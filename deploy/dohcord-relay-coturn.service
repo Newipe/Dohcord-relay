@@ -1,0 +1,43 @@
+[Unit]
+Description=Dohcord Relay TURN server (coturn)
+Documentation=https://github.com/coturn/coturn
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# coturn does not need root: 3478, 5349 and the 49152-65535 relay range are all
+# unprivileged ports. The certificate copies it reads are group-readable.
+User=turnserver
+Group=turnserver
+RuntimeDirectory=dohcord-relay
+RuntimeDirectoryMode=0750
+LogsDirectory=dohcord-relay
+LogsDirectoryMode=0750
+ExecStart=@TURN_BINARY@ -c /etc/dohcord-relay/turnserver.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3s
+
+# One file descriptor per relayed media flow.
+LimitNOFILE=1048576
+# Relaying many UDP sockets benefits from a larger receive buffer.
+LimitMEMLOCK=infinity
+
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+NoNewPrivileges=true
+ReadWritePaths=/run/dohcord-relay /var/log/dohcord-relay
+
+[Install]
+WantedBy=multi-user.target

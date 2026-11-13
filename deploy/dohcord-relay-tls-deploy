@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Dohcord Relay - certbot deploy hook.
+#
+# Runs only after a certificate was successfully issued or renewed. It verifies
+# that the new certificate really covers the relay's IP address, publishes copies
+# where the unprivileged services can read them, and restarts both consumers so
+# they pick up the new certificate.
+#
+# Installed at /usr/local/bin/dohcord-relay-tls-deploy by install.sh.
+set -Eeuo pipefail
+
+PUBLIC_IP="${DOHCORD_RELAY_PUBLIC_IP:-@PUBLIC_IP@}"
+CERT_NAME="${DOHCORD_RELAY_CERT_NAME:-dohcord-relay}"
+PREFIX="${DOHCORD_RELAY_PREFIX:-}"
+SRC_DIR="/etc/letsencrypt/live/${CERT_NAME}"
+DST_DIR="/etc/dohcord-relay/tls"
+GROUP="dohcord-relay"
+CREDENTIALS_UNIT="dohcord-relay-credentials.service"
+COTURN_UNIT="${DOHCORD_RELAY_COTURN_UNIT:-dohcord-relay-coturn.service}"
+
+log() { printf 'dohcord-relay-tls-deploy: %s\n' "$*"; }
+warn() { printf 'dohcord-relay-tls-deploy: warning: %s\n' "$*" >&2; }
+die() {
+	printf 'dohcord-relay-tls-deploy: error: %s\n' "$*" >&2
+	exit 1
+}
+
+[[ ${EUID} -eq 0 ]] || die "must run as root"
+
+[[ -r "${SRC_DIR}/fullchain.pem" ]] || die "missing ${SRC_DIR}/fullchain.pem"
+[[ -r "${SRC_DIR}/privkey.pem" ]] || die "missing ${SRC_DIR}/privkey.pem"
+
+# The whole point of an IP certificate: the SAN must contain this address, or
+# Dohcord clients will reject the TLS connection to the credential endpoint.
+if ! openssl x509 -in "${SRC_DIR}/fullchain.pem" -noout -checkip "${PUBLIC_IP}" >/dev/null 2>&1; then
+	die "certificate in ${SRC_DIR} does not cover IP ${PUBLIC_IP}"
+fi
+
+install -d -m 0750 -o root -g "${GROUP}" "${DST_DIR}"
+# Copy rather than symlink: /etc/letsencrypt/live is root-only, and the services
+# run unprivileged.
+install -m 0640 -o root -g "${GROUP}" "${SRC_DIR}/fullchain.pem" "${DST_DIR}/fullchain.pem"
+install -m 0640 -o root -g "${GROUP}" "${SRC_DIR}/privkey.pem" "${DST_DIR}/privkey.pem"
+
+expiry="$(openssl x509 -in "${DST_DIR}/fullchain.pem" -noout -enddate | cut -d= -f2)"
+log "installed certificate for ${PUBLIC_IP} (expires ${expiry})"
+
+restart_unit() {
+	local unit="$1"
+	if ! systemctl cat "${unit}" >/dev/null 2>&1; then
+		log "${unit} is not installed yet, skipping"
+		return 0
+	fi
+	if ! systemctl is-active --quiet "${unit}"; then
+		log "${unit} is not running, skipping reload"
+		return 0
+	fi
+	log "restarting ${unit}"
+	systemctl restart "${unit}"
+}
+
+restart_unit "${CREDENTIALS_UNIT}"
+restart_unit "${COTURN_UNIT}"
+
+log "done"

@@ -1,0 +1,124 @@
+# Dohcord Relay - coturn configuration
+#
+# Rendered by install.sh. Do not edit by hand: re-run the installer with
+# different settings instead, otherwise a renewal or upgrade will overwrite it.
+#
+# Path on the server: /etc/dohcord-relay/turnserver.conf
+
+# --- Listeners -------------------------------------------------------------
+# Plain TURN/STUN over UDP is the primary transport Dohcord uses.
+listening-port=3478
+# TURN over TLS (the fallback transport when UDP/TCP is filtered).
+tls-listening-port=5349
+
+# Listen on all local addresses. The public address is published separately
+# below, so this also works on hosts whose public IP lives on a NAT gateway.
+listening-ip=@LISTENING_IP@
+
+# --- Address mapping -------------------------------------------------------
+# Address the relay allocates its media sockets from. On a 1:1 NAT host (for
+# example EC2, where the public IP is not configured on any interface) this is
+# the private address, and external-ip publishes the public/private mapping.
+relay-ip=@RELAY_IP@
+external-ip=@EXTERNAL_IP@
+
+# --- Media relay port range ------------------------------------------------
+# Only these UDP ports carry relayed media. The firewall must allow them.
+min-port=49152
+max-port=65535
+
+# --- TURN REST authentication ----------------------------------------------
+# Temporary credentials are minted by the credential endpoint:
+#   username = <unix-expiration-timestamp>:Dohcord
+#   password = base64(HMAC-SHA1(shared secret, username))
+# The shared secret lives only on this host.
+use-auth-secret
+static-auth-secret=@SECRET@
+realm=@REALM@
+server-name=@REALM@
+
+# --- TLS -------------------------------------------------------------------
+# Copies of the Let's Encrypt IP certificate for @PUBLIC_IP@, refreshed by the
+# certbot deploy hook (/usr/local/bin/dohcord-relay-tls-deploy).
+cert=@CERT_FILE@
+pkey=@KEY_FILE@
+# TLS 1.0/1.1 are off; TLS 1.2 and 1.3 stay available. coturn 4.18 renamed these
+# flags: a minimum-version form replaced the old "no-tlsv1" deny form, and the
+# 4.18 config parser rejects the bare old spelling. Both forms are listed here and
+# install.sh keeps only the one the installed coturn actually understands.
+tlsv1=0
+tlsv1_1=0
+#no-tlsv1
+#no-tlsv1_1
+
+# --- Protocol behaviour ----------------------------------------------------
+fingerprint
+# Relay to peers over UDP only: this server is a WebRTC media relay, not a TCP
+# proxy. Clients may still reach it over UDP or TLS/TCP.
+no-tcp-relay
+# Long-lived nonces let a client keep an allocation across a call without
+# re-authenticating on every request, while still expiring.
+stale-nonce=600
+# Allocation/session lifetime ceilings (seconds).
+max-allocate-lifetime=3600
+permission-lifetime=300
+channel-lifetime=600
+# Housekeeping: bound how long an unauthenticated allocation attempt may take.
+max-allocate-timeout=30
+# Do not advertise implementation details in STUN responses.
+no-software-attribute
+
+# --- Quotas and bandwidth --------------------------------------------------
+# Concurrent allocations per temporary credential (one credential is issued per
+# Dohcord client per 24h, and a client uses a handful of allocations per call).
+# 12 leaves room for several simultaneous calls from the same client.
+user-quota=@USER_QUOTA@
+# Global ceiling on concurrent allocations for the whole relay.
+total-quota=@TOTAL_QUOTA@
+# Per-session bandwidth ceiling, bytes per second, each direction.
+# 2 MB/s (~16 Mbit/s) is comfortably above Discord voice, video and screen
+# share bitrates.
+max-bps=@MAX_BPS@
+# Total relay bandwidth the server may allocate, bytes per second.
+# IMPORTANT: coturn reserves max-bps for every open allocation, so this value
+# divided by max-bps is the number of concurrent relayed sessions the relay
+# accepts. Keep bps-capacity at roughly the VPS uplink (250 MB/s ~= 2 Gbit/s
+# reserves room for ~125 simultaneous 2 MB/s sessions). Setting it below a
+# couple of max-bps reservations makes coturn reject most allocations with
+# error 486 (Allocation Bandwidth Quota Reached).
+bps-capacity=@BPS_CAPACITY@
+
+# --- Peer destination filtering -------------------------------------------
+# Refuse to relay to anything that is not a public unicast address: loopback,
+# private, link-local, CGNAT, documentation, benchmarking, multicast and
+# broadcast destinations, plus this relay itself. Discord's ICE endpoints are
+# ordinary public addresses, so this does not block them.
+no-multicast-peers
+denied-peer-ip=0.0.0.0-0.255.255.255
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.0.0.0-192.0.2.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=198.18.0.0-198.19.255.255
+denied-peer-ip=198.51.100.0-198.51.100.255
+denied-peer-ip=203.0.113.0-203.0.113.255
+denied-peer-ip=224.0.0.0-255.255.255.255
+# The relay's own public address stays allowed on purpose: it is the standard
+# hairpin case where both ends of a call are relayed by this same server, and it
+# makes the media self-test in deploy/verify.sh possible without a second host.
+allowed-peer-ip=@PUBLIC_IP@
+denied-peer-ip=::1
+denied-peer-ip=::ffff:0.0.0.0-::ffff:255.255.255.255
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=ff00::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+
+# --- Process ---------------------------------------------------------------
+# Runs unprivileged under systemd (User=turnserver in the unit file).
+pidfile=/run/dohcord-relay/turnserver.pid
+log-file=@LOG_FILE@
+simple-log
+no-stdout-log

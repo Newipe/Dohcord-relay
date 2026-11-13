@@ -1,0 +1,11 @@
+# Built binary and local build output
+/dohcord-relay-credentials
+/dist/
+*.log
+
+# Local configuration / secrets must never be committed
+.env
+config.env
+turn-secret
+*.pem
+*.key

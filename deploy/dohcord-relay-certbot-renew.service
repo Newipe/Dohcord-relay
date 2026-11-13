@@ -1,0 +1,13 @@
+[Unit]
+Description=Renew the Dohcord Relay IP certificate
+Documentation=https://github.com/Newipe/Dohcord-relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The shortlived profile certificate is valid for ~160 hours, so the timer below
+# runs often; certbot itself decides whether a renewal is due (half of the
+# remaining lifetime for certificates valid less than 10 days).
+ExecStart=@CERTBOT@ renew --cert-name dohcord-relay --deploy-hook /usr/local/bin/dohcord-relay-tls-deploy --non-interactive --quiet
+Nice=10
