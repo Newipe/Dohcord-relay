@@ -327,6 +327,25 @@ PY
 	fi
 fi
 
+# --- ACME HTTP-01 -----------------------------------------------------------
+section "ACME HTTP-01 path"
+ACME_WEBROOT="$(cfg ACME_WEBROOT)"
+ACME_WEBROOT="${ACME_WEBROOT:-/var/www/dohcord-relay}"
+ACME_DIR="${ACME_WEBROOT}/.well-known/acme-challenge"
+ACME_URL="${DOHCORD_RELAY_ACME_URL:-http://${SERVER_IP}/.well-known/acme-challenge}"
+acme_token="dohcordverify${RANDOM}${RANDOM}"
+if mkdir -p "${ACME_DIR}" 2>/dev/null && printf 'acme-ok\n' >"${ACME_DIR}/${acme_token}" 2>/dev/null; then
+	acme_body="$(curl -sS --max-time 10 "${ACME_URL}/${acme_token}" 2>/dev/null || true)"
+	rm -f "${ACME_DIR}/${acme_token}"
+	if [[ "${acme_body}" == "acme-ok" ]]; then
+		pass "port 80 serves certificate challenge files from ${ACME_WEBROOT}"
+	else
+		fail "port 80 did not serve a challenge file from ${ACME_WEBROOT}; certificate issuance and renewal would fail"
+	fi
+else
+	skip "cannot write a probe challenge file to ${ACME_DIR} (run as root to test this)"
+fi
+
 # --- TLS listener -----------------------------------------------------------
 section "TURN over TLS"
 if [[ -n "${TLS_URL}" ]]; then

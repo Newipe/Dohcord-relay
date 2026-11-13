@@ -314,32 +314,43 @@ install_coturn() {
 		systemctl disable --now coturn.service >/dev/null 2>&1 || true
 		info "installed distribution coturn: ${TURN_BINARY}"
 	else
-		export DEBIAN_FRONTEND=noninteractive
-		apt-get install -y -qq --no-install-recommends \
-			build-essential libssl-dev libevent-dev pkg-config >/dev/null
-		local tmp
-		tmp="$(mktemp -d)"
-		info "building coturn ${COTURN_VERSION} from source (this takes a couple of minutes)"
-		curl -fsSL "https://github.com/coturn/coturn/archive/refs/tags/${COTURN_VERSION}.tar.gz" \
-			-o "${tmp}/coturn.tar.gz" ||
-			die "cannot download coturn ${COTURN_VERSION}"
-		if [[ "${COTURN_VERSION}" == "4.18.0" ]]; then
-			echo "${COTURN_SHA256}  ${tmp}/coturn.tar.gz" | sha256sum -c - >/dev/null ||
-				die "coturn archive checksum mismatch; refusing to build"
-		else
-			warn "no pinned checksum for coturn ${COTURN_VERSION}; continuing without verification"
+		# Re-runs should not rebuild from source when the pinned release is
+		# already installed (the certificate renewal flow re-runs this script).
+		local existing=""
+		if [[ -x /usr/local/bin/turnserver ]]; then
+			existing="$(/usr/local/bin/turnserver --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)"
 		fi
-		tar -C "${tmp}" -xzf "${tmp}/coturn.tar.gz"
-		(
-			cd "${tmp}/coturn-${COTURN_VERSION}"
-			./configure --prefix=/usr/local >/dev/null
-			make -j"$(nproc)" >/dev/null
-			make install >/dev/null
-		) || die "building coturn ${COTURN_VERSION} failed"
-		rm -rf "${tmp}"
-		TURN_BINARY="/usr/local/bin/turnserver"
-		[[ -x "${TURN_BINARY}" ]] || die "coturn binary not found at ${TURN_BINARY}"
-		info "installed upstream coturn at ${TURN_BINARY}"
+		if [[ -n "${existing}" && "${existing}" == "${COTURN_VERSION}" ]]; then
+			TURN_BINARY="/usr/local/bin/turnserver"
+			info "coturn ${existing} is already installed at ${TURN_BINARY}; skipping the source build"
+		else
+			export DEBIAN_FRONTEND=noninteractive
+			apt-get install -y -qq --no-install-recommends \
+				build-essential libssl-dev libevent-dev pkg-config >/dev/null
+			local tmp
+			tmp="$(mktemp -d)"
+			info "building coturn ${COTURN_VERSION} from source (this takes a couple of minutes)"
+			curl -fsSL "https://github.com/coturn/coturn/archive/refs/tags/${COTURN_VERSION}.tar.gz" \
+				-o "${tmp}/coturn.tar.gz" ||
+				die "cannot download coturn ${COTURN_VERSION}"
+			if [[ "${COTURN_VERSION}" == "4.18.0" ]]; then
+				echo "${COTURN_SHA256}  ${tmp}/coturn.tar.gz" | sha256sum -c - >/dev/null ||
+					die "coturn archive checksum mismatch; refusing to build"
+			else
+				warn "no pinned checksum for coturn ${COTURN_VERSION}; continuing without verification"
+			fi
+			tar -C "${tmp}" -xzf "${tmp}/coturn.tar.gz"
+			(
+				cd "${tmp}/coturn-${COTURN_VERSION}"
+				./configure --prefix=/usr/local >/dev/null
+				make -j"$(nproc)" >/dev/null
+				make install >/dev/null
+			) || die "building coturn ${COTURN_VERSION} failed"
+			rm -rf "${tmp}"
+			TURN_BINARY="/usr/local/bin/turnserver"
+			[[ -x "${TURN_BINARY}" ]] || die "coturn binary not found at ${TURN_BINARY}"
+			info "installed upstream coturn at ${TURN_BINARY}"
+		fi
 	fi
 
 	local version
@@ -537,21 +548,23 @@ start_acme_bootstrap() {
 	fi
 
 	local probe="probe${RANDOM}${RANDOM}"
+	local probe_dir="${WEBROOT}/.well-known/acme-challenge"
 	info "starting the ACME HTTP-01 responder on port 80"
-	printf 'ok\n' >"${WEBROOT}/${probe}"
+	install -d -m 0755 -o root -g root "${probe_dir}"
+	printf 'ok\n' >"${probe_dir}/${probe}"
 	"${BIN}" -config "${ETC_DIR}/config.env" -acme-only >>"${LOG_DIR}/acme-bootstrap.log" 2>&1 &
 	BOOTSTRAP_PID=$!
 
 	local i
 	for i in $(seq 1 60); do
 		if [[ "$(curl -fsS --max-time 2 "http://127.0.0.1/.well-known/acme-challenge/${probe}" 2>/dev/null || true)" == "ok" ]]; then
-			rm -f "${WEBROOT}/${probe}"
+			rm -f "${probe_dir}/${probe}"
 			info "ACME responder is answering on port 80"
 			return 0
 		fi
 		sleep 0.5
 	done
-	rm -f "${WEBROOT}/${probe}"
+	rm -f "${probe_dir}/${probe}"
 	die "the ACME responder did not start; see ${LOG_DIR}/acme-bootstrap.log"
 }
 
@@ -578,6 +591,9 @@ obtain_certificate() {
 	fi
 
 	start_acme_bootstrap
+
+	# certbot needs the challenge directory to exist under the webroot.
+	install -d -m 0755 -o root -g root "${WEBROOT}/.well-known/acme-challenge"
 
 	local -a args=(
 		certonly

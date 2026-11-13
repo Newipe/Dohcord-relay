@@ -311,8 +311,9 @@ It checks: both services active; UDP 3478 and TCP 5349 listening; relay range
 username, HMAC recomputed from the local secret); TLS validity for the IP; a real
 TURN client obtaining a relay candidate over UDP and over TLS; rejection of a
 wrong password, an expired username and unauthenticated requests; bidirectional
-media through the relay; outbound UDP (STUN to a public server); the certificate's
-IP SAN; the renewal timer; and `certbot renew --dry-run`.
+media through the relay; port 80 serving an ACME challenge file (written into the
+webroot, then fetched back over HTTP); outbound UDP (STUN to a public server); the
+certificate's IP SAN; the renewal timer; and `certbot renew --dry-run`.
 
 ### Tests
 
@@ -340,9 +341,10 @@ configuration was relaxed.
 | Per-user allocation quota | pass — second allocation with `user-quota=1` rejected with `486` |
 | Bidirectional media through the relay (UDP) | pass — 20/20 messages, 2000/2000 bytes echoed |
 | Bidirectional media through the relay (TLS) | pass — 20/20 messages |
+| Port 80 serves ACME HTTP-01 challenge files from the webroot | pass — probe file fetched back over HTTP |
 | Missing secret → clear error | pass — `503 {"error":"turn configuration unavailable"}` |
 | Per-IP rate limit | pass — burst exhausted → `429` |
-| `deploy/verify.sh` against a live instance | 21 pass, 0 fail, 1 warning (below), 4 skipped (systemd/renewal) |
+| `deploy/verify.sh` against a live instance | 22 pass, 0 fail, 1 warning (below), 4 skipped (systemd/renewal) |
 
 Not verified here, and therefore not claimed:
 
@@ -393,6 +395,13 @@ ranges are denied; if a legitimate endpoint falls into one, add a narrow
 
 **Allocations time out.** UDP 3478 (and the relay range) is not reaching the
 host, or outbound UDP is filtered. `deploy/verify.sh` reports both.
+
+**Issuance fails with `Invalid response ... 404` on the challenge.** The CA reached
+port 80 but the challenge file was not served. The endpoint serves
+`<ACME_WEBROOT>/.well-known/acme-challenge/<token>`, which is where
+`certbot --webroot` writes it; check `ACME_WEBROOT` in `config.env` and run
+`sudo bash deploy/verify.sh`, whose ACME check writes a probe file and fetches it
+back over HTTP.
 
 **Certificate renewal fails.** Port 80 must stay reachable for HTTP-01; check
 `journalctl -u dohcord-relay-certbot-renew.service`, then run

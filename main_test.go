@@ -243,7 +243,12 @@ func TestACMEChallengeServing(t *testing.T) {
 	srv, _ := testServer(t, "", time.Hour)
 	webroot := t.TempDir()
 	srv.cfg.acmeWebroot = webroot
-	if err := os.WriteFile(filepath.Join(webroot, "token-123"), []byte("challenge-body"), 0o644); err != nil {
+	// certbot --webroot places the file under .well-known/acme-challenge.
+	challengeDir := filepath.Join(webroot, ".well-known", "acme-challenge")
+	if err := os.MkdirAll(challengeDir, 0o755); err != nil {
+		t.Fatalf("create challenge dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(challengeDir, "token-123"), []byte("challenge-body"), 0o644); err != nil {
 		t.Fatalf("write challenge: %v", err)
 	}
 

@@ -421,7 +421,9 @@ func (s *server) handleACMEChallenge(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	http.ServeFile(w, r, filepath.Join(s.cfg.acmeWebroot, token))
+	// certbot --webroot writes challenge files to
+	// <webroot>/.well-known/acme-challenge/<token>.
+	http.ServeFile(w, r, filepath.Join(s.cfg.acmeWebroot, ".well-known", "acme-challenge", token))
 }
 
 func (s *server) clientIP(r *http.Request) string {
