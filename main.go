@@ -1,13 +1,18 @@
-// Command dohcord-relay-credentials serves the Dohcord relay TURN credential
-// endpoint over HTTPS and issues coturn TURN REST credentials.
+// Command dohcord-relay serves the public configuration API for a Dohcord relay
+// VPS and manages the destination policy of the HTTPS CONNECT proxy.
 //
-// It is a single small HTTP service: GET /turn-credentials returns an
-// RTCPeerConnection-compatible iceServers array whose username is
-// "<unix-expiration>:Dohcord" and whose credential is the matching
-// HMAC-SHA1 password derived from the coturn shared secret.
+//	GET /network-config   the HTTPS proxy URL, its destination policy and
+//	                      temporary TURN credentials, in one document
+//	GET /turn-credentials the TURN iceServers block alone (legacy clients)
 //
-// The shared secret is read from disk on demand and is never logged or returned
-// to clients. Nothing is persisted: no database, no accounts, no client keys.
+// It also answers ACME HTTP-01 challenges on port 80, and the -policy-apply
+// command validates /etc/dohcord-relay/allowed-domains.txt and
+// /etc/dohcord-relay/destination-policy.conf, renders the Squid ACL include and
+// only then reloads Squid.
+//
+// The TURN shared secret is read from disk on demand and is never logged or
+// returned to clients. Nothing is persisted: no database, no accounts, no
+// permanent client credentials.
 package main
 
 import (
@@ -20,7 +25,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
@@ -42,13 +49,16 @@ const (
 
 func main() {
 	var (
-		configPath  = flag.String("config", defaultConfigPath, "path to the configuration file")
-		printConfig = flag.Bool("print-config", false, "print the effective configuration (never the secret) and exit")
-		acmeOnly    = flag.Bool("acme-only", false, "serve only the ACME HTTP-01 responder (used while the certificate is being obtained)")
+		configPath     = flag.String("config", defaultConfigPath, "path to the configuration file")
+		printConfig    = flag.Bool("print-config", false, "print the effective configuration (never the secret) and exit")
+		acmeOnly       = flag.Bool("acme-only", false, "serve only the ACME HTTP-01 responder (used while the certificate is being obtained)")
+		policyCheck    = flag.Bool("policy-check", false, "validate the destination policy files and exit")
+		policyApply    = flag.Bool("policy-apply", false, "validate the destination policy, render the Squid include and reload Squid, then exit")
+		policyNoReload = flag.Bool("no-reload", false, "with -policy-apply: write the validated policy without reloading Squid")
 	)
 	flag.Parse()
 
-	logger := log.New(os.Stderr, "dohcord-relay-credentials: ", log.LstdFlags)
+	logger := log.New(os.Stderr, "dohcord-relay: ", log.LstdFlags)
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
@@ -56,12 +66,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *printConfig {
+	switch {
+	case *policyCheck:
+		p, err := LoadPolicy(cfg.allowedDomainsFile, cfg.destinationPolicyFile)
+		if err != nil {
+			logger.Printf("ERROR policy invalid: %v", err)
+			os.Exit(1)
+		}
+		printPolicySummary(os.Stdout, p)
+		return
+	case *policyApply:
+		if err := applyPolicy(cfg, !*policyNoReload, logger); err != nil {
+			logger.Printf("ERROR %v", err)
+			os.Exit(1)
+		}
+		return
+	case *printConfig:
 		printEffectiveConfig(os.Stdout, cfg)
 		return
-	}
-
-	if *acmeOnly {
+	case *acmeOnly:
 		// Bootstrapping: answer HTTP-01 challenges only, because no HTTPS
 		// certificate exists yet.
 		cfg.httpsListen = ""
@@ -77,15 +100,29 @@ func main() {
 // config is the runtime configuration, read from a small KEY=VALUE file so the
 // installer can write it and systemd can pass a single path.
 type config struct {
-	turnURLs    []string
-	identity    string
-	ttl         time.Duration
-	secretFile  string
-	certFile    string
-	keyFile     string
+	// Public identity of the relay, as clients must reach it.
+	proxyURL string // https://host:443 - the HTTPS CONNECT proxy
+	apiURL   string // https://host:8443/network-config, for logs and reports
+
+	turnURLs   []string
+	identity   string
+	ttl        time.Duration
+	secretFile string
+	certFile   string
+	keyFile    string
+
 	httpsListen string
 	httpListen  string
 	acmeWebroot string
+
+	// Destination policy.
+	allowedDomainsFile    string
+	destinationPolicyFile string
+	policyStateFile       string
+	squidConf             string
+	squidAllowFile        string
+	squidBinary           string
+
 	perIPRate   int
 	perIPBurst  int
 	globalRate  int
@@ -95,23 +132,24 @@ type config struct {
 
 func defaultConfig() config {
 	return config{
-		turnURLs: []string{
-			"turn:13.48.52.216:3478?transport=udp",
-			"turns:13.48.52.216:5349?transport=tcp",
-		},
-		identity:    "Dohcord",
-		ttl:         24 * time.Hour,
-		secretFile:  "/etc/dohcord-relay/turn-secret",
-		certFile:    "/etc/dohcord-relay/tls/fullchain.pem",
-		keyFile:     "/etc/dohcord-relay/tls/privkey.pem",
-		httpsListen: ":443",
-		httpListen:  ":80",
-		acmeWebroot: "/var/www/dohcord-relay",
-		perIPRate:   6,
-		perIPBurst:  3,
-		globalRate:  120,
-		globalBurst: 60,
-		trustProxy:  false,
+		identity:              "Dohcord",
+		ttl:                   24 * time.Hour,
+		secretFile:            "/etc/dohcord-relay/turn-secret",
+		certFile:              "/etc/dohcord-relay/tls/fullchain.pem",
+		keyFile:               "/etc/dohcord-relay/tls/privkey.pem",
+		httpsListen:           ":8443",
+		httpListen:            ":80",
+		acmeWebroot:           "/var/www/dohcord-relay",
+		allowedDomainsFile:    "/etc/dohcord-relay/allowed-domains.txt",
+		destinationPolicyFile: "/etc/dohcord-relay/destination-policy.conf",
+		policyStateFile:       "/etc/dohcord-relay/policy.json",
+		squidConf:             "/etc/dohcord-relay/squid.conf",
+		squidAllowFile:        "/etc/dohcord-relay/squid-allow.conf",
+		squidBinary:           "/usr/sbin/squid",
+		perIPRate:             6,
+		perIPBurst:            3,
+		globalRate:            120,
+		globalBurst:           60,
 	}
 }
 
@@ -124,6 +162,12 @@ func loadConfig(path string) (config, error) {
 		return config{}, err
 	}
 
+	if v, ok := values["HTTPS_PROXY_URL"]; ok {
+		cfg.proxyURL = v
+	}
+	if v, ok := values["NETWORK_CONFIG_URL"]; ok {
+		cfg.apiURL = v
+	}
 	if v, ok := values["TURN_URLS"]; ok {
 		urls := splitList(v)
 		if len(urls) == 0 {
@@ -158,6 +202,24 @@ func loadConfig(path string) (config, error) {
 	}
 	if v, ok := values["ACME_WEBROOT"]; ok {
 		cfg.acmeWebroot = v
+	}
+	if v, ok := values["ALLOWED_DOMAINS_FILE"]; ok {
+		cfg.allowedDomainsFile = v
+	}
+	if v, ok := values["DESTINATION_POLICY_FILE"]; ok {
+		cfg.destinationPolicyFile = v
+	}
+	if v, ok := values["POLICY_STATE_FILE"]; ok {
+		cfg.policyStateFile = v
+	}
+	if v, ok := values["SQUID_CONF"]; ok {
+		cfg.squidConf = v
+	}
+	if v, ok := values["SQUID_ALLOW_FILE"]; ok {
+		cfg.squidAllowFile = v
+	}
+	if v, ok := values["SQUID_BINARY"]; ok {
+		cfg.squidBinary = v
 	}
 	if v, ok := values["PER_IP_RATE_PER_MINUTE"]; ok {
 		n, err := strconv.Atoi(v)
@@ -211,6 +273,9 @@ func (c config) validate() error {
 	if c.ttl < minTTL || c.ttl > maxTTL {
 		return fmt.Errorf("CREDENTIAL_TTL must be between %s and %s", minTTL, maxTTL)
 	}
+	if len(c.turnURLs) == 0 {
+		return errors.New("TURN_URLS must list at least one TURN URL")
+	}
 	for _, u := range c.turnURLs {
 		if !strings.HasPrefix(u, "turn:") && !strings.HasPrefix(u, "turns:") {
 			return fmt.Errorf("TURN_URLS entry %q must start with turn: or turns:", u)
@@ -219,13 +284,54 @@ func (c config) validate() error {
 	if c.secretFile == "" {
 		return errors.New("SECRET_FILE must be set")
 	}
+	if err := validatePublicURL("HTTPS_PROXY_URL", c.proxyURL); err != nil {
+		return err
+	}
+	if c.apiURL != "" {
+		if err := validatePublicURL("NETWORK_CONFIG_URL", c.apiURL); err != nil {
+			return err
+		}
+	}
+	for name, p := range map[string]string{
+		"ALLOWED_DOMAINS_FILE":    c.allowedDomainsFile,
+		"DESTINATION_POLICY_FILE": c.destinationPolicyFile,
+		"POLICY_STATE_FILE":       c.policyStateFile,
+		"SQUID_CONF":              c.squidConf,
+		"SQUID_ALLOW_FILE":        c.squidAllowFile,
+	} {
+		if p == "" {
+			return fmt.Errorf("%s must be set", name)
+		}
+	}
 	if c.httpsListen != "" {
 		if c.certFile == "" || c.keyFile == "" {
 			return errors.New("TLS_CERT_FILE and TLS_KEY_FILE must be set when HTTPS_LISTEN is set")
 		}
-		if c.httpListen == ":443" || c.httpsListen == c.httpListen {
-			return errors.New("HTTPS_LISTEN and HTTP_LISTEN must differ")
+		if c.httpsListen == ":443" || c.httpsListen == c.httpListen {
+			return fmt.Errorf("HTTPS_LISTEN must not be :443 (the HTTPS CONNECT proxy owns that port) or equal HTTP_LISTEN")
 		}
+	}
+	return nil
+}
+
+// validatePublicURL rejects anything that is not an absolute https URL with a
+// host, because these URLs are handed to clients as-is.
+func validatePublicURL(name, raw string) error {
+	if raw == "" {
+		return fmt.Errorf("%s must be set", name)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s is not a valid URL: %w", name, err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("%s must use https://, got %q", name, u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("%s must include a host", name)
+	}
+	if u.User != nil {
+		return fmt.Errorf("%s must not contain credentials", name)
 	}
 	return nil
 }
@@ -284,6 +390,8 @@ func parseDuration(v string) (time.Duration, error) {
 }
 
 func printEffectiveConfig(w *os.File, c config) {
+	fmt.Fprintf(w, "HTTPS_PROXY_URL=%s\n", c.proxyURL)
+	fmt.Fprintf(w, "NETWORK_CONFIG_URL=%s\n", c.apiURL)
 	fmt.Fprintf(w, "TURN_URLS=%s\n", strings.Join(c.turnURLs, ","))
 	fmt.Fprintf(w, "TURN_IDENTITY=%s\n", c.identity)
 	fmt.Fprintf(w, "CREDENTIAL_TTL=%s\n", c.ttl)
@@ -293,11 +401,120 @@ func printEffectiveConfig(w *os.File, c config) {
 	fmt.Fprintf(w, "HTTPS_LISTEN=%s\n", c.httpsListen)
 	fmt.Fprintf(w, "HTTP_LISTEN=%s\n", c.httpListen)
 	fmt.Fprintf(w, "ACME_WEBROOT=%s\n", c.acmeWebroot)
+	fmt.Fprintf(w, "ALLOWED_DOMAINS_FILE=%s\n", c.allowedDomainsFile)
+	fmt.Fprintf(w, "DESTINATION_POLICY_FILE=%s\n", c.destinationPolicyFile)
+	fmt.Fprintf(w, "POLICY_STATE_FILE=%s\n", c.policyStateFile)
+	fmt.Fprintf(w, "SQUID_CONF=%s\n", c.squidConf)
+	fmt.Fprintf(w, "SQUID_ALLOW_FILE=%s\n", c.squidAllowFile)
+	fmt.Fprintf(w, "SQUID_BINARY=%s\n", c.squidBinary)
 	fmt.Fprintf(w, "PER_IP_RATE_PER_MINUTE=%d\n", c.perIPRate)
 	fmt.Fprintf(w, "PER_IP_BURST=%d\n", c.perIPBurst)
 	fmt.Fprintf(w, "GLOBAL_RATE_PER_MINUTE=%d\n", c.globalRate)
 	fmt.Fprintf(w, "GLOBAL_BURST=%d\n", c.globalBurst)
 	fmt.Fprintf(w, "TRUST_PROXY_HEADER=%t\n", c.trustProxy)
+}
+
+// printPolicySummary prints the effective policy in the destination-policy.conf
+// format, which is what an operator wants to see after validation.
+func printPolicySummary(w *os.File, p *Policy) {
+	fmt.Fprintf(w, "destination policy is valid: %d domains\n", len(p.Destinations))
+	for _, d := range p.Destinations {
+		fmt.Fprintf(w, "  %-28s %s\n", d.Domain, d.PortList())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Destination policy application
+// ---------------------------------------------------------------------------
+
+// applyPolicy validates the two operator files, renders the Squid ACL include,
+// checks the complete Squid configuration with `squid -k parse`, installs the
+// include and the policy state, and only after all of that reloads Squid. A
+// failure at any step leaves the previous, working policy in place.
+func applyPolicy(cfg config, reload bool, logger *log.Logger) error {
+	p, err := LoadPolicy(cfg.allowedDomainsFile, cfg.destinationPolicyFile)
+	if err != nil {
+		return fmt.Errorf("policy invalid: %w", err)
+	}
+	printPolicySummary(os.Stdout, p)
+
+	include := p.SquidACL()
+	allowDir := filepath.Dir(cfg.squidAllowFile)
+	if err := os.MkdirAll(allowDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", allowDir, err)
+	}
+
+	// Stage the rendered include next to its final location so the validation
+	// run and the installed file are the same bytes.
+	staged, err := os.CreateTemp(allowDir, ".squid-allow-*.conf")
+	if err != nil {
+		return fmt.Errorf("stage Squid include: %w", err)
+	}
+	stagedName := staged.Name()
+	defer os.Remove(stagedName)
+	if _, err := staged.WriteString(include); err != nil {
+		staged.Close()
+		return fmt.Errorf("write staged Squid include: %w", err)
+	}
+	if err := staged.Close(); err != nil {
+		return fmt.Errorf("close staged Squid include: %w", err)
+	}
+	if err := os.Chmod(stagedName, 0o644); err != nil {
+		return fmt.Errorf("chmod staged Squid include: %w", err)
+	}
+
+	confData, err := os.ReadFile(cfg.squidConf)
+	if err != nil {
+		return fmt.Errorf("read Squid configuration %s: %w", cfg.squidConf, err)
+	}
+	wantInclude := SquidIncludeLine(cfg.squidAllowFile)
+	if !strings.Contains(string(confData), wantInclude) {
+		return fmt.Errorf("%s does not contain %q; refusing to apply a policy Squid would not read", cfg.squidConf, wantInclude)
+	}
+	stagedConf := strings.ReplaceAll(string(confData), wantInclude, SquidIncludeLine(stagedName))
+
+	confFile, err := os.CreateTemp(allowDir, ".squid-conf-*.conf")
+	if err != nil {
+		return fmt.Errorf("stage Squid configuration: %w", err)
+	}
+	stagedConfName := confFile.Name()
+	defer os.Remove(stagedConfName)
+	if _, err := confFile.WriteString(stagedConf); err != nil {
+		confFile.Close()
+		return fmt.Errorf("write staged Squid configuration: %w", err)
+	}
+	if err := confFile.Close(); err != nil {
+		return fmt.Errorf("close staged Squid configuration: %w", err)
+	}
+
+	// Validate the whole configuration, not just the include: a syntax error, a
+	// missing certificate or an ACL that does not resolve all abort here.
+	// Squid exits non-zero on a fatal parse error and prints "FATAL:"; both are
+	// checked, and nothing narrower, because ordinary directive names contain
+	// the word "error" (error_directory) and must not be mistaken for failures.
+	out, err := exec.Command(cfg.squidBinary, "-k", "parse", "-f", stagedConfName).CombinedOutput()
+	if err != nil || strings.Contains(string(out), "FATAL:") {
+		return fmt.Errorf("Squid rejected the generated policy; the running configuration is unchanged:\n%s", strings.TrimSpace(string(out)))
+	}
+
+	if err := os.Rename(stagedName, cfg.squidAllowFile); err != nil {
+		return fmt.Errorf("install %s: %w", cfg.squidAllowFile, err)
+	}
+	if err := SavePolicyState(cfg.policyStateFile, p); err != nil {
+		return fmt.Errorf("write %s: %w", cfg.policyStateFile, err)
+	}
+	logger.Printf("policy applied: %d domains, include %s, state %s", len(p.Destinations), cfg.squidAllowFile, cfg.policyStateFile)
+
+	if !reload {
+		logger.Printf("policy staged but Squid not reloaded (-no-reload)")
+		return nil
+	}
+	out, err = exec.Command(cfg.squidBinary, "-k", "reconfigure", "-f", cfg.squidConf).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("Squid failed to reload (it keeps serving the previous policy): %s\n%s", err, strings.TrimSpace(string(out)))
+	}
+	logger.Printf("Squid reloaded")
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +528,7 @@ type server struct {
 	certs  *certReloader
 	perIP  *limiter
 	global *limiter
+	policy *policyCache
 
 	now func() time.Time
 }
@@ -323,7 +541,12 @@ func newServer(cfg config, logger *log.Logger) *server {
 		certs:  &certReloader{certFile: cfg.certFile, keyFile: cfg.keyFile},
 		perIP:  newLimiter(cfg.perIPRate, cfg.perIPBurst),
 		global: newLimiter(cfg.globalRate, cfg.globalBurst),
-		now:    time.Now,
+		policy: &policyCache{
+			domainsPath: cfg.allowedDomainsFile,
+			policyPath:  cfg.destinationPolicyFile,
+			statePath:   cfg.policyStateFile,
+		},
+		now: time.Now,
 	}
 }
 
@@ -333,6 +556,23 @@ type iceServer struct {
 	Credential string   `json:"credential"`
 }
 
+type rtcRelay struct {
+	ExpiresAt  int64       `json:"expiresAt"`
+	IceServers []iceServer `json:"iceServers"`
+}
+
+type httpsProxyInfo struct {
+	URL                 string        `json:"url"`
+	AllowedDestinations []Destination `json:"allowedDestinations"`
+}
+
+type networkConfig struct {
+	Version    int            `json:"version"`
+	HTTPSProxy httpsProxyInfo `json:"httpsProxy"`
+	RTCRelay   rtcRelay       `json:"rtcRelay"`
+}
+
+// credentialsResponse is the legacy /turn-credentials document.
 type credentialsResponse struct {
 	ExpiresAt  int64       `json:"expiresAt"`
 	IceServers []iceServer `json:"iceServers"`
@@ -340,6 +580,7 @@ type credentialsResponse struct {
 
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/network-config", s.handleNetworkConfig)
 	mux.HandleFunc("/turn-credentials", s.handleCredentials)
 	return mux
 }
@@ -355,34 +596,66 @@ func (s *server) acmeRoutes() http.Handler {
 	return mux
 }
 
-func (s *server) handleCredentials(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD")
-		writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
-		return
-	}
-
+func setAPIHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD")
 	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 	w.Header().Set("Pragma", "no-cache")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+}
 
-	now := s.now()
-
+// allowRequest applies the global and per-address limits shared by both API
+// endpoints. It writes the refusal itself and reports whether to continue.
+func (s *server) allowRequest(w http.ResponseWriter, r *http.Request, now time.Time) (string, bool) {
 	clientIP := s.clientIP(r)
 	if ok, retry := s.global.allow("global", now); !ok {
 		retryAfter(w, retry)
 		writeJSON(w, http.StatusTooManyRequests, errorBody("global request limit reached"))
-		return
+		return clientIP, false
 	}
 	if ok, retry := s.perIP.allow(clientIP, now); !ok {
 		retryAfter(w, retry)
 		writeJSON(w, http.StatusTooManyRequests, errorBody("too many requests from this address"))
+		return clientIP, false
+	}
+	return clientIP, true
+}
+
+func (s *server) issue(now time.Time) ([]iceServer, int64, error) {
+	secret, err := s.secret.get()
+	if err != nil {
+		return nil, 0, err
+	}
+	username, password, expiresAt := issueCredential(secret, s.cfg.identity, s.cfg.ttl, now)
+	return []iceServer{{
+		URLs:       s.cfg.turnURLs,
+		Username:   username,
+		Credential: password,
+	}}, expiresAt, nil
+}
+
+// handleNetworkConfig returns the proxy and TURN configuration produced from the
+// server's own configuration and the policy Squid is enforcing.
+func (s *server) handleNetworkConfig(w http.ResponseWriter, r *http.Request) {
+	if !allowedMethod(w, r) {
+		return
+	}
+	setAPIHeaders(w)
+
+	now := s.now()
+	clientIP, ok := s.allowRequest(w, r, now)
+	if !ok {
 		return
 	}
 
-	secret, err := s.secret.get()
+	policy, err := s.policy.get()
+	if err != nil {
+		s.log.Printf("ERROR destination policy unavailable: %v", err)
+		writeJSON(w, http.StatusServiceUnavailable, errorBody("destination policy unavailable"))
+		return
+	}
+	ice, expiresAt, err := s.issue(now)
 	if err != nil {
 		// Deliberately vague to the client; the details stay in the local log.
 		s.log.Printf("ERROR turn configuration unavailable: %v", err)
@@ -390,26 +663,58 @@ func (s *server) handleCredentials(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	username, password, expiresAt := issueCredential(secret, s.cfg.identity, s.cfg.ttl, now)
-
-	writeJSON(w, http.StatusOK, credentialsResponse{
-		ExpiresAt: expiresAt,
-		IceServers: []iceServer{{
-			URLs:       s.cfg.turnURLs,
-			Username:   username,
-			Credential: password,
-		}},
+	writeJSON(w, http.StatusOK, networkConfig{
+		Version: schemaVersion,
+		HTTPSProxy: httpsProxyInfo{
+			URL:                 s.cfg.proxyURL,
+			AllowedDestinations: policy.Destinations,
+		},
+		RTCRelay: rtcRelay{ExpiresAt: expiresAt, IceServers: ice},
 	})
 
-	// Log the issuance without the credential: the username and password are
-	// bearer secrets for the lifetime of the allocation.
+	// Log issuance without the credential: it is a bearer secret for the
+	// lifetime of the allocation.
+	s.log.Printf("served network-config client=%s destinations=%d expires_at=%d",
+		clientIP, len(policy.Destinations), expiresAt)
+}
+
+// handleCredentials serves the pre-network-config response shape.
+func (s *server) handleCredentials(w http.ResponseWriter, r *http.Request) {
+	if !allowedMethod(w, r) {
+		return
+	}
+	setAPIHeaders(w)
+
+	now := s.now()
+	clientIP, ok := s.allowRequest(w, r, now)
+	if !ok {
+		return
+	}
+
+	ice, expiresAt, err := s.issue(now)
+	if err != nil {
+		s.log.Printf("ERROR turn configuration unavailable: %v", err)
+		writeJSON(w, http.StatusServiceUnavailable, errorBody("turn configuration unavailable"))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, credentialsResponse{ExpiresAt: expiresAt, IceServers: ice})
 	s.log.Printf("issued turn credential client=%s expires_at=%d", clientIP, expiresAt)
+}
+
+func allowedMethod(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodGet || r.Method == http.MethodHead {
+		return true
+	}
+	w.Header().Set("Allow", "GET, HEAD")
+	writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
+	return false
 }
 
 var acmeToken = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 // handleACMEChallenge serves HTTP-01 validation files from the webroot. It exists
-// only so certbot can prove control of the IP address; it is not an API.
+// only so certbot can prove control of the domain or IP address; it is not an API.
 func (s *server) handleACMEChallenge(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
@@ -458,8 +763,8 @@ func retryAfter(w http.ResponseWriter, d time.Duration) {
 	w.Header().Set("Retry-After", strconv.Itoa(secs))
 }
 
-// run starts the HTTPS endpoint (and the port-80 ACME responder, when enabled)
-// and blocks until SIGTERM/SIGINT.
+// run starts the HTTPS API (and the port-80 ACME responder, when enabled) and
+// blocks until SIGTERM/SIGINT.
 func (s *server) run() error {
 	errc := make(chan error, 2)
 	var servers []*http.Server
@@ -498,8 +803,8 @@ func (s *server) run() error {
 		servers = append(servers, srv)
 		go func() { errc <- srv.Serve(tls.NewListener(ln, tlsCfg)) }()
 
-		s.log.Printf("https credential endpoint listening on %s (/turn-credentials), turn_urls=%s ttl=%s",
-			s.cfg.httpsListen, strings.Join(s.cfg.turnURLs, ","), s.cfg.ttl)
+		s.log.Printf("https api listening on %s (/network-config, /turn-credentials), proxy=%s turn_urls=%s ttl=%s",
+			s.cfg.httpsListen, s.cfg.proxyURL, strings.Join(s.cfg.turnURLs, ","), s.cfg.ttl)
 	}
 
 	if s.cfg.httpListen != "" {

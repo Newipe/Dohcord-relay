@@ -3,37 +3,45 @@
 #
 # Checks a live installation end to end and prints one line per check. Exits
 # non-zero when any check fails. Nothing here changes configuration; the only
-# side effects are temporary TURN allocations and a short-lived echo peer used by
-# the media test.
+# side effects are temporary TURN allocations, a short-lived echo peer used by
+# the media test, and TLS connections through the proxy.
 #
-# Run as root (or as a user that can read /etc/dohcord-relay and the coturn log):
+# Run as root (or as a user that can read /etc/dohcord-relay):
 #
 #   sudo deploy/verify.sh
 #
 # Environment overrides (used by the installer and by local testing):
 #   DOHCORD_RELAY_CONFIG        config.env path
 #   DOHCORD_RELAY_TURNSERVER_CONF, DOHCORD_RELAY_SECRET_FILE, DOHCORD_RELAY_TLS_CERT
-#   DOHCORD_RELAY_COTURN_UNIT, DOHCORD_RELAY_CRED_UNIT, DOHCORD_RELAY_SKIP_UNITS
+#   DOHCORD_RELAY_SQUID_CONF, DOHCORD_RELAY_SQUID_UNIT, DOHCORD_RELAY_API_UNIT
+#   DOHCORD_RELAY_PROXY_URL, DOHCORD_RELAY_API_URL
+#   DOHCORD_RELAY_SKIP_UNITS, DOHCORD_RELAY_SKIP_RENEW, DOHCORD_RELAY_CERTBOT
 #   DOHCORD_RELAY_PROBE_PEER, DOHCORD_RELAY_PROBE_PEER_PORT
-#   DOHCORD_RELAY_SKIP_RENEW, DOHCORD_RELAY_CERTBOT
+#   DOHCORD_RELAY_CA_FILE, DOHCORD_RELAY_ENDPOINT
 set -uo pipefail
 
 CONFIG="${DOHCORD_RELAY_CONFIG:-/etc/dohcord-relay/config.env}"
 TURN_CONF="${DOHCORD_RELAY_TURNSERVER_CONF:-/etc/dohcord-relay/turnserver.conf}"
+SQUID_CONF="${DOHCORD_RELAY_SQUID_CONF:-/etc/dohcord-relay/squid.conf}"
+SQUID_UNIT="${DOHCORD_RELAY_SQUID_UNIT:-dohcord-relay-squid.service}"
+API_UNIT="${DOHCORD_RELAY_API_UNIT:-dohcord-relay-api.service}"
 SECRET_FILE="${DOHCORD_RELAY_SECRET_FILE:-/etc/dohcord-relay/turn-secret}"
 TLS_CERT="${DOHCORD_RELAY_TLS_CERT:-/etc/dohcord-relay/tls/fullchain.pem}"
-TURN_LOG="${DOHCORD_RELAY_TURN_LOG:-/var/log/dohcord-relay/turnserver.log}"
+TURN_LOG="${DOHCORD_RELAY_TURN_LOG:-/var/log/dohcord-relay/turnserver/turnserver.log}"
 COTURN_UNIT="${DOHCORD_RELAY_COTURN_UNIT:-dohcord-relay-coturn.service}"
-CRED_UNIT="${DOHCORD_RELAY_CRED_UNIT:-dohcord-relay-credentials.service}"
 CERT_NAME="${DOHCORD_RELAY_CERT_NAME:-dohcord-relay}"
 SKIP_UNITS="${DOHCORD_RELAY_SKIP_UNITS:-0}"
 SKIP_RENEW="${DOHCORD_RELAY_SKIP_RENEW:-0}"
 PROBE_PEER="${DOHCORD_RELAY_PROBE_PEER:-}"
 PROBE_PEER_PORT="${DOHCORD_RELAY_PROBE_PEER_PORT:-3480}"
-# Optional overrides, used when testing an installation that does not (yet) use
-# the public Let's Encrypt certificate, for example a staging or local setup.
 CA_FILE="${DOHCORD_RELAY_CA_FILE:-}"
+# Certificate authority for the proxy listener. Empty means the system trust
+# store; set it only when testing against a staging certificate.
+PROXY_CA="${DOHCORD_RELAY_PROXY_CA:-}"
 ENDPOINT_OVERRIDE="${DOHCORD_RELAY_ENDPOINT:-}"
+API_URL_OVERRIDE="${DOHCORD_RELAY_API_URL:-}"
+PROXY_URL_OVERRIDE="${DOHCORD_RELAY_PROXY_URL:-}"
+BINARY="${DOHCORD_RELAY_BINARY:-/usr/local/bin/dohcord-relay}"
 
 passed=0
 failed=0
@@ -76,6 +84,37 @@ IDENTITY="$(cfg TURN_IDENTITY)"
 IDENTITY="${IDENTITY:-Dohcord}"
 TTL_RAW="$(cfg CREDENTIAL_TTL)"
 
+PROXY_URL="${PROXY_URL_OVERRIDE:-$(cfg HTTPS_PROXY_URL)}"
+API_URL="${API_URL_OVERRIDE:-$(cfg NETWORK_CONFIG_URL)}"
+ALLOWED_FILE="$(cfg ALLOWED_DOMAINS_FILE)"
+ALLOWED_FILE="${ALLOWED_FILE:-/etc/dohcord-relay/allowed-domains.txt}"
+POLICY_FILE="$(cfg DESTINATION_POLICY_FILE)"
+POLICY_FILE="${POLICY_FILE:-/etc/dohcord-relay/destination-policy.conf}"
+ALLOW_FILE="$(cfg SQUID_ALLOW_FILE)"
+ALLOW_FILE="${ALLOW_FILE:-/etc/dohcord-relay/squid-allow.conf}"
+
+# split_url URL -> sets URL_SCHEME URL_HOST URL_PORT
+split_url() {
+	local u="$1"
+	URL_SCHEME="${u%%://*}"
+	local rest="${u#*://}"
+	rest="${rest%%/*}"
+	if [[ "${rest}" == *:* && "${rest##*:}" =~ ^[0-9]+$ ]]; then
+		URL_HOST="${rest%:*}"
+		URL_PORT="${rest##*:}"
+	else
+		URL_HOST="${rest}"
+		URL_PORT=""
+	fi
+}
+
+split_url "${PROXY_URL}"
+PROXY_HOST="${URL_HOST}"
+PROXY_PORT="${URL_PORT:-443}"
+split_url "${API_URL}"
+API_HOST="${URL_HOST:-${PROXY_HOST}}"
+API_PORT="${URL_PORT:-8443}"
+
 UDP_URL=""
 TLS_URL=""
 for u in "${TURN_URLS[@]}"; do
@@ -89,30 +128,40 @@ done
 	exit 2
 }
 
-parse_url() { # <url> -> sets URL_HOST URL_PORT
+turn_host_port() { # <url> -> TURN_HOST TURN_PORT
 	local u="$1"
-	URL_HOST=""
-	URL_PORT=""
-	if [[ "${u}" =~ ^turns?://?([0-9.]+):([0-9]+) ]] ||
-		[[ "${u}" =~ ^turns?:([0-9.]+):([0-9]+) ]]; then
-		URL_HOST="${BASH_REMATCH[1]}"
-		URL_PORT="${BASH_REMATCH[2]}"
-	fi
+	u="${u#turns:}"
+	u="${u#turn:}"
+	u="${u#//}"
+	u="${u%%\?*}"
+	TURN_HOST="${u%:*}"
+	TURN_PORT="${u##*:}"
+	[[ "${TURN_PORT}" =~ ^[0-9]+$ ]] || TURN_PORT=""
 }
 
-parse_url "${UDP_URL}"
-SERVER_IP="${URL_HOST}"
-UDP_PORT="${URL_PORT:-3478}"
+turn_host_port "${UDP_URL}"
+SERVER_HOST="${TURN_HOST:-${PROXY_HOST}}"
+UDP_PORT="${TURN_PORT:-3478}"
 TLS_PORT="5349"
 if [[ -n "${TLS_URL}" ]]; then
-	parse_url "${TLS_URL}"
-	TLS_PORT="${URL_PORT:-5349}"
+	turn_host_port "${TLS_URL}"
+	TLS_PORT="${TURN_PORT:-5349}"
 fi
 
-[[ -n "${SERVER_IP}" ]] || {
-	printf 'error: cannot parse the server address from %s\n' "${UDP_URL}" >&2
+[[ -n "${SERVER_HOST}" ]] || {
+	printf 'error: cannot determine the server host from the configuration\n' >&2
 	exit 2
 }
+
+SERVER_IP="$(python3 - "${SERVER_HOST}" <<'PY' 2>/dev/null
+import socket, sys
+try:
+    print(socket.getaddrinfo(sys.argv[1], None, socket.AF_INET, socket.SOCK_STREAM)[0][4][0])
+except Exception:
+    pass
+PY
+)"
+SERVER_IP="${SERVER_IP:-${SERVER_HOST}}"
 
 # CREDENTIAL_TTL is either a number of seconds or a Go duration such as 24h.
 ttl_seconds() {
@@ -134,7 +183,6 @@ PY
 TTL="$(ttl_seconds "${TTL_RAW:-24h}")"
 
 UCLIENT="$(command -v turnutils_uclient || true)"
-UTILS_DIR=""
 if [[ -z "${UCLIENT}" ]]; then
 	for candidate in /usr/local/bin/turnutils_uclient /usr/bin/turnutils_uclient; do
 		[[ -x "${candidate}" ]] && UCLIENT="${candidate}" && break
@@ -142,20 +190,21 @@ if [[ -z "${UCLIENT}" ]]; then
 fi
 [[ -n "${UCLIENT}" ]] && UTILS_DIR="$(dirname "${UCLIENT}")"
 PEER_BIN=""
-[[ -n "${UTILS_DIR}" && -x "${UTILS_DIR}/turnutils_peer" ]] && PEER_BIN="${UTILS_DIR}/turnutils_peer"
+[[ -n "${UTILS_DIR:-}" && -x "${UTILS_DIR}/turnutils_peer" ]] && PEER_BIN="${UTILS_DIR}/turnutils_peer"
 
 printf 'Dohcord Relay verification\n'
-printf '  server      %s\n' "${SERVER_IP}"
-printf '  turn url    %s\n' "${UDP_URL}"
-printf '  tls url     %s\n' "${TLS_URL:-<not configured>}"
-printf '  identity    %s\n' "${IDENTITY}"
+printf '  proxy      %s\n' "${PROXY_URL}"
+printf '  api        %s\n' "${API_URL}"
+printf '  turn url   %s\n' "${UDP_URL}"
+printf '  tls url    %s\n' "${TLS_URL:-<not configured>}"
+printf '  identity   %s\n' "${IDENTITY}"
 
 # --- services ---------------------------------------------------------------
 section "Services"
 if [[ "${SKIP_UNITS}" == "1" ]]; then
 	skip "systemd checks disabled (DOHCORD_RELAY_SKIP_UNITS=1)"
 else
-	for unit in "${COTURN_UNIT}" "${CRED_UNIT}"; do
+	for unit in "${SQUID_UNIT}" "${COTURN_UNIT}" "${API_UNIT}"; do
 		if systemctl is-active --quiet "${unit}"; then
 			pass "${unit} is active"
 		else
@@ -169,8 +218,18 @@ section "Listeners"
 if [[ "${SKIP_UNITS}" == "1" ]]; then
 	skip "listener checks disabled"
 else
+	if ss -Hltn "sport = :${PROXY_PORT}" 2>/dev/null | grep -q .; then
+		pass "TCP ${PROXY_PORT} is listening (HTTPS CONNECT proxy)"
+	else
+		fail "TCP ${PROXY_PORT} is not listening"
+	fi
+	if ss -Hltn "sport = :${API_PORT}" 2>/dev/null | grep -q .; then
+		pass "TCP ${API_PORT} is listening (network configuration endpoint)"
+	else
+		fail "TCP ${API_PORT} is not listening"
+	fi
 	if ss -Hlun "sport = :${UDP_PORT}" 2>/dev/null | grep -q .; then
-		pass "UDP ${UDP_PORT} is listening (primary TURN)"
+		pass "UDP ${UDP_PORT} is listening (TURN)"
 	else
 		fail "UDP ${UDP_PORT} is not listening"
 	fi
@@ -192,8 +251,8 @@ else
 	fail "relay allocation range not found in ${TURN_CONF}"
 fi
 
-# --- limits -----------------------------------------------------------------
-section "Limits and peer filtering"
+# --- TURN limits and peer filtering -----------------------------------------
+section "TURN limits and peer filtering"
 read_conf() { sed -n "s/^$1=//p" "${TURN_CONF}" 2>/dev/null | tail -1; }
 user_quota="$(read_conf user-quota)"
 total_quota="$(read_conf total-quota)"
@@ -237,9 +296,202 @@ else
 	note "no-tcp-relay is not set: clients may request TCP relays to peers"
 fi
 
-# --- HTTPS contract ---------------------------------------------------------
-section "HTTPS credential endpoint"
-ENDPOINT="${ENDPOINT_OVERRIDE:-https://${SERVER_IP}/turn-credentials}"
+# --- Squid configuration ----------------------------------------------------
+section "HTTPS CONNECT proxy configuration"
+if [[ -r "${SQUID_CONF}" ]]; then
+	if grep -qE "^https_port[[:space:]]+${PROXY_PORT}[[:space:]]" "${SQUID_CONF}"; then
+		pass "https_port ${PROXY_PORT} is a TLS-enabled forward proxy listener"
+	else
+		fail "${SQUID_CONF} has no https_port ${PROXY_PORT} listener"
+	fi
+	# Match a directive, not the word inside a comment: the shipped configuration
+	# mentions "no ssl_bump" in its header.
+	if grep -qE '^[[:space:]]*ssl_bump([[:space:]]|$)' "${SQUID_CONF}"; then
+		fail "ssl_bump is configured; this relay must never intercept TLS"
+	else
+		pass "no ssl_bump: the Discord TLS session stays end-to-end"
+	fi
+	if grep -qxF 'http_access deny !dohcord_connect' "${SQUID_CONF}" && grep -qxF 'http_access deny all' "${SQUID_CONF}"; then
+		pass "CONNECT is the only method and the default action is deny"
+	else
+		fail "CONNECT-only deny rules are missing from ${SQUID_CONF}"
+	fi
+	if grep -q 'dohcord_blocked_dst' "${SQUID_CONF}" && grep -qE '10\.0\.0\.0/8' "${SQUID_CONF}"; then
+		pass "resolved destination addresses are checked against private/special ranges"
+	else
+		fail "private destination address filtering is missing from ${SQUID_CONF}"
+	fi
+	if grep -qE '^client_ip_max_connections [0-9]+' "${SQUID_CONF}"; then
+		pass "per-client connection limit set ($(sed -n 's/^client_ip_max_connections //p' "${SQUID_CONF}"))"
+	else
+		fail "client_ip_max_connections is not set in ${SQUID_CONF}"
+	fi
+	if grep -qxF "include ${ALLOW_FILE}" "${SQUID_CONF}"; then
+		pass "the generated destination policy include is wired in"
+	else
+		fail "${SQUID_CONF} does not include ${ALLOW_FILE}"
+	fi
+	if [[ -x "${BINARY}" ]]; then
+		if "${BINARY}" -config "${CONFIG}" -policy-check >/dev/null 2>&1; then
+			pass "allowed-domains.txt and destination-policy.conf validate and agree"
+		else
+			fail "the destination policy files do not validate: ${BINARY} -config ${CONFIG} -policy-check"
+		fi
+	else
+		skip "policy validation skipped: ${BINARY} not found"
+	fi
+	if [[ -r "${ALLOW_FILE}" ]]; then
+		# The generated ACLs must cover exactly the configured policy.
+		if python3 - "${ALLOWED_FILE}" "${POLICY_FILE}" "${ALLOW_FILE}" <<'PY'
+import re, sys
+domains_file, policy_file, allow_file = sys.argv[1:4]
+def entries(path):
+    out = []
+    for raw in open(path):
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            out.append(line)
+    return out
+def portspec(spec):
+    parts = []
+    for p in spec.split(","):
+        p = p.strip()
+        if "-" in p:
+            a, b = p.split("-", 1)
+            parts.append(f"{int(a)}-{int(b)}")
+        else:
+            parts.append(str(int(p)))
+    return " ".join(parts)
+policy = {}
+for line in entries(policy_file):
+    f = line.split()
+    policy[f[0].lower().rstrip(".")] = portspec(f[1])
+allow = open(allow_file).read()
+want = set(entries(domains_file))
+if want != set(policy):
+    print("allowlist and port policy disagree")
+    sys.exit(1)
+for domain, ports in policy.items():
+    if f"dstdomain .{domain}" not in allow:
+        print(f"missing dstdomain for {domain}")
+        sys.exit(1)
+    if f"port {ports}" not in allow:
+        print(f"missing port rule {ports} for {domain}")
+        sys.exit(1)
+for line in allow.splitlines():
+    if line.startswith("http_access"):
+        if "dohcord_domain_" not in line or "dohcord_ports_" not in line:
+            print(f"access rule does not constrain domain and port: {line}")
+            sys.exit(1)
+sys.exit(0)
+PY
+		then
+			pass "generated Squid ACLs match the policy files exactly"
+		else
+			fail "generated Squid ACLs do not match ${ALLOWED_FILE} / ${POLICY_FILE}; run the policy command"
+		fi
+	else
+		fail "cannot read ${ALLOW_FILE}"
+	fi
+else
+	fail "cannot read ${SQUID_CONF}"
+fi
+
+# --- proxy behaviour --------------------------------------------------------
+section "HTTPS CONNECT proxy policy enforcement"
+
+# proxy_probe URL prints one of: denied, tls, ok, other
+#
+# Probes always verify the proxy's TLS certificate: with the system trust store,
+# or with DOHCORD_RELAY_PROXY_CA when the relay uses a staging certificate.
+proxy_ca_args=()
+[[ -n "${PROXY_CA}" ]] && proxy_ca_args+=(--proxy-cacert "${PROXY_CA}")
+proxy_probe() {
+	local url="$1" out rc
+	out="$(curl -sS -o /dev/null --max-time 25 "${proxy_ca_args[@]}" --proxy "${PROXY_URL}" "$url" 2>&1)"
+	rc=$?
+	if grep -q 'CONNECT tunnel failed, response 403' <<<"${out}"; then
+		echo denied
+	elif grep -qiE 'SSL certificate problem|certificate verify' <<<"${out}"; then
+		echo tls
+	elif [[ ${rc} -eq 0 ]]; then
+		echo ok
+	else
+		echo other
+	fi
+}
+
+curl_features="$(curl --version 2>/dev/null)"
+if ! grep -q 'HTTPS-proxy' <<<"${curl_features}"; then
+	skip "this curl has no HTTPS-proxy support; proxy checks skipped"
+else
+	# The proxy's own certificate must be publicly trusted and valid for the
+	# configured host: curl verifies it with the system trust store.
+	probe_out="$(proxy_probe "https://discord.com/")"
+	proxy_tls_ok=0
+	case "${probe_out}" in
+	tls)
+		fail "the TLS certificate presented by the proxy did not verify for ${PROXY_HOST}"
+		;;
+	denied)
+		fail "CONNECT discord.com:443 was denied"
+		;;
+	ok)
+		proxy_tls_ok=1
+		pass "proxy TLS verified, CONNECT discord.com:443 succeeded end to end"
+		;;
+	*)
+		# The tunnel opened, so the certificate was accepted; the origin simply
+		# did not answer. Policy probes are still meaningful.
+		proxy_tls_ok=1
+		warn "CONNECT discord.com:443 was permitted but the origin request did not complete (${probe_out}); check outbound HTTPS from this VPS"
+		;;
+	esac
+
+	if ((!proxy_tls_ok)); then
+		skip "policy probes skipped: fix the proxy certificate first, otherwise a denial cannot be told apart from a TLS failure"
+	elif [[ "$(proxy_probe "https://gateway.discord.gg/?v=10&encoding=json")" == "denied" ]]; then
+		fail "CONNECT gateway.discord.gg:443 (WebSocket gateway) was denied"
+	else
+		pass "CONNECT gateway.discord.gg:443 is permitted (the WSS transport path)"
+	fi
+
+	denied_cases=(
+		"https://example.com/|unlisted domain"
+		"https://discord.com.evil.example/|allowlist suffix trick"
+		"https://evil-discord.com/|similar-looking domain"
+		"https://1.1.1.1/|IP-literal destination"
+		"https://discord.com:2053/|port outside discord.com's policy"
+	)
+	for c in "${denied_cases[@]}"; do
+		url="${c%%|*}"
+		label="${c##*|}"
+		case "$(proxy_probe "${url}")" in
+		denied) pass "rejected: ${label} (${url})" ;;
+		tls) fail "TLS verification failed while testing ${label}" ;;
+		*) fail "${label} was not rejected with a policy denial (${url})" ;;
+		esac
+	done
+
+	# Dynamic voice-signalling ports are allowed for discord.media only. The
+	# exact port is supplied by Discord at call time; any permitted port must
+	# pass the ACL (the origin may still refuse the connection).
+	media_case="$(proxy_probe "https://sweetwater-12345.discord.media:2048/")"
+	if [[ "${media_case}" == "denied" ]]; then
+		fail "CONNECT to a dynamic discord.media port was denied"
+	else
+		pass "CONNECT to a dynamic discord.media port is permitted (${media_case})"
+	fi
+	case "$(proxy_probe "https://gateway.discord.com:2048/")" in
+	denied) pass "the dynamic port range is not available to other Discord domains" ;;
+	tls) skip "dynamic-port isolation not tested: the proxy certificate did not verify" ;;
+	*) fail "a non-media Discord domain was allowed on a dynamic port" ;;
+	esac
+fi
+
+# --- HTTPS API --------------------------------------------------------------
+section "Network configuration endpoint"
+ENDPOINT="${ENDPOINT_OVERRIDE:-${API_URL}}"
 BODY_FILE="$(mktemp)"
 HEADER_FILE="$(mktemp)"
 trap 'rm -f "${BODY_FILE}" "${HEADER_FILE}"' EXIT
@@ -250,7 +502,7 @@ http_status="$(curl -sS --max-time 15 "${curl_tls_args[@]}" -D "${HEADER_FILE}" 
 	-w '%{http_code}' "${ENDPOINT}" 2>/dev/null || echo 000)"
 
 if [[ "${http_status}" == "200" ]]; then
-	pass "GET ${ENDPOINT} returned 200 with a verified certificate for ${SERVER_IP}"
+	pass "GET ${ENDPOINT} returned 200 with a verified certificate"
 else
 	fail "GET ${ENDPOINT} returned ${http_status} (expected 200)"
 	head -5 "${BODY_FILE}" 2>/dev/null | sed 's/^/        /'
@@ -270,23 +522,81 @@ fi
 USERNAME=""
 CREDENTIAL=""
 EXPIRES_AT=""
+DOC_PROXY=""
 if [[ "${http_status}" == "200" ]]; then
-	eval "$(python3 - "${BODY_FILE}" <<'PY'
+	eval "$(python3 - "${BODY_FILE}" "${POLICY_FILE}" <<'PY'
 import json, shlex, sys
+body, policy_file = sys.argv[1:3]
 try:
-    d = json.load(open(sys.argv[1]))
-    ice = d["iceServers"][0]
-    print("USERNAME=" + shlex.quote(ice["username"]))
-    print("CREDENTIAL=" + shlex.quote(ice["credential"]))
-    print("EXPIRES_AT=" + shlex.quote(str(d["expiresAt"])))
-    print("URLS=" + shlex.quote(",".join(ice["urls"])))
+    d = json.load(open(body))
 except Exception:
-    pass
+    print("SCHEMA=0")
+    sys.exit(0)
+
+def entries(path):
+    out = []
+    for raw in open(path):
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            out.append(line)
+    return out
+
+def portspec(spec):
+    parts = []
+    for p in spec.split(","):
+        p = p.strip()
+        if "-" in p:
+            a, b = p.split("-", 1)
+            parts.append(f"{int(a)}-{int(b)}")
+        else:
+            parts.append(str(int(p)))
+    return " ".join(parts)
+
+want = {}
+for line in entries(policy_file):
+    fields = line.split()
+    want[fields[0].lower().rstrip(".")] = portspec(fields[1])
+
+got = {}
+for dest in d.get("httpsProxy", {}).get("allowedDestinations", []):
+    parts = [str(int(p)) for p in dest.get("ports", [])]
+    parts += [f'{int(r["from"])}-{int(r["to"])}' for r in dest.get("portRanges", [])]
+    got[dest["domain"]] = " ".join(parts)
+
+ice = d.get("rtcRelay", {}).get("iceServers", [{}])[0]
+print("SCHEMA=" + shlex.quote(str(d.get("version"))))
+print("DOC_PROXY=" + shlex.quote(d.get("httpsProxy", {}).get("url", "")))
+print("USERNAME=" + shlex.quote(ice.get("username", "")))
+print("CREDENTIAL=" + shlex.quote(ice.get("credential", "")))
+print("EXPIRES_AT=" + shlex.quote(str(d.get("rtcRelay", {}).get("expiresAt", ""))))
+print("POLICY_MATCH=" + ("1" if want == got else "0"))
 PY
 )"
 
-	[[ -n "${USERNAME}" && -n "${CREDENTIAL}" ]] && pass "credentials are present in the response" ||
-		fail "response does not contain username/credential"
+	if [[ "${SCHEMA:-0}" == "1" ]]; then
+		pass "response uses schema version 1"
+	else
+		fail "response schema version is '${SCHEMA:-missing}', expected 1"
+	fi
+	if [[ "${POLICY_MATCH:-0}" == "1" ]]; then
+		pass "advertised domain-and-port policy matches the policy files exactly"
+	else
+		fail "advertised policy does not match ${POLICY_FILE}"
+	fi
+
+	if [[ -n "${DOC_PROXY}" ]]; then
+		pass "document quotes an HTTPS proxy URL (${DOC_PROXY})"
+		if [[ "${DOC_PROXY}" == "${PROXY_URL}" ]]; then
+			pass "advertised proxy URL matches the configured proxy"
+		else
+			fail "advertised proxy URL ${DOC_PROXY} differs from ${PROXY_URL}"
+		fi
+	else
+		fail "the response has no httpsProxy.url (or an unexpected schema version)"
+	fi
+
+	[[ -n "${USERNAME}" && -n "${CREDENTIAL}" ]] && pass "TURN credentials are present in the response" ||
+		fail "response does not contain TURN username/credential"
 
 	now="$(date +%s)"
 	if [[ "${EXPIRES_AT}" =~ ^[0-9]+$ ]] && [[ $((EXPIRES_AT - now)) -ge $((TTL - 300)) ]] &&
@@ -322,8 +632,23 @@ PY
 		else
 			fail "credential does not match the coturn shared secret"
 		fi
+		if grep -qF "$(cat "${SECRET_FILE}")" "${BODY_FILE}" 2>/dev/null; then
+			fail "the response leaked the permanent TURN secret"
+		else
+			pass "the permanent TURN secret is not in the response"
+		fi
 	else
 		skip "cannot read ${SECRET_FILE} to re-compute the credential"
+	fi
+
+	if [[ "${http_status}" == "200" ]]; then
+		other="$(curl -sS --max-time 10 "${curl_tls_args[@]}" -o /dev/null -w '%{http_code}' \
+			"${ENDPOINT%/network-config}/does-not-exist" 2>/dev/null || echo 000)"
+		if [[ "${other}" == "404" ]]; then
+			pass "unknown paths return 404"
+		else
+			fail "GET a non-API path returned ${other}, expected 404"
+		fi
 	fi
 fi
 
@@ -332,7 +657,7 @@ section "ACME HTTP-01 path"
 ACME_WEBROOT="$(cfg ACME_WEBROOT)"
 ACME_WEBROOT="${ACME_WEBROOT:-/var/www/dohcord-relay}"
 ACME_DIR="${ACME_WEBROOT}/.well-known/acme-challenge"
-ACME_URL="${DOHCORD_RELAY_ACME_URL:-http://${SERVER_IP}/.well-known/acme-challenge}"
+ACME_URL="${DOHCORD_RELAY_ACME_URL:-http://${PROXY_HOST}/.well-known/acme-challenge}"
 acme_token="dohcordverify${RANDOM}${RANDOM}"
 if mkdir -p "${ACME_DIR}" 2>/dev/null && printf 'acme-ok\n' >"${ACME_DIR}/${acme_token}" 2>/dev/null; then
 	acme_body="$(curl -sS --max-time 10 "${ACME_URL}/${acme_token}" 2>/dev/null || true)"
@@ -346,201 +671,44 @@ else
 	skip "cannot write a probe challenge file to ${ACME_DIR} (run as root to test this)"
 fi
 
-# --- TLS listener -----------------------------------------------------------
-section "TURN over TLS"
-if [[ -n "${TLS_URL}" ]]; then
+# --- TLS listeners ----------------------------------------------------------
+section "TLS certificates"
+for target in "${PROXY_HOST}:${PROXY_PORT}|proxy endpoint" "${SERVER_HOST}:${TLS_PORT}|TURN over TLS"; do
+	hostport="${target%%|*}"
+	label="${target##*|}"
+	host="${hostport%:*}"
+	port="${hostport##*:}"
 	openssl_ca=()
 	[[ -n "${CA_FILE}" ]] && openssl_ca=(-CAfile "${CA_FILE}")
-	verify_out="$(timeout 10 openssl s_client -connect "${SERVER_IP}:${TLS_PORT}" \
-		-verify_ip "${SERVER_IP}" -verify_return_error "${openssl_ca[@]}" 2>&1 </dev/null || true)"
+	if ! ss -Hltn "sport = :${port}" 2>/dev/null | grep -q .; then
+		skip "${label}: TCP ${port} is not listening"
+		continue
+	fi
+	verify_out="$(timeout 10 openssl s_client -connect "${hostport}" -servername "${host}" \
+		-verify_hostname "${host}" -verify_return_error "${openssl_ca[@]}" 2>&1 </dev/null || true)"
 	if grep -q 'Verify return code: 0 (ok)' <<<"${verify_out}"; then
-		pass "TLS ${TLS_PORT} presents a certificate that is valid for ${SERVER_IP}"
+		pass "${label}: certificate is publicly trusted and valid for ${host}"
 	else
-		fail "TLS ${TLS_PORT} certificate did not verify for ${SERVER_IP}"
-		grep -E 'Verify return code|verify error' <<<"${verify_out}" | head -3 | sed 's/^/        /'
-	fi
-else
-	skip "no turns: URL configured"
-fi
-
-# --- TURN authentication ----------------------------------------------------
-section "TURN authentication and relaying"
-if [[ -z "${UCLIENT}" ]]; then
-	skip "turnutils_uclient not found (install coturn utilities to test allocation)"
-else
-	# uclient needs a peer address even for an allocation-only probe. Using the
-	# relay's own address keeps the probe local; the permission may be refused
-	# and that is fine, the ALLOCATE itself is what is being checked.
-	probe_peer="${PROBE_PEER:-${SERVER_IP}}"
-	turn_probe() { # <user> <password>
-		local user="$1" pass="$2"
-		shift 2
-		local out
-		out="$(timeout 15 "${UCLIENT}" -v -c -n 1 -m 1 -p "${UDP_PORT}" \
-			-e "${probe_peer}" -r "${PROBE_PEER_PORT}" \
-			-u "${user}" -w "${pass}" "$@" "${SERVER_IP}" 2>&1 || true)"
-		printf '%s' "${out}"
-	}
-
-	if [[ -n "${USERNAME}" ]]; then
-		probe_out="$(turn_probe "${USERNAME}" "${CREDENTIAL}")"
-		if grep -q 'Received relay addr' <<<"${probe_out}"; then
-			relay_addr="$(grep -o 'Received relay addr: [0-9.]*:[0-9]*' <<<"${probe_out}" | head -1)"
-			pass "a TURN client obtained a relay candidate (${relay_addr#Received relay addr: })"
+		# An IP certificate has no host name; verify it as an IP instead.
+		verify_out_ip="$(timeout 10 openssl s_client -connect "${hostport}" \
+			-verify_ip "${host}" -verify_return_error "${openssl_ca[@]}" 2>&1 </dev/null || true)"
+		if grep -q 'Verify return code: 0 (ok)' <<<"${verify_out_ip}"; then
+			pass "${label}: certificate is publicly trusted and valid for IP ${host}"
 		else
-			fail "no relay candidate for valid credentials"
-			tail -3 <<<"${probe_out}" | sed 's/^/        /'
+			fail "${label}: certificate did not verify for ${host}"
+			grep -E 'Verify return code|verify error' <<<"${verify_out}" | head -3 | sed 's/^/        /'
 		fi
-
-		if [[ -n "${TLS_URL}" ]]; then
-			trust_store="${CA_FILE:-/etc/ssl/certs/ca-certificates.crt}"
-			tls_out="$(timeout 15 "${UCLIENT}" -v -c -t -S -p "${TLS_PORT}" \
-				-E "${trust_store}" -n 1 -m 1 \
-				-e "${probe_peer}" -r "${PROBE_PEER_PORT}" \
-				-u "${USERNAME}" -w "${CREDENTIAL}" "${SERVER_IP}" 2>&1 || true)"
-			if grep -q 'Received relay addr' <<<"${tls_out}"; then
-				pass "a TURN client obtained a relay candidate over TLS"
-			else
-				fail "no relay candidate over TLS"
-				tail -3 <<<"${tls_out}" | sed 's/^/        /'
-			fi
-		fi
-
-		bad_out="$(turn_probe "${USERNAME}" 'aaaaaaaaaaaaaaaaaaaaaaaaaaaa')"
-		if grep -q 'Received relay addr' <<<"${bad_out}"; then
-			fail "an allocation succeeded with a wrong password"
-		else
-			pass "a wrong password is rejected (no allocation)"
-		fi
-
-		expired_user="1000000000:${IDENTITY}"
-		expired_pass=""
-		if [[ -r "${SECRET_FILE}" ]]; then
-			expired_pass="$(python3 - "${expired_user}" "${SECRET_FILE}" <<'PY'
-import base64, hashlib, hmac, sys
-u, f = sys.argv[1], sys.argv[2]
-print(base64.b64encode(hmac.new(open(f, "rb").read().strip(), u.encode(), hashlib.sha1).digest()).decode())
-PY
-)"
-		fi
-		expired_out="$(turn_probe "${expired_user}" "${expired_pass}")"
-		if grep -q 'Received relay addr' <<<"${expired_out}"; then
-			fail "an expired username was accepted"
-		else
-			pass "an expired username timestamp is rejected (no allocation)"
-		fi
-
-		anon_out="$(turn_probe '' '')"
-		if grep -q 'Received relay addr' <<<"${anon_out}"; then
-			fail "an unauthenticated allocation succeeded"
-		else
-			pass "an unauthenticated allocation is rejected"
-		fi
-
-		if [[ -r "${TURN_LOG}" ]] && grep -q '401: Unauthorized' "${TURN_LOG}" 2>/dev/null; then
-			note "coturn logged 401: Unauthorized for the rejected probes"
-		fi
-	else
-		fail "no credential was obtained, so TURN authentication could not be tested"
 	fi
-fi
+done
 
-# --- media forwarding -------------------------------------------------------
-section "Media forwarding"
-MEDIA_PEER="${PROBE_PEER}"
-if [[ -z "${MEDIA_PEER}" ]]; then
-	if ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qx "${SERVER_IP}"; then
-		MEDIA_PEER="${SERVER_IP}"
-	fi
-fi
-
-if [[ -n "${UCLIENT}" && -n "${USERNAME}" && -n "${MEDIA_PEER}" && -n "${PEER_BIN}" ]]; then
-	if ! ss -Hlun "sport = :${PROBE_PEER_PORT}" 2>/dev/null | grep -q .; then
-		"${PEER_BIN}" -L "${MEDIA_PEER}" -p "${PROBE_PEER_PORT}" >/dev/null 2>&1 &
-		peer_pid=$!
-		sleep 1
-	fi
-	media_out="$(timeout 30 "${UCLIENT}" -v -c -n 10 -m 1 -e "${MEDIA_PEER}" -r "${PROBE_PEER_PORT}" \
-		-p "${UDP_PORT}" -u "${USERNAME}" -w "${CREDENTIAL}" "${SERVER_IP}" 2>&1 || true)"
-	[[ -n "${peer_pid:-}" ]] && kill "${peer_pid}" 2>/dev/null
-	sent="$(grep -o 'tot_send_msgs=[0-9]*' <<<"${media_out}" | tail -1 | cut -d= -f2)"
-	recv="$(grep -o 'tot_recv_msgs=[0-9]*' <<<"${media_out}" | tail -1 | cut -d= -f2)"
-	if [[ "${sent:-0}" -ge 10 && "${recv:-0}" -ge 10 ]]; then
-		pass "bidirectional media traversed the relay (sent=${sent}, received=${recv})"
-	else
-		fail "media did not traverse the relay (sent=${sent:-0}, received=${recv:-0})"
-	fi
-else
-	skip "media test needs turnutils_peer and a peer address on this host; set DOHCORD_RELAY_PROBE_PEER"
-fi
-
-# --- outbound UDP -----------------------------------------------------------
-section "Outbound UDP"
-# A real STUN Binding request to a public STUN server: this exercises exactly the
-# egress path relayed media uses (UDP to a remote RTC endpoint).
-outbound="$(python3 - <<'PY' 2>/dev/null
-import socket, struct, sys
-for host in ("stun.l.google.com", "stun.cloudflare.com"):
-    try:
-        addr = socket.getaddrinfo(host, 19302, socket.AF_INET, socket.SOCK_DGRAM)[0][4]
-    except Exception:
-        continue
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(4)
-    # STUN Binding Request, magic cookie 0x2112A442, empty attributes.
-    request = struct.pack("!HHI", 0x0001, 0, 0x2112A442) + b"\x00" * 12
-    try:
-        sock.sendto(request, addr)
-        data, _ = sock.recvfrom(1024)
-        if len(data) >= 20 and data[0:2] == b"\x01\x01":
-            print(host)
-            sys.exit(0)
-    except Exception:
-        pass
-    finally:
-        sock.close()
-sys.exit(1)
-PY
-)"
-if [[ -n "${outbound}" ]]; then
-	pass "STUN binding over outbound UDP works (echo from ${outbound})"
-else
-	# Distinguish "no UDP egress at all" from "this network blocks UDP to
-	# ports other than DNS", which some build/hosting environments do.
-	udp_dns="$(python3 - <<'PY' 2>/dev/null
-import socket, sys
-query = (b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
-         b'\x07example\x03com\x00\x00\x01\x00\x01')
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(4)
-try:
-    s.sendto(query, ('1.1.1.1', 53))
-    data, _ = s.recvfrom(512)
-    if len(data) > 12:
-        print("ok")
-        sys.exit(0)
-except Exception:
-    pass
-sys.exit(1)
-PY
-)"
-	if [[ -n "${udp_dns}" ]]; then
-		warn "outbound UDP to a public DNS server works, but no STUN reply arrived; this network may filter UDP to non-DNS ports. Confirm on the host that UDP to Discord's ICE endpoints is permitted"
-	else
-		fail "no outbound UDP at all; relayed media cannot reach remote ICE endpoints (check egress firewall rules)"
-	fi
-fi
-
-# --- certificate and renewal ------------------------------------------------
-section "Certificate and renewal"
 if [[ -r "${TLS_CERT}" ]]; then
-	if openssl x509 -in "${TLS_CERT}" -noout -checkip "${SERVER_IP}" >/dev/null 2>&1; then
-		pass "certificate includes ${SERVER_IP} as an IP Subject Alternative Name"
-	else
-		fail "certificate does not cover ${SERVER_IP}"
-	fi
 	not_after="$(openssl x509 -in "${TLS_CERT}" -noout -enddate | cut -d= -f2)"
 	note "certificate expires ${not_after}"
+	if openssl x509 -in "${TLS_CERT}" -noout -checkend 86400 >/dev/null 2>&1; then
+		pass "certificate is valid for at least another 24 hours"
+	else
+		fail "certificate expires within 24 hours; renewal is not keeping up"
+	fi
 else
 	fail "cannot read ${TLS_CERT}"
 fi
@@ -548,16 +716,13 @@ fi
 if [[ "${SKIP_UNITS}" == "1" ]]; then
 	skip "renewal timer checks disabled"
 else
-	if systemctl is-enabled --quiet dohcord-relay-certbot-renew.timer 2>/dev/null; then
-		pass "dohcord-relay-certbot-renew.timer is enabled"
-	else
-		fail "dohcord-relay-certbot-renew.timer is not enabled"
-	fi
-	if systemctl is-active --quiet dohcord-relay-certbot-renew.timer 2>/dev/null; then
-		pass "dohcord-relay-certbot-renew.timer is active"
-	else
-		fail "dohcord-relay-certbot-renew.timer is not active"
-	fi
+	for state in enabled active; do
+		if systemctl is-${state} --quiet dohcord-relay-certbot-renew.timer 2>/dev/null; then
+			pass "dohcord-relay-certbot-renew.timer is ${state}"
+		else
+			fail "dohcord-relay-certbot-renew.timer is not ${state}"
+		fi
+	done
 fi
 
 CERTBOT_BIN="${DOHCORD_RELAY_CERTBOT:-}"
@@ -577,6 +742,166 @@ else
 		pass "certbot renew --dry-run succeeded for the ${CERT_NAME} lineage"
 	else
 		fail "certbot renew --dry-run failed; check port 80 reachability and the certbot log"
+	fi
+fi
+
+# --- TURN authentication ----------------------------------------------------
+section "TURN authentication and relaying"
+if [[ -z "${UCLIENT}" ]]; then
+	skip "turnutils_uclient not found (install coturn utilities to test allocation)"
+elif [[ -z "${USERNAME}" ]]; then
+	fail "no credential was obtained, so TURN authentication could not be tested"
+else
+	probe_peer="${PROBE_PEER:-${SERVER_IP}}"
+	turn_probe() { # <server> <user> <password> [extra args...]
+		local server="$1" user="$2" pass="$3"
+		shift 3
+		local out
+		out="$(timeout 15 "${UCLIENT}" -v -c -n 1 -m 1 -p "${UDP_PORT}" \
+			-e "${probe_peer}" -r "${PROBE_PEER_PORT}" \
+			-u "${user}" -w "${pass}" "$@" "${server}" 2>&1 || true)"
+		printf '%s' "${out}"
+	}
+
+	udp_out="$(turn_probe "${SERVER_IP}" "${USERNAME}" "${CREDENTIAL}")"
+	if grep -q 'Received relay addr' <<<"${udp_out}"; then
+		relay_addr="$(grep -o 'Received relay addr: [0-9.]*:[0-9]*' <<<"${udp_out}" | head -1)"
+		pass "a TURN client obtained a relay candidate over UDP (${relay_addr#Received relay addr: })"
+	else
+		fail "no relay candidate for valid credentials over UDP"
+		tail -3 <<<"${udp_out}" | sed 's/^/        /'
+	fi
+
+	if [[ -n "${TLS_URL}" ]]; then
+		# The TLS listener is verified by name above; uclient is pointed at the
+		# resolved address so its own name handling cannot mask a real failure.
+		tls_out="$(timeout 20 "${UCLIENT}" -v -c -t -S -p "${TLS_PORT}" \
+			-E "${CA_FILE:-/etc/ssl/certs/ca-certificates.crt}" -n 1 -m 1 \
+			-e "${probe_peer}" -r "${PROBE_PEER_PORT}" \
+			-u "${USERNAME}" -w "${CREDENTIAL}" "${SERVER_IP}" 2>&1 || true)"
+		if grep -q 'Received relay addr' <<<"${tls_out}"; then
+			pass "a TURN client obtained a relay candidate over TLS"
+		else
+			fail "no relay candidate over TLS"
+			tail -3 <<<"${tls_out}" | sed 's/^/        /'
+		fi
+	fi
+
+	bad_out="$(turn_probe "${SERVER_IP}" "${USERNAME}" 'aaaaaaaaaaaaaaaaaaaaaaaaaaaa')"
+	if grep -q 'Received relay addr' <<<"${bad_out}"; then
+		fail "an allocation succeeded with a wrong password"
+	else
+		pass "a wrong password is rejected (no allocation)"
+	fi
+
+	expired_user="1000000000:${IDENTITY}"
+	expired_pass=""
+	if [[ -r "${SECRET_FILE}" ]]; then
+		expired_pass="$(python3 - "${expired_user}" "${SECRET_FILE}" <<'PY'
+import base64, hashlib, hmac, sys
+u, f = sys.argv[1], sys.argv[2]
+print(base64.b64encode(hmac.new(open(f, "rb").read().strip(), u.encode(), hashlib.sha1).digest()).decode())
+PY
+)"
+	fi
+	expired_out="$(turn_probe "${SERVER_IP}" "${expired_user}" "${expired_pass}")"
+	if grep -q 'Received relay addr' <<<"${expired_out}"; then
+		fail "an expired username was accepted"
+	else
+		pass "an expired username timestamp is rejected (no allocation)"
+	fi
+
+	anon_out="$(turn_probe "${SERVER_IP}" "" "")"
+	if grep -q 'Received relay addr' <<<"${anon_out}"; then
+		fail "an unauthenticated allocation succeeded"
+	else
+		pass "an unauthenticated allocation is rejected"
+	fi
+
+	if [[ -r "${TURN_LOG}" ]] && grep -q '401: Unauthorized' "${TURN_LOG}" 2>/dev/null; then
+		note "coturn logged 401: Unauthorized for the rejected probes"
+	fi
+fi
+
+# --- media forwarding -------------------------------------------------------
+section "Media forwarding"
+MEDIA_PEER="${PROBE_PEER}"
+if [[ -z "${MEDIA_PEER}" ]]; then
+	if ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -qx "${SERVER_IP}"; then
+		MEDIA_PEER="${SERVER_IP}"
+	fi
+fi
+
+if [[ -n "${UCLIENT}" && -n "${USERNAME}" && -n "${MEDIA_PEER}" && -n "${PEER_BIN}" ]]; then
+	peer_pid=""
+	if ! ss -Hlun "sport = :${PROBE_PEER_PORT}" 2>/dev/null | grep -q .; then
+		"${PEER_BIN}" -L "${MEDIA_PEER}" -p "${PROBE_PEER_PORT}" >/dev/null 2>&1 &
+		peer_pid=$!
+		sleep 1
+	fi
+	media_out="$(timeout 30 "${UCLIENT}" -v -c -n 10 -m 1 -e "${MEDIA_PEER}" -r "${PROBE_PEER_PORT}" \
+		-p "${UDP_PORT}" -u "${USERNAME}" -w "${CREDENTIAL}" "${SERVER_IP}" 2>&1 || true)"
+	[[ -n "${peer_pid}" ]] && kill "${peer_pid}" 2>/dev/null
+	sent="$(grep -o 'tot_send_msgs=[0-9]*' <<<"${media_out}" | tail -1 | cut -d= -f2)"
+	recv="$(grep -o 'tot_recv_msgs=[0-9]*' <<<"${media_out}" | tail -1 | cut -d= -f2)"
+	if [[ "${sent:-0}" -ge 10 && "${recv:-0}" -ge 10 ]]; then
+		pass "bidirectional media traversed the relay (sent=${sent}, received=${recv})"
+	else
+		fail "media did not traverse the relay (sent=${sent:-0}, received=${recv:-0})"
+	fi
+else
+	skip "media test needs turnutils_peer and a peer address on this host; set DOHCORD_RELAY_PROBE_PEER"
+fi
+
+# --- outbound connectivity --------------------------------------------------
+section "Outbound connectivity"
+outbound="$(python3 - <<'PY' 2>/dev/null
+import socket, struct, sys
+for host in ("stun.l.google.com", "stun.cloudflare.com"):
+    try:
+        addr = socket.getaddrinfo(host, 19302, socket.AF_INET, socket.SOCK_DGRAM)[0][4]
+    except Exception:
+        continue
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(4)
+    request = struct.pack("!HHI", 0x0001, 0, 0x2112A442) + b"\x00" * 12
+    try:
+        sock.sendto(request, addr)
+        data, _ = sock.recvfrom(1024)
+        if len(data) >= 20 and data[0:2] == b"\x01\x01":
+            print(host)
+            sys.exit(0)
+    except Exception:
+        pass
+    finally:
+        sock.close()
+sys.exit(1)
+PY
+)"
+if [[ -n "${outbound}" ]]; then
+	pass "STUN binding over outbound UDP works (echo from ${outbound})"
+else
+	udp_dns="$(python3 - <<'PY' 2>/dev/null
+import socket, sys
+query = (b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+         b'\x07example\x03com\x00\x00\x01\x00\x01')
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(4)
+try:
+    s.sendto(query, ('1.1.1.1', 53))
+    data, _ = s.recvfrom(512)
+    if len(data) > 12:
+        print("ok")
+        sys.exit(0)
+except Exception:
+    pass
+sys.exit(1)
+PY
+)"
+	if [[ -n "${udp_dns}" ]]; then
+		warn "outbound UDP to a public DNS server works, but no STUN reply arrived; this network may filter UDP to non-DNS ports. Confirm that UDP to Discord's ICE endpoints is permitted"
+	else
+		fail "no outbound UDP at all; relayed media cannot reach remote ICE endpoints (check egress firewall rules)"
 	fi
 fi
 

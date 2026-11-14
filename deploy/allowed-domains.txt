@@ -1,0 +1,24 @@
+# Dohcord-relay - domains the HTTPS CONNECT proxy may reach
+#
+# Path on the server: /etc/dohcord-relay/allowed-domains.txt
+#
+# One domain per line. '#' starts a comment. A domain here allows that domain
+# AND its subdomains: "discord.com" covers "gateway.discord.com" and
+# "cdn.discordapp.com" covers "cdn.discordapp.com". Matching is on DNS label
+# boundaries, so "discord.com.evil.example" is not covered by "discord.com".
+#
+# Allowlisting a domain is not enough on its own: every domain here must also
+# have a port policy in destination-policy.conf, and the proxy allows only
+# those ports. After editing either file run:
+#
+#   sudo dohcord-relay -policy-apply -config /etc/dohcord-relay/config.env
+#
+# which validates both files, checks the whole Squid configuration and only
+# then reloads Squid. Domains must be plain host names: no scheme, no port, no
+# wildcard, no IP address.
+
+discord.com
+discord.gg
+discordapp.com
+discordapp.net
+discord.media

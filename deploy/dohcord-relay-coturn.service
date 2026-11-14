@@ -10,10 +10,8 @@ Type=simple
 # unprivileged ports. The certificate copies it reads are group-readable.
 User=turnserver
 Group=turnserver
-RuntimeDirectory=dohcord-relay
+RuntimeDirectory=dohcord-relay-coturn
 RuntimeDirectoryMode=0750
-LogsDirectory=dohcord-relay
-LogsDirectoryMode=0750
 ExecStart=@TURN_BINARY@ -c /etc/dohcord-relay/turnserver.conf
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
@@ -37,7 +35,7 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 NoNewPrivileges=true
-ReadWritePaths=/run/dohcord-relay /var/log/dohcord-relay
+ReadWritePaths=/run/dohcord-relay-coturn /var/log/dohcord-relay/turnserver
 
 [Install]
 WantedBy=multi-user.target

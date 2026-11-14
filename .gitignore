@@ -1,4 +1,5 @@
 # Built binary and local build output
+/dohcord-relay
 /dohcord-relay-credentials
 /dist/
 *.log
@@ -7,5 +8,7 @@
 .env
 config.env
 turn-secret
+policy.json
+squid-allow.conf
 *.pem
 *.key

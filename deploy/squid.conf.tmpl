@@ -1,0 +1,109 @@
+# Dohcord-relay - Squid HTTPS CONNECT proxy
+#
+# Rendered by install.sh. Do not edit by hand: re-run the installer instead.
+# Path on the server: /etc/dohcord-relay/squid.conf
+#
+# This is a TLS-enabled FORWARD proxy. Dohcord opens a TLS connection to this
+# port, sends "CONNECT host:port" inside it, and this proxy opens a plain TCP
+# connection to the approved destination. The inner TLS session (Dohcord to
+# Discord) is never decrypted: no ssl_bump, no generated CA, no interception.
+
+# --- Listener --------------------------------------------------------------
+# tls-cert points at a combined certificate+key PEM (squid.pem, maintained by
+# the certbot deploy hook, readable only by the proxy user).
+#
+# The TLS 1.2 floor is expressed differently by the two TLS backends Squid can
+# be built with, and each rejects the other's spelling, so install.sh writes the
+# form that this build understands:
+#   GnuTLS (Debian/Ubuntu packages): tls-options=NORMAL:-VERS-TLS1.0:-VERS-TLS1.1
+#   OpenSSL (source builds):         options=NO_TLSv1,NO_TLSv1_1
+https_port @PROXY_PORT@ tls-cert=@SQUID_PEM@ @TLS_OPTIONS@
+
+visible_hostname @PUBLIC_HOST@
+httpd_suppress_version_string on
+
+# Do not add client-address headers. CONNECT requests are never forwarded as
+# HTTP messages at all (Squid opens a raw TCP connection to the destination), so
+# the tunneled protocol cannot be altered either.
+forwarded_for delete
+
+# --- Process ---------------------------------------------------------------
+cache_effective_user @SQUID_USER@
+cache_effective_group @SQUID_GROUP@
+pid_filename @RUN_DIR@/squid.pid
+coredump_dir @LOG_DIR@
+
+# --- Logging ---------------------------------------------------------------
+# The access log records one line per attempted destination. It is the audit
+# trail for policy decisions and contains no tunneled payload.
+access_log daemon:@LOG_DIR@/access.log
+cache_log @LOG_DIR@/cache.log
+cache_store_log none
+buffered_logs on
+logfile_rotate 0
+
+# --- No caching ------------------------------------------------------------
+# A CONNECT tunnel is never cached anyway; make that explicit so no HTTP
+# response can be stored on this host either.
+cache deny all
+maximum_object_size 0 KB
+
+# --- Limits ----------------------------------------------------------------
+# Hard ceiling on concurrent connections from one client address. Discord opens
+# a handful of connections per client (HTTPS API, two WebSocket gateways, voice
+# signalling); this leaves generous headroom while stopping one source from
+# exhausting the relay.
+client_ip_max_connections @MAX_CONN_PER_IP@
+# Global descriptor ceiling: the total number of sockets Squid may hold, which
+# bounds total concurrent connections for the whole relay.
+max_filedescriptors @MAX_FDS@
+# Bound request parsing; a CONNECT request is a single short line.
+request_header_max_size 16 KB
+client_request_buffer_max_size 32 KB
+# Close client connections that stop sending data and cap connection lifetime.
+read_timeout @READ_TIMEOUT@
+client_idle_pconn_timeout 30 seconds
+request_timeout 30 seconds
+connect_timeout 15 seconds
+client_lifetime @CLIENT_LIFETIME@
+shutdown_lifetime 5 seconds
+
+# ICMP pinger and ICP are not used by this deployment.
+pinger_enable off
+icp_port 0
+htcp_port 0
+
+# --- Access control --------------------------------------------------------
+# CONNECT is the only method this relay serves. Everything else is denied
+# before any destination lookup happens.
+acl dohcord_connect method CONNECT
+http_access deny manager
+http_access deny !dohcord_connect
+
+# Defence in depth: even if a permitted domain resolved to an internal address,
+# Squid refuses to tunnel to loopback, private, link-local, multicast and
+# special-purpose destinations, and to this relay itself. The "dst" ACL makes
+# Squid resolve the requested hostname and check the resolved address before
+# connecting - the address that passed this check is the one it connects to.
+# IPv4-mapped IPv6 (::ffff:0:0/96) is deliberately not listed: Squid folds it into
+# the IPv4 table, where it becomes 0.0.0.0/0 and would deny every destination.
+# Mapped addresses are handled as plain IPv4 and are covered by the v4 ranges.
+acl dohcord_blocked_dst dst \
+	0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
+	172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.168.0.0/16 198.18.0.0/15 \
+	198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 \
+	::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8 \
+	@BLOCKED_IP@
+http_access deny dohcord_connect dohcord_blocked_dst
+
+# The domain-and-port allowlist. This include is generated from
+# allowed-domains.txt and destination-policy.conf by `dohcord-relay
+# -policy-apply`, which validates the whole configuration before reloading.
+include @ALLOW_FILE@
+
+# Anything not explicitly allowed above is refused. An empty or broken policy
+# can therefore never turn this into an open proxy.
+http_access deny all
+
+# No reverse-proxy module, no cache manager interface.
+http_reply_access allow all

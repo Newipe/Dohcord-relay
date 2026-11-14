@@ -14,6 +14,42 @@ import (
 	"time"
 )
 
+// testPolicyFiles writes a small allowlist and port policy and returns their
+// paths. The default test policy mirrors the shipped one closely enough to
+// exercise root domains, subdomains and a dynamic port range.
+func testPolicyFiles(t *testing.T) (domainsPath, policyPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	domainsPath = filepath.Join(dir, "allowed-domains.txt")
+	policyPath = filepath.Join(dir, "destination-policy.conf")
+
+	domains := strings.Join([]string{
+		"# Discord destinations the relay may reach",
+		"discord.com",
+		"discord.gg",
+		"discordapp.com",
+		"discordapp.net",
+		"discord.media",
+		"",
+	}, "\n")
+	ports := strings.Join([]string{
+		"discord.com       443",
+		"discord.gg        443",
+		"discordapp.com    443",
+		"discordapp.net    443",
+		"discord.media     443,1024-65535",
+		"",
+	}, "\n")
+
+	if err := os.WriteFile(domainsPath, []byte(domains), 0o644); err != nil {
+		t.Fatalf("write allowlist: %v", err)
+	}
+	if err := os.WriteFile(policyPath, []byte(ports), 0o644); err != nil {
+		t.Fatalf("write port policy: %v", err)
+	}
+	return domainsPath, policyPath
+}
+
 func testServer(t *testing.T, secret string, ttl time.Duration) (*server, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -24,11 +60,21 @@ func testServer(t *testing.T, secret string, ttl time.Duration) (*server, string
 		}
 	}
 
+	domainsPath, policyPath := testPolicyFiles(t)
+
 	cfg := defaultConfig()
 	cfg.secretFile = secretPath
 	cfg.ttl = ttl
 	cfg.httpsListen = ""
 	cfg.httpListen = ""
+	cfg.proxyURL = "https://relay.example.test:443"
+	cfg.apiURL = "https://relay.example.test:8443/network-config"
+	cfg.turnURLs = []string{
+		"turn:relay.example.test:3478?transport=udp",
+		"turns:relay.example.test:5349?transport=tcp",
+	}
+	cfg.allowedDomainsFile = domainsPath
+	cfg.destinationPolicyFile = policyPath
 
 	logger := log.New(io.Discard, "", 0)
 	srv := newServer(cfg, logger)
@@ -115,8 +161,8 @@ func TestCredentialsHandler(t *testing.T) {
 	}
 	ice := resp.IceServers[0]
 	if want := []string{
-		"turn:13.48.52.216:3478?transport=udp",
-		"turns:13.48.52.216:5349?transport=tcp",
+		"turn:relay.example.test:3478?transport=udp",
+		"turns:relay.example.test:5349?transport=tcp",
 	}; strings.Join(ice.URLs, ",") != strings.Join(want, ",") {
 		t.Errorf("urls = %v, want %v", ice.URLs, want)
 	}
@@ -138,6 +184,114 @@ func TestCredentialsHandler(t *testing.T) {
 	}
 }
 
+func TestNetworkConfigHandler(t *testing.T) {
+	srv, _ := testServer(t, "0123456789abcdef0123456789abcdef", 24*time.Hour)
+	srv.now = func() time.Time { return time.Unix(1794591360, 0) }
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/network-config", nil)
+	req.RemoteAddr = "203.0.113.7:5555"
+	srv.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+
+	var resp networkConfig
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if resp.Version != schemaVersion {
+		t.Errorf("version = %d, want %d", resp.Version, schemaVersion)
+	}
+	if got, want := resp.HTTPSProxy.URL, "https://relay.example.test:443"; got != want {
+		t.Errorf("httpsProxy.url = %q, want %q", got, want)
+	}
+	if len(resp.HTTPSProxy.AllowedDestinations) != 5 {
+		t.Fatalf("got %d destinations, want 5", len(resp.HTTPSProxy.AllowedDestinations))
+	}
+
+	// The document must describe exactly what the policy files say.
+	var media *Destination
+	for i := range resp.HTTPSProxy.AllowedDestinations {
+		if resp.HTTPSProxy.AllowedDestinations[i].Domain == "discord.media" {
+			media = &resp.HTTPSProxy.AllowedDestinations[i]
+		}
+	}
+	if media == nil {
+		t.Fatalf("discord.media missing from the advertised policy: %+v", resp.HTTPSProxy.AllowedDestinations)
+	}
+	if len(media.Ports) != 1 || media.Ports[0] != 443 {
+		t.Errorf("discord.media ports = %v, want [443]", media.Ports)
+	}
+	if len(media.PortRanges) != 1 || media.PortRanges[0].From != 1024 || media.PortRanges[0].To != 65535 {
+		t.Errorf("discord.media portRanges = %v, want 1024-65535", media.PortRanges)
+	}
+
+	if resp.RTCRelay.ExpiresAt != 1794591360+86400 {
+		t.Errorf("expiresAt = %d, want %d", resp.RTCRelay.ExpiresAt, 1794591360+86400)
+	}
+	if len(resp.RTCRelay.IceServers) != 1 || len(resp.RTCRelay.IceServers[0].Credential) != 28 {
+		t.Errorf("unexpected iceServers: %+v", resp.RTCRelay.IceServers)
+	}
+	if strings.Contains(rec.Body.String(), "0123456789abcdef") {
+		t.Error("response leaked the shared secret")
+	}
+
+	// The advertised policy must agree with an independent load of the files.
+	policy, err := LoadPolicy(srv.cfg.allowedDomainsFile, srv.cfg.destinationPolicyFile)
+	if err != nil {
+		t.Fatalf("LoadPolicy: %v", err)
+	}
+	stored, err := json.Marshal(resp.HTTPSProxy.AllowedDestinations)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	want, err := json.Marshal(policy.Destinations)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(stored) != string(want) {
+		t.Errorf("advertised policy %s != authoritative policy %s", stored, want)
+	}
+
+	// Only the documented endpoints exist.
+	other := httptest.NewRecorder()
+	srv.routes().ServeHTTP(other, httptest.NewRequest(http.MethodGet, "/", nil))
+	if other.Code != http.StatusNotFound {
+		t.Errorf("GET / = %d, want 404", other.Code)
+	}
+}
+
+func TestNetworkConfigInvalidPolicyIsRefused(t *testing.T) {
+	srv, _ := testServer(t, "0123456789abcdef0123456789abcdef", time.Hour)
+	// Add a domain to the allowlist without a port policy: the pair is
+	// inconsistent, so the endpoint must not advertise anything.
+	f, err := os.OpenFile(srv.cfg.allowedDomainsFile, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open allowlist: %v", err)
+	}
+	if _, err := f.WriteString("example.com\n"); err != nil {
+		t.Fatalf("append allowlist: %v", err)
+	}
+	f.Close()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/network-config", nil)
+	req.RemoteAddr = "198.51.100.4:1234"
+	srv.routes().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 for an inconsistent policy (body %s)", rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "example.com") {
+		t.Error("error response should not echo the policy contents")
+	}
+}
+
 func TestCredentialsHandlerMissingSecret(t *testing.T) {
 	srv, _ := testServer(t, "", time.Hour)
 
@@ -147,7 +301,7 @@ func TestCredentialsHandlerMissingSecret(t *testing.T) {
 	srv.routes().ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want 503 when the catalog secret is missing", rec.Code)
+		t.Fatalf("status = %d, want 503 when the secret is missing", rec.Code)
 	}
 	var body map[string]string
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
@@ -167,10 +321,16 @@ func TestCredentialsHandlerRejectsOtherMethodsAndPaths(t *testing.T) {
 		t.Errorf("POST status = %d, want 405", post.Code)
 	}
 
+	postConfig := httptest.NewRecorder()
+	srv.routes().ServeHTTP(postConfig, httptest.NewRequest(http.MethodPost, "/network-config", nil))
+	if postConfig.Code != http.StatusMethodNotAllowed {
+		t.Errorf("POST /network-config status = %d, want 405", postConfig.Code)
+	}
+
 	other := httptest.NewRecorder()
 	srv.routes().ServeHTTP(other, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if other.Code != http.StatusNotFound {
-		t.Errorf("GET /healthz status = %d, want 404 (only /turn-credentials is an API)", other.Code)
+		t.Errorf("GET /healthz status = %d, want 404", other.Code)
 	}
 }
 
@@ -181,7 +341,7 @@ func TestPerIPRateLimit(t *testing.T) {
 	statuses := make([]int, 0, 5)
 	for i := 0; i < 5; i++ {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/turn-credentials", nil)
+		req := httptest.NewRequest(http.MethodGet, "/network-config", nil)
 		req.RemoteAddr = "192.0.2.10:9999"
 		srv.routes().ServeHTTP(rec, req)
 		statuses = append(statuses, rec.Code)
@@ -197,7 +357,7 @@ func TestPerIPRateLimit(t *testing.T) {
 	}
 
 	other := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/turn-credentials", nil)
+	req := httptest.NewRequest(http.MethodGet, "/network-config", nil)
 	req.RemoteAddr = "192.0.2.11:9999"
 	srv.routes().ServeHTTP(other, req)
 	if other.Code != http.StatusOK {
@@ -212,7 +372,7 @@ func TestGlobalRateLimit(t *testing.T) {
 	codes := make([]int, 0, 3)
 	for i := 0; i < 3; i++ {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, "/turn-credentials", nil)
+		req := httptest.NewRequest(http.MethodGet, "/network-config", nil)
 		req.RemoteAddr = fmt.Sprintf("192.0.2.%d:1", i+1)
 		srv.routes().ServeHTTP(rec, req)
 		codes = append(codes, rec.Code)
@@ -265,7 +425,7 @@ func TestACMEChallengeServing(t *testing.T) {
 	}
 
 	root := httptest.NewRecorder()
-	srv.acmeRoutes().ServeHTTP(root, httptest.NewRequest(http.MethodGet, "/turn-credentials", nil))
+	srv.acmeRoutes().ServeHTTP(root, httptest.NewRequest(http.MethodGet, "/network-config", nil))
 	if root.Code != http.StatusNotFound {
 		t.Errorf("port 80 status = %d, want 404 (HTTP is only for ACME)", root.Code)
 	}
@@ -275,12 +435,17 @@ func TestLoadConfigRejectsBadValues(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.env")
 
+	base := "HTTPS_PROXY_URL=https://relay.example.test:443\nTURN_URLS=turn:relay.example.test:3478?transport=udp\n"
 	cases := map[string]string{
-		"bad ttl":        "CREDENTIAL_TTL=forever\n",
-		"bad url":        "TURN_URLS=http://example.com\n",
-		"bad identity":   "TURN_IDENTITY=Doh:cord\n",
-		"bad rate":       "PER_IP_RATE_PER_MINUTE=0\n",
-		"missing equals": "NONSENSE\n",
+		"bad ttl":                    base + "CREDENTIAL_TTL=forever\n",
+		"bad url":                    base + "TURN_URLS=http://example.com\n",
+		"bad identity":               base + "TURN_IDENTITY=Doh:cord\n",
+		"bad rate":                   base + "PER_IP_RATE_PER_MINUTE=0\n",
+		"missing equals":             "NONSENSE\n",
+		"http proxy url":             "HTTPS_PROXY_URL=http://relay.example.test:443\nTURN_URLS=turn:x:3478\n",
+		"proxy url with credentials": "HTTPS_PROXY_URL=https://user:pass@relay.example.test:443\nTURN_URLS=turn:x:3478\n",
+		"missing proxy url":          "TURN_URLS=turn:relay.example.test:3478\n",
+		"api on 443":                 base + "HTTPS_LISTEN=:443\n",
 	}
 	for name, body := range cases {
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
@@ -299,7 +464,9 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 		"# comment",
 		"CREDENTIAL_TTL=86400",
 		"TURN_IDENTITY=\"Dohcord\"",
-		"TURN_URLS=turn:13.48.52.216:3478?transport=udp turns:13.48.52.216:5349?transport=tcp",
+		"TURN_URLS=turn:relay.example.test:3478?transport=udp turns:relay.example.test:5349?transport=tcp",
+		"HTTPS_PROXY_URL=https://relay.example.test:443",
+		"NETWORK_CONFIG_URL=https://relay.example.test:8443/network-config",
 		"PER_IP_RATE_PER_MINUTE=12",
 	}, "\n")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
@@ -321,5 +488,8 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 	}
 	if cfg.perIPRate != 12 {
 		t.Errorf("perIPRate = %d, want 12", cfg.perIPRate)
+	}
+	if cfg.proxyURL != "https://relay.example.test:443" {
+		t.Errorf("proxyURL = %q", cfg.proxyURL)
 	}
 }

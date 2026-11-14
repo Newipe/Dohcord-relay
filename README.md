@@ -1,60 +1,309 @@
-# Dohcord Relay
+# Dohcord-relay
 
-A minimal TURN relay for [Dohcord](https://github.com/Newipe)'s Discord WebRTC
-feature, plus one small HTTPS endpoint that hands Dohcord temporary TURN
-credentials. Users configure nothing: the Electron app calls the endpoint and
-gets a working `iceServers` array.
+A small, self-hosted relay for [Dohcord](https://github.com/Newipe)'s **Newipe**
+and **Custom Profile** features. You run it on your own VPS; Dohcord gets one
+URL from it and can then reach Discord even on networks that block or interfere
+with Discord directly.
 
-```text
-Dohcord — Discord WebRTC
-          |
-          | TURN / UDP  (primary)
-          | TURN / TLS  (fallback)
-          v
-VPS 13.48.52.216   coturn :3478/udp, :5349/tcp, relay 49152-65535/udp
-          |
-          | UDP forwarding
-          v
-Discord's actual RTC endpoint   (dynamic, never hardcoded)
-```
+It installs two separate services on **one server**:
 
-Incoming media returns through the same TURN allocation; nothing is decrypted,
-rewritten or proxied beyond standard TURN relaying.
+| Service | What it carries | Port |
+|---|---|---|
+| **HTTPS CONNECT proxy** (Squid) | Discord **HTTPS and WSS** (login, API, gateway, voice *signalling*) | TCP 443 |
+| **TURN relay** (coturn) | Discord **voice/video UDP media** | UDP 3478, TCP 5349, UDP 49152–65535 |
 
-## What this is, and what it deliberately is not
+Plus one tiny HTTPS endpoint that tells Dohcord where those two services are:
 
-* **coturn** does all TURN work. There is no custom relay, VPN, QUIC tunnel,
-  SOCKS/HTTP proxy or DNS service here.
-* **One Go binary** (standard library only) terminates HTTPS on 443, answers
-  ACME HTTP-01 on 80, and serves `GET /turn-credentials`. No database, no user
-  accounts, no dashboard, no client API keys, no persistent records.
-* The only thing stored is one random shared secret in
-  `/etc/dohcord-relay/turn-secret`; it is never served and never logged.
-
-TURN's security model, stated plainly: coturn authenticates *allocations* with
-short-lived credentials, and this relay only accepts credentials signed with its
-shared secret. Anyone who can reach the public endpoint can obtain such
-credentials, so the endpoint cannot prove a request came from the official
-Dohcord build. The defence is rate limiting, allocation quotas and bandwidth
-ceilings, not client identity.
-
-## Layout
+| Endpoint | What it returns | Port |
+|---|---|---|
+| `GET /network-config` | proxy URL, the destinations the proxy allows, temporary TURN credentials | TCP 8443 |
 
 ```text
-main.go, credentials.go, ratelimit.go, main_test.go   credential endpoint
-deploy/install.sh                                      installer (Ubuntu/Debian)
-deploy/verify.sh                                       verification suite
-deploy/turnserver.conf.tmpl                            coturn configuration
-deploy/config.env.tmpl                                 endpoint configuration
-deploy/dohcord-relay-coturn.service                    coturn unit
-deploy/dohcord-relay-credentials.service                endpoint unit
-deploy/dohcord-relay-certbot-renew.{service,timer}      certificate renewal
-deploy/dohcord-relay-tls-deploy                         certbot deploy hook
+                        YOUR VPS
+                 ┌──────────────────────────────────────────────┐
+  Dohcord        │                                              │
+  (Electron)     │   Squid :443   ── CONNECT host:port ──┐      │
+      │          │   (TLS forward proxy)                 │      │
+      │  TLS     │                                       ▼      │
+      ├─────────►│                              Discord HTTPS/WSS│
+      │  CONNECT │                                              │
+      │          │   coturn :3478/udp, :5349/tcp               │
+      │  TURN    │        │                                     │
+      ├─────────►│        └──── UDP relay ────► Discord RTC     │
+      │          │                                              │
+      │  HTTPS   │   dohcord-relay :8443 /network-config        │
+      └─────────►│                                              │
+                 └──────────────────────────────────────────────┘
 ```
+
+Nothing is decrypted. The Discord TLS session runs end-to-end between Dohcord
+and Discord; the proxy only forwards encrypted bytes. Voice media is relayed
+with standard TURN, also without inspection.
+
+---
+
+## Contents
+
+- [Quick start](#quick-start)
+- [Why two services?](#why-two-services)
+- [How Discord traffic flows](#how-discord-traffic-flows)
+- [The domain-and-port allowlist](#the-domain-and-port-allowlist)
+- [What you need](#what-you-need)
+- [Domain or IP address? (TLS certificates)](#domain-or-ip-address-tls-certificates)
+- [Install](#install)
+- [Configure Dohcord](#configure-dohcord)
+- [Your endpoints](#your-endpoints)
+- [Editing the allowlist safely](#editing-the-allowlist-safely)
+- [Firewall](#firewall)
+- [Everyday operations](#everyday-operations)
+- [Upgrading](#upgrading)
+- [Uninstalling](#uninstalling)
+- [Troubleshooting](#troubleshooting)
+- [Security model and limitations](#security-model-and-limitations)
+- [Files on the server](#files-on-the-server)
+- [What was tested](#what-was-tested)
+
+---
+
+## Quick start
+
+On a fresh Ubuntu or Debian VPS, as `root`:
+
+```bash
+sudo apt-get update && sudo apt-get install -y git
+git clone https://github.com/Newipe/Dohcord-relay.git
+cd Dohcord-relay
+sudo deploy/install.sh
+```
+
+The installer asks one question:
+
+```text
+Dohcord-relay Installation
+
+How should clients connect to this server?
+
+  1. Domain name (recommended)
+  2. Public IPv4 address
+
+Choose [1/2]:
+```
+
+Answer, confirm the detected IP address (and your domain, if you chose one), and
+let it run. At the end it prints the one URL you paste into Dohcord, plus the
+firewall ports, certificate status and service status.
+
+That's the whole installation. Everything below explains what it did and how to
+look after it.
+
+---
+
+## Why two services?
+
+Discord needs two different kinds of connection, and they cannot be served by one
+mechanism:
+
+| | HTTPS CONNECT proxy | TURN relay |
+|---|---|---|
+| Discord uses it for | the app itself: login, messages, gateway WebSocket, voice **signalling** | the actual voice/video **media** |
+| Transport | TCP, wrapped in TLS to your server | UDP (plus TCP/TLS fallback) |
+| Protocol the server speaks | HTTP `CONNECT` inside TLS | TURN (STUN extensions) |
+| What the server can see | destination host name and port | allocation metadata only |
+| What it forwards | an encrypted byte stream | UDP datagrams |
+
+A proxy cannot carry UDP media, and TURN cannot fetch a web page. Dohcord needs
+both, so the relay installs both, from the same wizard, on the same VPS.
+
+### The HTTPS CONNECT proxy, in one paragraph
+
+Dohcord opens a **TLS connection to your server's port 443** and sends a line
+like `CONNECT discord.com:443` *inside* that encrypted connection. Your server
+checks the requested host and port against its own allowlist, resolves the host
+name on the VPS, checks the resolved address, then opens a plain TCP connection
+to Discord and copies bytes in both directions. Dohcord then starts its own TLS
+session to Discord through that tunnel. Your server never sees that inner
+session, and an observer on the local network only sees TLS to your VPS.
+
+### The TURN relay, in one paragraph
+
+For voice, Discord tells the client to send UDP media to particular addresses.
+With TURN, Dohcord instead asks your server for a **relay address**; the VPS opens
+a UDP socket and forwards every datagram to Discord and back through the same
+allocation. Discord's media stays encrypted (DTLS-SRTP); coturn just moves the
+packets.
+
+---
+
+## How Discord traffic flows
+
+### 1. Normal Discord HTTPS and WSS
+
+```text
+Dohcord ──TLS──► your VPS :443 ──TCP──► discord.com:443
+   │                │
+   │                └─ sees only "CONNECT discord.com:443"
+   └─ TLS to Discord runs *through* the tunnel, end to end
+```
+
+Dohcord's PAC rules decide which requests to send to the proxy; the VPS decides
+which requests to **allow**. Both must agree, but only the server's decision is
+security-relevant.
+
+### 2. Voice signalling can use a port that is not 443
+
+This is the part people get wrong. Discord's
+[voice documentation](https://docs.discord.com/developers/topics/voice-connections)
+describes a `VOICE_SERVER_UPDATE` event that hands the client a **dynamically
+assigned voice server**, for example:
+
+```text
+sweetwater-12345.discord.media:2048
+```
+
+The client prepends `wss://` and connects to **that exact port** — which changes
+per call and per region, and is not always 443. Dohcord sends:
+
+```http
+CONNECT sweetwater-12345.discord.media:2048 HTTP/1.1
+```
+
+through the same TLS proxy connection. The relay's policy therefore allows
+`discord.media` on **443 and 1024–65535**, and nothing else is allowed those
+ports:
+
+```text
+discord.com       443
+discord.gg        443
+discordapp.com    443
+discordapp.net    443
+discord.media     443,1024-65535
+```
+
+The proxy never rewrites the requested port to 443 and never decrypts the
+WebSocket. The sample port 2048 is not hardcoded anywhere.
+
+### 3. Voice media
+
+```text
+Dohcord ──TURN/UDP──► your VPS :3478 ──UDP──► Discord RTC endpoint
+                     allocation 49152-65535
+```
+
+Both directions use the same allocation. Discord's endpoint addresses are
+discovered at call time and are never hardcoded.
+
+---
+
+## The domain-and-port allowlist
+
+The proxy is public (Dohcord is public), so assume strangers will find it. It is
+**not** an open proxy: two server-side files decide what it may reach, and both
+must pass before a connection is made.
+
+`/etc/dohcord-relay/allowed-domains.txt` — which domains:
+
+```text
+discord.com
+discord.gg
+discordapp.com
+discordapp.net
+discord.media
+```
+
+A domain allows itself and its subdomains, matched on DNS label boundaries:
+
+| Requested destination | Result |
+|---|---|
+| `discord.com` | allow |
+| `gateway.discord.com` | allow |
+| `cdn.discordapp.com` | allow |
+| `discord.com.evil.example` | **deny** |
+| `evil-discord.com` | **deny** |
+| `example.com` | **deny** |
+
+`/etc/dohcord-relay/destination-policy.conf` — which TCP ports each domain may
+use:
+
+```text
+discord.com       443
+discord.gg        443
+discordapp.com    443
+discordapp.net    443
+discord.media     443,1024-65535
+```
+
+Every domain in the allowlist must have a policy line, and every policy line must
+belong to an allowlisted domain; anything else is rejected as a configuration
+error rather than half-applied.
+
+Additional protection, enforced by Squid at connect time:
+
+- **CONNECT only.** Any other request gets `403`.
+- **No IP literals.** `CONNECT 1.1.1.1:443` is denied; only host names match.
+- **Resolved addresses are checked.** After the VPS resolves the host name, the
+  address must not be loopback, private, link-local, CGNAT, documentation,
+  benchmarking, multicast or this relay itself. This is what stops DNS rebinding
+  from turning an allowed name into a connection to `127.0.0.1` or your
+  private network.
+- **Limits.** Per-client connection cap, global descriptor ceiling, request
+  header limits, connect/read/lifetime timeouts.
+- **An empty or invalid policy can never mean "allow everything".** The generated
+  ACLs are validated with `squid -k parse` before Squid is reloaded, and the
+  final rule is always `http_access deny all`.
+
+> The allowlist proves *where* a connection may go. It cannot prove a request
+> came from the official Dohcord app: anyone who knows your address can use the
+> proxy for those Discord destinations. That is why the destination list, port
+> policy, IP checks and limits are strict — they are the security boundary.
+
+---
+
+## What you need
+
+- A VPS with a **public IPv4 address** (a 1:1 NAT host such as EC2 works).
+- **Ubuntu 22.04/24.04** or **Debian 12+**, root access, systemd.
+- About **1 CPU / 1 GB RAM** and roughly **1 Mbit/s per concurrent voice call**
+  of bandwidth. Voice relaying is cheap; a small VPS handles dozens of calls.
+- Ports **80/tcp, 443/tcp, 8443/tcp, 3478/udp, 5349/tcp, 49152–65535/udp**
+  reachable from the internet (and open in your cloud firewall/security group).
+- **SSH access preserved** — the installer never flushes firewall rules.
+
+You do **not** need Docker, a database, user accounts, or an existing web server.
+
+---
+
+## Domain or IP address? (TLS certificates)
+
+All public listeners use publicly trusted certificates. Nothing self-signed is
+ever installed in production, and certificate verification is never disabled.
+
+**Domain (recommended).** Let's Encrypt issues normal certificates over HTTP-01,
+validated on port 80 by the relay's own endpoint. Renewal runs every six hours
+and restarts the affected services automatically. The installer checks that the
+domain's A record points at the IP you gave it, and warns/fails if an AAAA record
+exists but the VPS has no working IPv6 (clients would otherwise prefer a broken
+path).
+
+**Public IPv4 only.** This works, but read this carefully:
+
+- Let's Encrypt has issued IP-address certificates since January 2026, but **only
+  on its `shortlived` profile: 160 hours (about 6⅔ days) per certificate**.
+- That makes renewal a permanent requirement, not an installation step. The
+  installer sets up automatic renewal with a six-hour timer and verifies it with
+  `certbot renew --dry-run` at the end.
+- If renewal breaks, the relay stops working within days. A domain certificate
+  gives you weeks of slack instead.
+- IP certificates need certbot 5.4+ (for webroot); the installer installs a
+  private copy in `/opt/dohcord-relay-certbot` when the system certbot is older.
+
+Choose IP mode when you cannot point DNS at the VPS. Choose a domain for anything
+long-lived.
+
+---
 
 ## Install
 
-On the VPS (Ubuntu 22.04+/Debian 12+, root):
+### Interactive (the normal way)
 
 ```bash
 git clone https://github.com/Newipe/Dohcord-relay.git
@@ -62,384 +311,559 @@ cd Dohcord-relay
 sudo deploy/install.sh
 ```
 
-No email address is needed: the ACME account is registered without a contact
-address. Add `--email ADDRESS` only if you want Let's Encrypt expiry notices.
-
-Test the whole pipeline against Let's Encrypt staging first, then run it for
-real (staging certificates are not trusted by clients):
+Test against Let's Encrypt staging first if you like (the certificate is not
+trusted, so clients cannot use it yet):
 
 ```bash
 sudo deploy/install.sh --staging
-sudo deploy/install.sh
+sudo deploy/install.sh          # for real: replaces the staging certificate
 ```
 
-Useful flags: `--email ADDRESS`, `--ip ADDRESS`, `--realm NAME`, `--distro-coturn`,
-`--coturn-version VERSION`, `--user-quota N`, `--total-quota N`,
-`--max-bps N`, `--bps-capacity N`, `--skip-renew-test`. `--help` lists them all.
+### Non-interactive
 
-The installer is idempotent. Re-running it keeps the existing TURN secret and a
-still-valid certificate, and only rewrites files it owns.
+```bash
+# domain
+sudo deploy/install.sh --mode domain --domain relay.example.com --ip 203.0.113.10
+
+# public IPv4 only
+sudo deploy/install.sh --mode ip --ip 203.0.113.10
+```
+
+Useful options (see `--help`):
+
+| Option | Meaning |
+|---|---|
+| `--email ADDRESS` | Let's Encrypt expiry notices (optional) |
+| `--staging` | staging CA for test installs |
+| `--user-quota N` | concurrent TURN allocations per credential (default 12) |
+| `--total-quota N` | concurrent allocations for the relay (default 1200) |
+| `--max-bps N` | per-session TURN bandwidth, bytes/s (default 2 MB/s) |
+| `--bps-capacity N` | total TURN bandwidth reservation (default 250 MB/s) |
+| `--max-connections N` | concurrent proxy connections per client IP (default 20) |
+| `--distro-coturn` | use the distribution coturn package instead of building 4.18.0 |
+| `--skip-verify` | skip the final verification suite |
+| `--yes` | skip the confirmation prompt (still needs `--mode`) |
+
+The installer is re-runnable. It keeps the existing TURN secret, an existing
+valid certificate and any allowlist edits, and only rewrites the files it owns.
 
 ### What the installer does
 
-1. Verifies the OS (`ubuntu` or `debian`) and that it runs as root.
-2. Verifies ports 80/tcp, 443/tcp, 3478/udp and 5349/tcp are free. If an existing
-   web server holds them the installer stops and prints what is listening — it
-   never reconfigures or stops another service. (See
-   [Existing web server](#existing-web-server) for the manual integration.)
-3. Detects the network layout. If `13.48.52.216` is configured on an interface,
-   relays bind it directly. If the public address is 1:1 NAT (typical for EC2),
-   relays bind the private address and coturn publishes
-   `external-ip=13.48.52.216/<private>`.
-4. Creates the `turnserver` and `dohcord-relay` system users.
-5. Opens only the required ports in ufw or firewalld, leaving existing rules
-   alone, and warns if the SSH port is not allowed.
-6. Installs coturn 4.18.0 built from the pinned, checksum-verified upstream
-   release (`--distro-coturn` uses the distribution package instead and warns if
-   it is old).
-7. Generates `/etc/dohcord-relay/turn-secret` (32 random bytes, hex, `0640`) and
-   renders `/etc/dohcord-relay/turnserver.conf`. Every option in the rendered
-   file is checked against `turnserver --help` of the installed binary; an
-   unsupported option aborts the install instead of being silently ignored.
-8. Builds and installs `/usr/local/bin/dohcord-relay-credentials` with the
-   distribution Go compiler, writes `/etc/dohcord-relay/config.env`, installs
-   the systemd unit.
-9. Installs `/usr/local/bin/dohcord-relay-tls-deploy`, the certbot deploy hook.
-10. Installs certbot 5.4+ (a private venv if the distribution package is older),
-    starts a temporary ACME-responder-only instance of the credential endpoint,
-    and requests a **shortlived IP certificate** for `13.48.52.216` with
-    `--ip-address` and `--preferred-profile shortlived` over HTTP-01 webroot.
-11. Installs and enables the renewal service and timer (`6h`, with jitter).
-12. Starts both services, runs `deploy/verify.sh` (which includes
-    `certbot renew --dry-run`, once port 80 is served by the real service), and
-    prints a summary.
+1. Asks how clients connect (domain or IP), validates the public IPv4 and, for a
+   domain, that the A record points at it.
+2. Refuses to continue if 80, 443, 8443, 3478/udp or 5349/tcp are already taken
+   by another service — it prints the listener and stops; it never reconfigures
+   an existing web server.
+3. Detects 1:1 NAT so coturn publishes the right `external-ip` mapping.
+4. Creates the `turnserver` and `dohcord-relay` users and directories.
+5. Opens exactly the required ports in ufw or firewalld, leaving existing rules
+   (including SSH) untouched.
+6. Installs **Squid** from the distribution, verifies the build has TLS support
+   and Squid 5+, and picks the TLS-floor syntax that build accepts (GnuTLS and
+   OpenSSL builds reject each other's spelling).
+7. Installs **coturn**: builds the pinned 4.18.0 release with a verified checksum
+   (or uses the distribution package with `--distro-coturn`), and checks every
+   option in the generated `turnserver.conf` against `turnserver --help`.
+8. Generates `/etc/dohcord-relay/turn-secret` and both policy files.
+9. Builds the Go endpoint and writes `config.env`.
+10. Obtains the certificate over HTTP-01 using a temporary ACME-only instance of
+    the endpoint on port 80.
+11. Renders the Squid ACLs from the policy files and validates the whole Squid
+    configuration with `squid -k parse` **before** anything is started.
+12. Starts and enables Squid, coturn and the endpoint, with the distribution
+    `squid.service` and `coturn.service` disabled so they cannot fight over ports.
+13. Installs the six-hour certificate renewal timer with a deploy hook that
+    verifies the new certificate covers the host, publishes copies for the
+    unprivileged services, and restarts/reloads them.
+14. Runs `deploy/verify.sh` and prints a summary.
 
-## Server layout
+---
 
-| Path | Purpose |
-|---|---|
-| `/etc/dohcord-relay/turnserver.conf` | coturn configuration (`root:turnserver 0640`) |
-| `/etc/dohcord-relay/turn-secret` | TURN shared secret (`root:dohcord-relay 0640`) |
-| `/etc/dohcord-relay/config.env` | credential endpoint configuration |
-| `/etc/dohcord-relay/tls/{fullchain,privkey}.pem` | certificate copies for the unprivileged services |
-| `/usr/local/bin/dohcord-relay-credentials` | credential endpoint |
-| `/usr/local/bin/dohcord-relay-tls-deploy` | certbot deploy hook |
-| `/usr/local/bin/turnserver` | coturn (source install) |
-| `/var/www/dohcord-relay` | ACME HTTP-01 webroot |
-| `/var/log/dohcord-relay/turnserver.log` | coturn log |
+## Configure Dohcord
 
-Services: `dohcord-relay-coturn.service`, `dohcord-relay-credentials.service`,
-`dohcord-relay-certbot-renew.timer`.
+### In Dohcord (not on the server)
 
-## TURN configuration
+1. Open Dohcord's settings and find **Custom Profile** (also used by **Newipe**).
+2. Add a profile / server and paste the **Network Configuration URL** the
+   installer printed:
 
-Key settings in `/etc/dohcord-relay/turnserver.conf`:
+   ```text
+   https://relay.example.com:8443/network-config
+   ```
 
-| Setting | Value | Why |
-|---|---|---|
-| `listening-port` | 3478 | primary TURN over UDP |
-| `tls-listening-port` | 5349 | TURN over TLS |
-| `min-port` / `max-port` | 49152 / 65535 | media allocation range |
-| `listening-ip` / `relay-ip` | local addresses | bind what exists on the host |
-| `external-ip` | `13.48.52.216[/private]` | publish the public address, with NAT mapping when needed |
-| `use-auth-secret` + `static-auth-secret` | random 64-char secret | coturn TURN REST authentication |
-| `realm` / `server-name` | `dohcord.relay` | TURN realm |
-| `fingerprint` | on | STUN/TURN fingerprinting |
-| `cert` / `pkey` | `/etc/dohcord-relay/tls/*` | Let's Encrypt IP certificate |
-| `tlsv1=0`, `tlsv1_1=0` | TLS 1.2/1.3 only | TLS 1.0/1.1 disabled |
-| `no-tcp-relay` | on | peers are reached over UDP; this is not a TCP proxy |
-| `user-quota` / `total-quota` | 12 / 1200 | concurrent allocations per credential / overall |
-| `max-bps` / `bps-capacity` | 2000000 / 250000000 | ~16 Mbit/s per session, ~2 Gbit/s of reservations |
-| `denied-peer-ip` (0/8, 10/8, 100.64/10, 127/8, 169.254/16, 172.16/12, 192.0.0/24, 192.168/16, 198.18/15, 198.51.100/24, 203.0.113/24, 224/4, all IPv6 special ranges) | denied | no relaying to private, loopback, link-local or multicast destinations |
-| `allowed-peer-ip` | `13.48.52.216` | allows same-relay hairpin calls and the local media self-test |
-| `no-multicast-peers` | on | extra guard against broadcast destinations |
-| `no-software-attribute` | on | no implementation details in STUN replies |
+3. Save and select it.
 
-`bps-capacity` deserves care: coturn reserves `max-bps` for every open
-allocation, so `bps-capacity / max-bps` is the number of concurrent relayed
-sessions the relay accepts. Setting it too low makes coturn reject nearly every
-allocation with `486 Allocation Bandwidth Quota Reached` (this genuinely happened
-during development). Match it to the VPS uplink.
+Dohcord fetches that one document and gets everything else from it: the HTTPS
+proxy URL, the destinations the proxy permits, and fresh TURN credentials with an
+expiry. There is nothing else to type in, and no account or API key.
 
-## The credential endpoint
+### On the VPS
 
-```http
-GET https://13.48.52.216/turn-credentials
+Nothing — that is the point of the endpoint. If you want to see what Dohcord
+receives:
+
+```bash
+curl -sS https://relay.example.com:8443/network-config | python3 -m json.tool
 ```
+
+---
+
+## Your endpoints
+
+For a domain install (`relay.example.com`):
+
+```text
+HTTPS CONNECT proxy   https://relay.example.com:443
+Network configuration https://relay.example.com:8443/network-config
+TURN UDP              turn:relay.example.com:3478?transport=udp
+TURN TLS              turns:relay.example.com:5349?transport=tcp
+```
+
+For an IP install, `relay.example.com` is replaced by your IPv4 address
+everywhere. Both are generated from your answers — nothing is hardcoded.
+
+The `/network-config` document looks like this (shortened):
 
 ```json
 {
-  "expiresAt": 1794600000,
-  "iceServers": [
-    {
+  "version": 1,
+  "httpsProxy": {
+    "url": "https://relay.example.com:443",
+    "allowedDestinations": [
+      { "domain": "discord.com", "ports": [443] },
+      { "domain": "discord.gg", "ports": [443] },
+      { "domain": "discordapp.com", "ports": [443] },
+      { "domain": "discordapp.net", "ports": [443] },
+      { "domain": "discord.media", "ports": [443],
+        "portRanges": [{ "from": 1024, "to": 65535 }] }
+    ]
+  },
+  "rtcRelay": {
+    "expiresAt": 1794600000,
+    "iceServers": [{
       "urls": [
-        "turn:13.48.52.216:3478?transport=udp",
-        "turns:13.48.52.216:5349?transport=tcp"
+        "turn:relay.example.com:3478?transport=udp",
+        "turns:relay.example.com:5349?transport=tcp"
       ],
       "username": "1794600000:Dohcord",
-      "credential": "c2VjcmV0LW5vdC1yZWFsbHk="
-    }
-  ]
+      "credential": "……"
+    }]
+  }
 }
 ```
 
-Behaviour:
+- It is HTTPS-only, `Cache-Control: no-store`, and rate limited per client IP and
+  globally.
+- The advertised destination list is read from the policy Squid is **actually**
+  enforcing, so the document cannot drift from reality.
+- `GET /turn-credentials` still exists for older Dohcord builds and returns only
+  the `expiresAt` + `iceServers` part.
+- The permanent TURN secret never leaves the server and is never logged.
 
-* HTTPS only, with a publicly trusted certificate for the IP address.
-  `Cache-Control: no-store, no-cache, must-revalidate, max-age=0`,
-  `Pragma: no-cache`, `X-Content-Type-Options: nosniff`,
-  `Access-Control-Allow-Origin: *` (no cookies or credentials involved).
-* Fresh credentials on every request; the TURN shared secret is never returned
-  and never logged (only client address and expiry are logged).
-* `503` with `{"error":"turn configuration unavailable"}` when the secret is
-  missing, unreadable or too short — the reason stays in the local log.
-* `429` with `Retry-After` when rate limited.
-* Per-IP token bucket (`PER_IP_RATE_PER_MINUTE`, `PER_IP_BURST`) plus a global
-  bucket (`GLOBAL_RATE_PER_MINUTE`, `GLOBAL_BURST`).
-* Only `/turn-credentials` is an API. Port 80 answers ACME HTTP-01 challenges and
-  returns `404` for everything else.
-
-Only the two configured URLs are ever returned; the URL list is configuration
-(`TURN_URLS`), not client input.
-
-### Credential scheme (coturn TURN REST authentication)
+TURN credentials use coturn's standard REST scheme:
 
 ```text
-username = "<unix expiration timestamp>:Dohcord"
-password = base64(HMAC-SHA1(key = shared secret, message = username))
+username = "<unix expiration>:Dohcord"
+password = base64(HMAC-SHA1(shared secret, username))
 ```
 
-* Lifetime: 24 hours (`CREDENTIAL_TTL`, changeable between 1 minute and 7 days).
-* The password is the standard padded base64 of the raw HMAC-SHA1 digest, which
-  is exactly what coturn computes for `use-auth-secret` — verified against a real
-  coturn instance (see [Tests](#tests)).
-* coturn rejects the credential once the timestamp has passed, and rejects any
-  credential not signed with the shared secret.
+The lifetime defaults to 24 hours (`CREDENTIAL_TTL`).
 
-Rotate the secret (invalidates every credential in flight, within one allocation
-lifetime):
+---
+
+## Editing the allowlist safely
+
+Both files are plain text and live on the VPS:
 
 ```bash
-sudo sh -c 'openssl rand -hex 32 > /etc/dohcord-relay/turn-secret'
-sudo chown root:dohcord-relay /etc/dohcord-relay/turn-secret
-sudo chmod 0640 /etc/dohcord-relay/turn-secret
-# keep turnserver.conf in sync, then restart both consumers
-sudo sed -i "s|^static-auth-secret=.*|static-auth-secret=$(cat /etc/dohcord-relay/turn-secret)|" \
-  /etc/dohcord-relay/turnserver.conf
-sudo systemctl restart dohcord-relay-coturn.service dohcord-relay-credentials.service
+sudoedit /etc/dohcord-relay/allowed-domains.txt
+sudoedit /etc/dohcord-relay/destination-policy.conf
 ```
 
-## TLS for a bare IP address
+Examples:
 
-No domain name is needed. Let's Encrypt issues IP-address certificates only with
-its `shortlived` profile (~160 hours), validated over HTTP-01:
+```text
+# allowed-domains.txt
+discord.com
+discord.gg
+discordapp.com
+discordapp.net
+discord.media
+```
+
+```text
+# destination-policy.conf
+discord.com       443
+discord.gg        443
+discordapp.com    443
+discordapp.net    443
+discord.media     443,1024-65535
+```
+
+Then apply them:
 
 ```bash
-certbot certonly \
-  --preferred-profile shortlived \
-  --webroot --webroot-path /var/www/dohcord-relay \
-  --ip-address 13.48.52.216 \
-  --cert-name dohcord-relay \
-  --deploy-hook /usr/local/bin/dohcord-relay-tls-deploy \
-  --agree-tos --register-unsafely-without-email
+sudo dohcord-relay -config /etc/dohcord-relay/config.env -policy-apply
 ```
 
-(Use `--email ADDRESS` instead of `--register-unsafely-without-email` if you want
-Let's Encrypt expiry notices.)
+What that command does, in order:
 
-`--ip-address` needs certbot 5.3+ and webroot support needs 5.4+; the installer
-reuses a suitable `certbot` if present, otherwise installs one in
-`/opt/dohcord-relay-certbot`.
+1. Parses and cross-validates both files (strict domain syntax, no IP literals,
+   no wildcards, valid port numbers, no duplicates, no overlap, full coverage of
+   the allowlist).
+2. Renders the Squid ACLs.
+3. Runs `squid -k parse` on the **complete** configuration.
+4. Only if all of that passes: installs the new ACLs, writes the applied-policy
+   snapshot used by `/network-config`, and reloads Squid.
 
-Renewal: `dohcord-relay-certbot-renew.timer` runs every 6 hours with jitter and
-calls `certbot renew` for the `dohcord-relay` lineage. Certbot renews
-certificates valid for under 10 days at half their lifetime, so a 160-hour
-certificate is replaced with ~80 hours left; six-hour checks leave many retries
-before expiry. No `renew_before_expiry` is set (an inherited 30-day value would
-renew on every run).
+If anything fails, the command prints the reason, changes nothing, and Squid
+keeps enforcing the previous policy. `-policy-check` validates without applying.
 
-The deploy hook runs only after a successful issuance/renewal and:
+`discord.media`'s dynamic range is configurable — it is just that line. Keep it
+exclusive to `discord.media`: other Discord domains do not need it, and giving it
+to them widens the proxy for no benefit.
 
-1. verifies the new certificate contains `13.48.52.216` as an IP SAN
-   (`openssl x509 -checkip`) and fails loudly if not;
-2. copies `fullchain.pem` and `privkey.pem` to `/etc/dohcord-relay/tls` as
-   `root:dohcord-relay 0640`, because both services run unprivileged and cannot
-   read `/etc/letsencrypt/live`;
-3. restarts `dohcord-relay-credentials.service` and
-   `dohcord-relay-coturn.service` so both use the new certificate.
+> Do not add broad shared namespaces such as `googleapis.com`. If Discord
+> genuinely needs a specific Google host, add that exact host name only, after
+> confirming it. Fewer destinations is strictly safer.
 
-The credential endpoint also reloads the certificate on `SIGHUP` and whenever the
-file changes on disk (`systemctl reload dohcord-relay-credentials`).
+---
 
 ## Firewall
 
 | Port | Protocol | Purpose |
 |---|---|---|
-| 80 | TCP | IP certificate HTTP-01 validation |
-| 443 | TCP | HTTPS credential endpoint |
-| 3478 | UDP | primary TURN |
+| 80 | TCP | HTTP-01 certificate validation (and renewal) |
+| 443 | TCP | HTTPS CONNECT proxy |
+| 8443 | TCP | Network configuration endpoint |
+| 3478 | UDP | TURN |
 | 5349 | TCP | TURN over TLS |
-| 49152–65535 | UDP | TURN media allocations |
+| 49152–65535 | UDP | TURN relayed media |
 
-The installer opens exactly these in ufw or firewalld and never removes SSH or
-other rules. If the VPS sits behind a cloud security group (EC2, for example),
-the same ports must be allowed there — the host firewall cannot do that for you.
-coturn also listens on 3478/tcp and 5349/udp by default; those are not opened, so
-only the required transports are reachable.
+The installer opens these in ufw or firewalld and preserves everything else. If
+your VPS sits behind a cloud security group (EC2, OVH, Hetzner firewall…), open
+the same ports there too — the host firewall cannot do that for you.
 
-## Service operations
+**No extra inbound ports are needed for proxied destinations.** When the proxy
+connects to `discord.media:2048`, port 2048 is the *remote* port on Discord; your
+server only needs normal outbound TCP (and outbound UDP for TURN media).
 
-```bash
-systemctl status dohcord-relay-coturn.service dohcord-relay-credentials.service
-systemctl restart dohcord-relay-coturn.service
-systemctl restart dohcord-relay-credentials.service
-journalctl -u dohcord-relay-credentials.service -f
-tail -f /var/log/dohcord-relay/turnserver.log
-systemctl list-timers dohcord-relay-certbot-renew.timer
-certbot certificates --cert-name dohcord-relay   # or /opt/dohcord-relay-certbot/bin/certbot
-```
+---
 
-## Verification
+## Everyday operations
 
 ```bash
+# what is running
+systemctl status dohcord-relay-squid.service dohcord-relay-coturn.service dohcord-relay-api.service
+
+# logs
+journalctl -u dohcord-relay-api.service -f
+journalctl -u dohcord-relay-squid.service -f      # or /var/log/dohcord-relay/squid/cache.log
+tail -f /var/log/dohcord-relay/turnserver/turnserver.log
+
+# re-run all checks (services, listeners, policy, proxy allow/deny, API, TURN, certs)
 sudo deploy/verify.sh
+
+# policy work
+sudo dohcord-relay -config /etc/dohcord-relay/config.env -policy-check
+sudo dohcord-relay -config /etc/dohcord-relay/config.env -policy-apply
+
+# certificate
+sudo /opt/dohcord-relay-certbot/bin/certbot certificates --cert-name dohcord-relay
+systemctl list-timers dohcord-relay-certbot-renew.timer
+
+# which policy did Squid last accept
+cat /etc/dohcord-relay/policy.json
 ```
 
-It checks: both services active; UDP 3478 and TCP 5349 listening; relay range
-49152–65535; quotas and peer filtering present; the HTTPS response contract
-(status, `no-store`, JSON, `expiresAt` ≈ now + TTL, `<timestamp>:Dohcord`
-username, HMAC recomputed from the local secret); TLS validity for the IP; a real
-TURN client obtaining a relay candidate over UDP and over TLS; rejection of a
-wrong password, an expired username and unauthenticated requests; bidirectional
-media through the relay; port 80 serving an ACME challenge file (written into the
-webroot, then fetched back over HTTP); outbound UDP (STUN to a public server); the
-certificate's IP SAN; the renewal timer; and `certbot renew --dry-run`.
+`deploy/verify.sh` checks, among other things: all three services active; the
+four listeners; Squid configured as a TLS forward proxy with `https_port`, no
+`ssl_bump`, CONNECT-only rules and private-address filtering; the generated ACLs
+matching the policy files exactly; real CONNECT tests through the proxy
+(`discord.com:443` and `gateway.discord.gg:443` succeed; unlisted domains,
+`discord.com.evil.example`, similarity tricks, IP literals, disallowed ports and
+the dynamic range on *other* domains are denied); the `/network-config` document
+matching the policy and not leaking the TURN secret; TURN allocation, wrong
+password, expired username, quota and bidirectional media (when coturn's
+utilities are installed); outbound UDP; and certificate validity plus
+`certbot renew --dry-run`.
 
-### Tests
+### Editing endpoint tuning
 
-What was actually run, and where: coturn **4.18.0** was built from the pinned
-upstream release in a Linux sandbox and driven by the project's own rendered
-configuration, the real credential binary, and coturn's `turnutils_uclient` /
-`turnutils_peer`. Public-IP-specific steps were adjusted to loopback only for
-that sandbox (unprivileged ports, `allow-loopback-peers`); nothing else in the
-configuration was relaxed.
-
-| Check | Result |
-|---|---|
-| coturn 4.18.0 starts with the generated configuration | pass — 0 parse warnings |
-| Every option in the generated config exists in coturn 4.18.0 | pass |
-| UDP listener + TCP/TLS listener | pass |
-| TLS 1.0 / 1.1 refused, TLS 1.2 / 1.3 accepted | pass |
-| HTTPS endpoint: JSON, HTTP/2, `Cache-Control: no-store` | pass |
-| `expiresAt` = now + 24h, username `<timestamp>:Dohcord` | pass |
-| Credential = `base64(HMAC-SHA1(secret, username))` | pass — matched an independent Python computation |
-| Allocation with issued credentials (UDP) | pass — relay candidate from the allocation range |
-| Allocation with issued credentials over TLS | pass |
-| Wrong password rejected | pass — coturn `401 Unauthorized` (“message integrity does not match any auth secret”) |
-| Expired username rejected | pass — coturn `401 Unauthorized` (“time-limited username timestamp is in the past”) |
-| Unauthenticated allocation rejected | pass — coturn `401 Unauthorized` |
-| Per-user allocation quota | pass — second allocation with `user-quota=1` rejected with `486` |
-| Bidirectional media through the relay (UDP) | pass — 20/20 messages, 2000/2000 bytes echoed |
-| Bidirectional media through the relay (TLS) | pass — 20/20 messages |
-| Port 80 serves ACME HTTP-01 challenge files from the webroot | pass — probe file fetched back over HTTP |
-| Missing secret → clear error | pass — `503 {"error":"turn configuration unavailable"}` |
-| Per-IP rate limit | pass — burst exhausted → `429` |
-| `deploy/verify.sh` against a live instance | 22 pass, 0 fail, 1 warning (below), 4 skipped (systemd/renewal) |
-
-Not verified here, and therefore not claimed:
-
-* **Deployment to 13.48.52.216.** This environment has no access to that VPS, so
-  the installer was never executed against it.
-* **Real Let's Encrypt IP certificate issuance and renewal.** That needs port 80
-  of the public IP; only the TLS serving path, IP-SAN verification and the deploy
-  hook logic were exercised, with a locally generated IP-SAN certificate.
-* **systemd units under systemd.** No systemd in the build sandbox; units and
-  scripts were syntax-checked and their commands exercised manually.
-* **A real Electron/WebRTC client** (no browser here). TURN behaviour was proven
-  with coturn's own TURN client instead.
-* **Outbound UDP to a public STUN server** — the sandbox filters UDP to
-  non-DNS ports, so `verify.sh` reports a warning there. On the VPS this check is
-  expected to pass; if it does not, relayed media cannot reach Discord.
-
-Finish verification on the VPS:
+`/etc/dohcord-relay/config.env` holds the endpoint's own settings
+(`CREDENTIAL_TTL`, rate limits, ports). After editing:
 
 ```bash
-sudo deploy/verify.sh                                  # all checks, including renewal
-sudo certbot certificates --cert-name dohcord-relay     # IP SAN + expiry (~160h)
-curl -sS https://13.48.52.216/turn-credentials | head -c 400
+sudo systemctl restart dohcord-relay-api.service
 ```
 
-Then place a real call from Dohcord through the relay and confirm the ICE
-candidate pair is `relay`, with bytes flowing both ways.
+Squid limits live in `/etc/dohcord-relay/squid.conf`. Change them through the
+installer flags where possible (`--max-connections`), then:
 
-## Tuning
+```bash
+sudo squid -k parse -f /etc/dohcord-relay/squid.conf
+sudo systemctl reload dohcord-relay-squid.service
+```
 
-`/etc/dohcord-relay/config.env` (restart `dohcord-relay-credentials` after
-editing): `CREDENTIAL_TTL`, `PER_IP_RATE_PER_MINUTE`, `PER_IP_BURST`,
-`GLOBAL_RATE_PER_MINUTE`, `GLOBAL_BURST`, `TURN_URLS`, `TURN_IDENTITY`,
-`TRUST_PROXY_HEADER` (only behind a proxy that overwrites `X-Forwarded-For`).
+### Rotating the TURN secret
 
-coturn limits live in `/etc/dohcord-relay/turnserver.conf`; re-run the installer
-with `--user-quota`, `--total-quota`, `--max-bps` or `--bps-capacity` to change
-them in a supported way, then `systemctl restart dohcord-relay-coturn.service`.
+This invalidates every credential in flight (within one allocation lifetime):
+
+```bash
+sudo sh -c 'openssl rand -hex 32 > /etc/dohcord-relay/turn-secret'
+sudo chown root:dohcord-relay /etc/dohcord-relay/turn-secret
+sudo chmod 0640 /etc/dohcord-relay/turn-secret
+sudo sed -i "s|^static-auth-secret=.*|static-auth-secret=$(sudo cat /etc/dohcord-relay/turn-secret)|" \
+  /etc/dohcord-relay/turnserver.conf
+sudo systemctl restart dohcord-relay-coturn.service dohcord-relay-api.service
+```
+
+---
+
+## Upgrading
+
+```bash
+cd Dohcord-relay
+git pull
+sudo deploy/install.sh --mode domain --domain relay.example.com --ip 203.0.113.10
+```
+
+Re-running the installer is the supported upgrade path: it rebuilds the endpoint,
+re-renders configuration, re-validates the policy and restarts the services. Your
+allowlist edits, TURN secret and valid certificate are kept.
+
+- **coturn:** `sudo deploy/install.sh --coturn-version 4.19.0` (only 4.18.0 has a
+  pinned checksum; other versions build without one and print a warning).
+- **Squid:** upgraded by `apt`; the installer re-checks TLS support and version
+  and re-renders `squid.conf` for the right TLS syntax.
+
+---
+
+## Uninstalling
+
+```bash
+sudo systemctl disable --now dohcord-relay-squid.service \
+  dohcord-relay-coturn.service dohcord-relay-api.service \
+  dohcord-relay-certbot-renew.timer
+sudo rm -f /etc/systemd/system/dohcord-relay-squid.service \
+  /etc/systemd/system/dohcord-relay-coturn.service \
+  /etc/systemd/system/dohcord-relay-api.service \
+  /etc/systemd/system/dohcord-relay-certbot-renew.service \
+  /etc/systemd/system/dohcord-relay-certbot-renew.timer
+sudo rm -f /usr/local/bin/dohcord-relay /usr/local/bin/dohcord-relay-tls-deploy
+sudo rm -rf /etc/dohcord-relay /var/log/dohcord-relay /var/www/dohcord-relay
+sudo systemctl daemon-reload
+# optional: remove the certificate lineage
+sudo /opt/dohcord-relay-certbot/bin/certbot delete --cert-name dohcord-relay
+# optional: remove the packages
+sudo apt-get remove squid coturn
+```
+
+Firewall rules the installer added stay in place; remove them by hand if you want
+them gone. If you edited `/etc/apparmor.d/local/usr.sbin.squid`, remove the
+Dohcord-relay block there too.
+
+---
 
 ## Troubleshooting
 
-**`486 Allocation Bandwidth Quota Reached`.** `bps-capacity` is smaller than a
-few `max-bps` reservations. Raise `bps-capacity` (or lower `max-bps`).
+**The installer stops: "port(s) … already in use".**
+Something else owns 80, 443, 8443, 3478 or 5349. It prints the listener and does
+not touch it. Stop or move that service (for example an existing nginx), then
+re-run. The relay does not integrate with another web server automatically.
 
-**`403 Forbidden IP` on permission/channel bind.** The peer address is in a
-denied range. Only private, loopback, link-local, multicast and documentation
-ranges are denied; if a legitimate endpoint falls into one, add a narrow
-`allowed-peer-ip` for it.
+**The installer stops on the DNS check.**
+The domain's A record must contain the IP you supplied. Fix DNS (and wait for
+propagation), or pass the matching `--ip`. If the domain has an AAAA record but
+the VPS has no global IPv6, remove the AAAA record.
 
-**Allocations time out.** UDP 3478 (and the relay range) is not reaching the
-host, or outbound UDP is filtered. `deploy/verify.sh` reports both.
+**Certificate issuance fails.**
+Port 80 must be reachable from the internet for the domain/IP. Check the cloud
+firewall and `journalctl -u dohcord-relay-api.service`. Re-run the installer; it
+retries issuance when the current certificate is missing or near expiry.
 
-**Issuance fails with `Invalid response ... 404` on the challenge.** The CA reached
-port 80 but the challenge file was not served. The endpoint serves
-`<ACME_WEBROOT>/.well-known/acme-challenge/<token>`, which is where
-`certbot --webroot` writes it; check `ACME_WEBROOT` in `config.env` and run
-`sudo bash deploy/verify.sh`, whose ACME check writes a probe file and fetches it
-back over HTTP.
+**Certificate renewal fails (IP installs especially).**
+IP certificates last 160 hours, so watch this. `deploy/verify.sh` includes
+`certbot renew --dry-run`; run it and check the certbot log. Renewal needs port
+80 to keep working.
 
-**Certificate renewal fails.** Port 80 must stay reachable for HTTP-01; check
-`journalctl -u dohcord-relay-certbot-renew.service`, then run
-`certbot renew --cert-name dohcord-relay --dry-run` (or the venv certbot at
-`/opt/dohcord-relay-certbot/bin/certbot`). With a 160-hour certificate, act well
-before expiry.
+**Dohcord shows a 403 or "proxy refused" for a Discord address.**
+Squid denied it. Check `/var/log/dohcord-relay/squid/access.log` for
+`TCP_DENIED/403`: the destination is not covered by the policy, or the port is
+not allowed for that domain. Add the exact domain to both files and run
+`-policy-apply`. If the log shows `HIER_NONE/-` with a 403, the resolved address
+was rejected (private/loopback) — that is intentional.
 
-**Port already in use.** The installer refuses to continue and prints the
-listener. Stop or move the conflicting service; it will not touch existing web
-server configuration.
+**Voice connects but audio is silent / no relay candidate.**
+TURN is not being reached: check UDP 3478 and 49152–65535 are open in the host
+firewall *and* the cloud firewall, and that outbound UDP works
+(`deploy/verify.sh` tests a public STUN server). Coturn logs specific errors in
+`/var/log/dohcord-relay/turnserver/turnserver.log`.
 
-<a name="existing-web-server"></a>
-**Existing web server on 80/443.** The installer stops rather than reconfiguring
-it. To integrate manually: serve `/.well-known/acme-challenge/` from
-`/var/www/dohcord-relay` over plain HTTP, run certbot with
-`--webroot -w /var/www/dohcord-relay --ip-address 13.48.52.216
---preferred-profile shortlived`, copy the certificates with
-`/usr/local/bin/dohcord-relay-tls-deploy`, and reverse-proxy
-`https://13.48.52.216/turn-credentials` to `127.0.0.1:8080` after setting
-`HTTPS_LISTEN=127.0.0.1:8080`, `HTTP_LISTEN=` and `TRUST_PROXY_HEADER=true` in
-`config.env` (the proxy must overwrite `X-Forwarded-For`).
+**`486 Allocation Bandwidth Quota Reached`.**
+`bps-capacity` is too small relative to `max-bps`: coturn reserves `max-bps` for
+every allocation, so `bps-capacity / max-bps` is the number of concurrent
+sessions. Raise `bps-capacity` or lower `max-bps`, then restart coturn.
 
-## Updating
+**`403 Forbidden IP` on a TURN permission.**
+The peer address fell into a denied range. Only private, loopback, link-local,
+multicast and documentation ranges are denied; if a legitimate endpoint is in one
+of those, add a narrow `allowed-peer-ip` for it.
 
-* **coturn:** `sudo deploy/install.sh --coturn-version 4.19.0`
-  (or whatever the current release is; the pinned checksum applies to 4.18.0).
-* **credential endpoint:** `git pull && sudo deploy/install.sh`
-  rebuilds the binary and restarts the service.
+**Squid will not start after an edit.**
+Run `sudo squid -k parse -f /etc/dohcord-relay/squid.conf` — it prints the exact
+line. Never start Squid with a broken policy; `-policy-apply` refuses to reload
+one.
 
-## Removing
+**Dohcord cannot validate the certificate.**
+The certificate must be publicly trusted and must contain the exact host clients
+use. `deploy/verify.sh` checks both the proxy and the TURN TLS listener. A staging
+certificate is not trusted — re-run without `--staging`.
+
+---
+
+## Security model and limitations
+
+Read this before exposing the relay publicly.
+
+**What the server enforces**
+
+- Only `CONNECT`, only allowlisted domains, only their permitted ports.
+- Only public destination addresses, checked after server-side resolution.
+- Bounded connections per client IP, bounded total descriptors, request header
+  limits, connect/read/lifetime timeouts.
+- No TLS interception: no `ssl_bump`, no custom CA, no client certificate.
+- TURN requires short-lived credentials signed with a secret that never leaves
+  the server; private/loopback/multicast peers are denied; quotas and bandwidth
+  reservations bound allocations.
+- The policy files are validated before they can change behaviour; an empty or
+  broken policy denies everything.
+
+**What it does not do**
+
+- **It does not authenticate clients.** Anyone who knows your address can fetch
+  `/network-config` and use the proxy for the allowed Discord destinations. The
+  server cannot prove a request came from official Dohcord. The destination
+  policy is the boundary; do not claim more.
+- **Bandwidth inside a proxy tunnel is not shaped by Squid.** Stock Squid has no
+  per-tunnel byte-rate limiter. Concurrency is capped per client and globally,
+  and idle/lifetime timeouts apply, but a single tunnel can use the link. If you
+  need hard per-client shaping, apply it at the network layer on your VPS. TURN
+  media *is* rate-limited (`max-bps` / `bps-capacity`).
+- **DNS rebinding resistance has a narrow window.** Squid resolves the name,
+  checks the resolved address, and connects to that same resolved address, so an
+  attacker cannot swap the answer between the check and the connect. A hostile
+  resolver can still return a public address that later redirects at the
+  application layer; the allowlist prevents that from reaching non-Discord
+  services. Run a trustworthy resolver on the VPS.
+- **No IPv6 endpoints are advertised.** TURN URLs use the domain name or IPv4
+  address. If your domain publishes AAAA and the VPS has no IPv6, the installer
+  stops rather than shipping a broken configuration.
+- **The endpoint is public by design.** It hands out TURN credentials to anyone
+  who asks, at a rate limit. That is the trade-off for "no accounts".
+
+**Operational notes**
+
+- Certificates and keys are readable only by the services that need them
+  (`/etc/dohcord-relay/tls`, root-owned directory, group-readable files).
+- Temporary TURN credentials are never logged; only the client address and expiry.
+- The shared TURN secret is stored once, in `/etc/dohcord-relay/turn-secret`.
+
+---
+
+## Files on the server
+
+| Path | Purpose |
+|---|---|
+| `/etc/dohcord-relay/squid.conf` | proxy configuration (TLS forward proxy, limits, checks) |
+| `/etc/dohcord-relay/squid-allow.conf` | **generated** ACLs — do not edit |
+| `/etc/dohcord-relay/allowed-domains.txt` | domains the proxy may reach (edit this) |
+| `/etc/dohcord-relay/destination-policy.conf` | ports per domain (edit this) |
+| `/etc/dohcord-relay/policy.json` | the exact policy Squid is enforcing |
+| `/etc/dohcord-relay/turnserver.conf` | coturn configuration |
+| `/etc/dohcord-relay/turn-secret` | TURN shared secret (`root:dohcord-relay 0640`) |
+| `/etc/dohcord-relay/config.env` | endpoint configuration |
+| `/etc/dohcord-relay/tls/` | certificate, key and the combined `squid.pem` |
+| `/usr/local/bin/dohcord-relay` | the endpoint / policy tool |
+| `/usr/local/bin/dohcord-relay-tls-deploy` | certbot deploy hook |
+| `/var/www/dohcord-relay` | ACME HTTP-01 webroot |
+| `/var/log/dohcord-relay/squid/` | Squid access and cache logs (owned by `proxy`) |
+| `/var/log/dohcord-relay/turnserver/` | coturn log (owned by `turnserver`) |
+
+Units: `dohcord-relay-squid.service`, `dohcord-relay-coturn.service`,
+`dohcord-relay-api.service`, `dohcord-relay-certbot-renew.timer`.
+
+---
+
+## What was tested
+
+This project is a networking product, so treat "works" claims carefully.
+
+**Verified in development against real software (not just unit tests):**
+
+- The Go service builds, `go vet` is clean, and the unit tests pass (policy
+  parsing and boundary matching, Squid ACL rendering, credential HMAC vector,
+  config validation, `/network-config` schema and rate limiting).
+- **Squid 6.14** (Ubuntu 24.04 build, GnuTLS) was started with the repository's
+  own rendered `squid.conf` and generated ACLs, and driven with real HTTPS proxy
+  requests:
+  - CONNECT to an allowlisted domain on 443 succeeded end to end (TLS through
+    the tunnel), and to a second allowlisted domain on a dynamic high port was
+    permitted.
+  - Denied: an unlisted domain, `allowed.com.evil.test`, `evilallowed.com`, an
+    IP-literal destination, a port outside the domain's policy, and the dynamic
+    range on a non-media domain.
+  - A plain `GET` through the proxy returned 403 (CONNECT-only).
+  - A hostname resolving to `127.0.0.1` and one resolving to `10.1.2.3` were
+    both denied *after* resolution (`TCP_DENIED/403`), while a public address was
+    tunnelled (`TCP_TUNNEL`).
+  - Policy changes: removing a domain and running `-policy-apply` made the same
+    Squid process deny it without a restart; an inconsistent or empty policy was
+    refused and the running policy stayed in force.
+  - TLS 1.0/1.1 are refused, TLS 1.2 accepted.
+- The endpoint was run over HTTPS and returned the documented JSON (correct
+  policy, HMAC credential, `no-store`, HTTP/2), 404 for unknown paths, and 429
+  once the per-IP burst was spent. Logs contain no secrets.
+- **`deploy/verify.sh` itself** was run against that live Squid plus endpoint:
+  39 checks passed, 0 failed, with systemd, renewal and TURN-runtime checks
+  skipped in the sandbox (the self-signed test certificate was supplied through
+  its `DOHCORD_RELAY_CA_FILE` / `DOHCORD_RELAY_PROXY_CA` overrides, which still
+  verify the certificate rather than disabling verification).
+- Two more bugs that running the verifier found and fixed: it treated the word
+  `ssl_bump` inside a comment as a configured directive, and it reported a failed
+  proxy certificate check as "a non-media domain was allowed on a dynamic port".
+- Bugs this testing found and fixed: Squid rejects `options=` on GnuTLS builds
+  and is *fatal* on `tls-min-version=1.2` there; two ACL types cannot share a
+  name; `.domain` already covers the apex; `::ffff:0:0/96` silently collapses to
+  `0.0.0.0/0` (which would have denied every destination).
+
+**Not verified here, so not claimed:**
+
+- **A real Discord call or Electron client through the relay.** That needs the
+  Dohcord app on a real network; the proxy and TURN paths were tested separately
+  as described above.
+- **Live coturn relaying in this environment.** The coturn configuration and the
+  credential algorithm are unchanged from the previous tested revision, and the
+  credential output was verified live, but the sandbox used for this change could
+  not run a coturn binary (no root; available packages were ABI-incompatible). Run
+  `sudo deploy/verify.sh` on your VPS — it performs real allocation, expired- and
+  wrong-credential, quota and bidirectional media tests.
+- **Let's Encrypt issuance and renewal against the public CA.** That needs port 80
+  of a real public address. The ACME responder, IP-SAN/domain checks and deploy
+  hook were exercised locally; `verify.sh` runs `certbot renew --dry-run` on your
+  server.
+- **The installer end to end on a fresh VPS.** It was syntax-checked and its
+  individual steps were exercised, but it was not executed as root against a real
+  Ubuntu/Debian host in a cloud with real DNS and a public IP.
+- **systemd units under systemd** and **reboot recovery** — verify with
+  `systemctl status` and a reboot on your VPS.
+
+After installing, the honest final checks are:
 
 ```bash
-sudo systemctl disable --now dohcord-relay-coturn.service \
-  dohcord-relay-credentials.service dohcord-relay-certbot-renew.timer
-sudo rm -f /etc/systemd/system/dohcord-relay-*.service \
-  /etc/systemd/system/dohcord-relay-certbot-renew.timer
-sudo rm -f /usr/local/bin/dohcord-relay-credentials /usr/local/bin/dohcord-relay-tls-deploy
-sudo rm -rf /etc/dohcord-relay /var/log/dohcord-relay /var/www/dohcord-relay
-sudo systemctl daemon-reload
-# optionally: sudo certbot delete --cert-name dohcord-relay
+sudo deploy/verify.sh
+curl -sS https://YOUR-HOST:8443/network-config | python3 -m json.tool
 ```
+
+then place a real call from Dohcord and confirm the ICE candidate pair is
+`relay` with bytes flowing both ways.

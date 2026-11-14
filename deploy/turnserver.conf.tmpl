@@ -118,7 +118,7 @@ denied-peer-ip=ff00::-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
 
 # --- Process ---------------------------------------------------------------
 # Runs unprivileged under systemd (User=turnserver in the unit file).
-pidfile=/run/dohcord-relay/turnserver.pid
+pidfile=@PID_FILE@
 log-file=@LOG_FILE@
 simple-log
 no-stdout-log
