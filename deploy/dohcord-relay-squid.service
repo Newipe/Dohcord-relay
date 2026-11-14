@@ -10,7 +10,7 @@ RuntimeDirectory=dohcord-relay-squid
 RuntimeDirectoryMode=0750
 # Squid binds 443 as root and then drops to the unprivileged "proxy" user
 # (cache_effective_user in squid.conf), so it must start as root.
-ExecStart=/usr/sbin/squid -N -f /etc/dohcord-relay/squid.conf
+ExecStart=@SQUID_BINARY@ -N -f /etc/dohcord-relay/squid.conf
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3s

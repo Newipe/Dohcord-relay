@@ -359,8 +359,12 @@ valid certificate and any allowlist edits, and only rewrites the files it owns.
 5. Opens exactly the required ports in ufw or firewalld, leaving existing rules
    (including SSH) untouched.
 6. Installs **Squid** from the distribution, verifies the build has TLS support
-   and Squid 5+, and picks the TLS-floor syntax that build accepts (GnuTLS and
-   OpenSSL builds reject each other's spelling).
+   and Squid 5+, and **requires the OpenSSL flavour** (`squid-openssl`), because
+   GnuTLS builds never send intermediate certificates and every client would
+   reject the proxy's certificate with `unable to get local issuer certificate`.
+   On Debian the installer adds `squid-openssl`; on Ubuntu that package replaces
+   `squid` itself. If no OpenSSL build is available the install stops and says so
+   rather than leaving you with a proxy nobody can trust.
 7. Installs **coturn**: builds the pinned 4.18.0 release with a verified checksum
    (or uses the distribution package with `--distro-coturn`), and checks every
    option in the generated `turnserver.conf` against `turnserver --help`.
@@ -735,7 +739,12 @@ one.
 **Dohcord cannot validate the certificate.**
 The certificate must be publicly trusted and must contain the exact host clients
 use. `deploy/verify.sh` checks both the proxy and the TURN TLS listener. A staging
-certificate is not trusted — re-run without `--staging`.
+certificate is not trusted — re-run without `--staging`. If the error mentions
+`unable to get local issuer certificate`, the proxy is sending only its leaf:
+check that `SQUID_BINARY` is an OpenSSL build (`squid -v | grep with-openssl`)
+and that `squid.pem` contains both certificates
+(`grep -c 'BEGIN CERTIFICATE' /etc/dohcord-relay/tls/squid.pem`). GnuTLS builds
+cannot send intermediates, so `squid-openssl` is required.
 
 ---
 
@@ -821,8 +830,8 @@ This project is a networking product, so treat "works" claims carefully.
 - The Go service builds, `go vet` is clean, and the unit tests pass (policy
   parsing and boundary matching, Squid ACL rendering, credential HMAC vector,
   config validation, `/network-config` schema and rate limiting).
-- **Squid 6.14** (Ubuntu 24.04 build, GnuTLS) was started with the repository's
-  own rendered `squid.conf` and generated ACLs, and driven with real HTTPS proxy
+- **Squid 6.14**: the GnuTLS build was started with the repository's own
+  rendered `squid.conf` and generated ACLs, and driven with real HTTPS proxy
   requests:
   - CONNECT to an allowlisted domain on 443 succeeded end to end (TLS through
     the tunnel), and to a second allowlisted domain on a dynamic high port was
@@ -849,6 +858,13 @@ This project is a networking product, so treat "works" claims carefully.
 - Two more bugs that running the verifier found and fixed: it treated the word
   `ssl_bump` inside a comment as a configured directive, and it reported a failed
   proxy certificate check as "a non-media domain was allowed on a dynamic port".
+- **The certificate-chain defect found on a real VPS**: Squid's GnuTLS build
+  accepts `tls-cert=` with a full chain and silently sends only the leaf, so a
+  Let's Encrypt certificate is unusable. Reproduced with a root→intermediate→leaf
+  chain, then verified that the OpenSSL build (`squid-openssl`) sends both
+  certificates and verifies with `Verify return code: 0` against the root alone.
+  The installer now requires that build and `deploy/verify.sh` checks the chain
+  was actually sent.
 - Bugs this testing found and fixed: Squid rejects `options=` on GnuTLS builds
   and is *fatal* on `tls-min-version=1.2` there; two ACL types cannot share a
   name; `.domain` already covers the apex; `::ffff:0:0/96` silently collapses to

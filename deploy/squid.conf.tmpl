@@ -12,11 +12,13 @@
 # tls-cert points at a combined certificate+key PEM (squid.pem, maintained by
 # the certbot deploy hook, readable only by the proxy user).
 #
-# The TLS 1.2 floor is expressed differently by the two TLS backends Squid can
-# be built with, and each rejects the other's spelling, so install.sh writes the
-# form that this build understands:
-#   GnuTLS (Debian/Ubuntu packages): tls-options=NORMAL:-VERS-TLS1.0:-VERS-TLS1.1
-#   OpenSSL (source builds):         options=NO_TLSv1,NO_TLSv1_1
+# This relay requires the OpenSSL build of Squid (squid-openssl), because GnuTLS
+# builds never send intermediate certificates and clients would reject the
+# proxy's certificate. install.sh writes the TLS 1.2 floor in the form that build
+# accepts:
+#   OpenSSL: options=NO_TLSv1,NO_TLSv1_1
+#   GnuTLS:  tls-options=NORMAL:-VERS-TLS1.0:-VERS-TLS1.1 (not used; kept for
+#            anyone running the scripts against such a build)
 https_port @PROXY_PORT@ tls-cert=@SQUID_PEM@ @TLS_OPTIONS@
 
 visible_hostname @PUBLIC_HOST@

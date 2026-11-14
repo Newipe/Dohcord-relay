@@ -22,7 +22,7 @@
 # valid certificate, and only rewrites files it owns.
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="2.0.1"
+readonly INSTALLER_VERSION="2.0.2"
 
 # --- Defaults ---------------------------------------------------------------
 MODE=""            # "domain" or "ip"; asked interactively when empty
@@ -545,9 +545,32 @@ install_squid() {
 	export DEBIAN_FRONTEND=noninteractive
 	apt-get install -y -qq --no-install-recommends squid >/dev/null
 
-	SQUID_BINARY="$(command -v squid || true)"
-	[[ -n "${SQUID_BINARY}" ]] || SQUID_BINARY="/usr/sbin/squid"
+	# A GnuTLS build of Squid never sends intermediate certificates - upstream
+	# documents the chain as OpenSSL-only - so a public certificate (Let's
+	# Encrypt, whose leaf is signed by an intermediate) would be rejected by
+	# every client with "unable to get local issuer certificate". Debian ships
+	# the OpenSSL flavour as the squid-openssl package; on Ubuntu that package
+	# replaces squid itself.
+	pick_openssl_squid() {
+		local candidate
+		for candidate in /usr/sbin/squid-openssl "${SQUID_BINARY}"; do
+			[[ -x "${candidate}" ]] || continue
+			if "${candidate}" -v 2>&1 | grep -q -- '--with-openssl'; then
+				SQUID_BINARY="${candidate}"
+				return 0
+			fi
+			done
+		return 1
+	}
+	SQUID_BINARY="$(command -v squid || echo /usr/sbin/squid)"
 	[[ -x "${SQUID_BINARY}" ]] || die "the squid package did not install a squid binary"
+	if ! pick_openssl_squid; then
+		info "installing the OpenSSL flavour of Squid: the GnuTLS build cannot send the certificate chain"
+		apt-get install -y -qq --no-install-recommends squid-openssl >/dev/null 2>&1 || true
+		pick_openssl_squid ||
+			die "no OpenSSL build of Squid is available here, and a GnuTLS build cannot send intermediate certificates: clients would reject the proxy certificate with 'unable to get local issuer certificate'. Install the 'squid-openssl' package (Debian/Ubuntu) or build Squid with --with-openssl, then re-run."
+	fi
+	info "squid binary: ${SQUID_BINARY} (OpenSSL build, so the full certificate chain is sent)"
 
 	# Squid's distro unit must not fight ours for logs and the cache manager.
 	systemctl disable --now squid.service >/dev/null 2>&1 || true
@@ -558,9 +581,10 @@ install_squid() {
 	[[ -n "${SQUID_INSTALLED_VERSION}" ]] || die "cannot determine the Squid version"
 	info "squid version: ${SQUID_INSTALLED_VERSION}"
 
-	# https_port for forward-proxy CONNECT needs a TLS-enabled Squid.
-	if ! "${SQUID_BINARY}" -v 2>&1 | grep -qE -- '--with-openssl|--with-gnutls'; then
-		die "this Squid build has no TLS support (--with-openssl/--with-gnutls); the HTTPS CONNECT listener cannot work. Install a TLS-enabled Squid (Ubuntu 22.04+/Debian 12+ packages are)."
+	# https_port for forward-proxy CONNECT needs a TLS-enabled Squid, and the
+	# chain requirement above means it has to be the OpenSSL flavour.
+	if ! "${SQUID_BINARY}" -v 2>&1 | grep -q -- '--with-openssl'; then
+		die "${SQUID_BINARY} is not an OpenSSL build of Squid, so it cannot send the certificate chain and clients would reject the proxy certificate. Install squid-openssl or build Squid with --with-openssl."
 	fi
 	if ! version_ge "${SQUID_INSTALLED_VERSION}" "5.0"; then
 		die "Squid ${SQUID_INSTALLED_VERSION} is too old; Squid 5 or newer is required for the https_port forward-proxy listener on this distribution"
@@ -644,9 +668,10 @@ render_squid_conf() {
 }
 
 install_squid_unit() {
-	install -m 0644 "${REPO_DIR}/deploy/dohcord-relay-squid.service" \
-		"/etc/systemd/system/${SQUID_UNIT}"
-	info "installed /etc/systemd/system/${SQUID_UNIT}"
+	sed -e "s|@SQUID_BINARY@|${SQUID_BINARY}|g" \
+		"${REPO_DIR}/deploy/dohcord-relay-squid.service" >"/etc/systemd/system/${SQUID_UNIT}"
+	chmod 0644 "/etc/systemd/system/${SQUID_UNIT}"
+	info "installed /etc/systemd/system/${SQUID_UNIT} (exec ${SQUID_BINARY})"
 }
 
 # --- coturn -----------------------------------------------------------------
@@ -841,6 +866,7 @@ render_config_env() {
 		-e "s|@PROXY_PORT@|${PROXY_PORT}|g" \
 		-e "s|@API_PORT@|${API_PORT}|g" \
 		-e "s|@TLS_DIR@|${TLS_DIR}|g" \
+		-e "s|@SQUID_BINARY@|${SQUID_BINARY}|g" \
 		"${REPO_DIR}/deploy/config.env.tmpl" >"${rendered}"
 
 	if [[ -f "${target}" ]] && grep -q '^HTTPS_PROXY_URL=' "${target}"; then
@@ -850,6 +876,7 @@ render_config_env() {
 			-e "s|^HTTPS_PROXY_URL=.*|HTTPS_PROXY_URL=https://${PUBLIC_HOST}:${PROXY_PORT}|" \
 			-e "s|^NETWORK_CONFIG_URL=.*|NETWORK_CONFIG_URL=https://${PUBLIC_HOST}:${API_PORT}/network-config|" \
 			-e "s|^TURN_URLS=.*|TURN_URLS=turn:${PUBLIC_HOST}:3478?transport=udp,turns:${PUBLIC_HOST}:5349?transport=tcp|" \
+			-e "s|^SQUID_BINARY=.*|SQUID_BINARY=${SQUID_BINARY}|" \
 			"${target}"
 		# Add any setting this version needs that the file predates (for example
 		# after upgrading from the credentials-only design).

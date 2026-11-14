@@ -448,43 +448,45 @@ else
 
 	if ((!proxy_tls_ok)); then
 		skip "policy probes skipped: fix the proxy certificate first, otherwise a denial cannot be told apart from a TLS failure"
-	elif [[ "$(proxy_probe "https://gateway.discord.gg/?v=10&encoding=json")" == "denied" ]]; then
-		fail "CONNECT gateway.discord.gg:443 (WebSocket gateway) was denied"
 	else
-		pass "CONNECT gateway.discord.gg:443 is permitted (the WSS transport path)"
-	fi
+		if [[ "$(proxy_probe "https://gateway.discord.gg/?v=10&encoding=json")" == "denied" ]]; then
+			fail "CONNECT gateway.discord.gg:443 (WebSocket gateway) was denied"
+		else
+			pass "CONNECT gateway.discord.gg:443 is permitted (the WSS transport path)"
+		fi
 
-	denied_cases=(
-		"https://example.com/|unlisted domain"
-		"https://discord.com.evil.example/|allowlist suffix trick"
-		"https://evil-discord.com/|similar-looking domain"
-		"https://1.1.1.1/|IP-literal destination"
-		"https://discord.com:2053/|port outside discord.com's policy"
-	)
-	for c in "${denied_cases[@]}"; do
-		url="${c%%|*}"
-		label="${c##*|}"
-		case "$(proxy_probe "${url}")" in
-		denied) pass "rejected: ${label} (${url})" ;;
-		tls) fail "TLS verification failed while testing ${label}" ;;
-		*) fail "${label} was not rejected with a policy denial (${url})" ;;
+		denied_cases=(
+			"https://example.com/|unlisted domain"
+			"https://discord.com.evil.example/|allowlist suffix trick"
+			"https://evil-discord.com/|similar-looking domain"
+			"https://1.1.1.1/|IP-literal destination"
+			"https://discord.com:2053/|port outside discord.com's policy"
+		)
+		for c in "${denied_cases[@]}"; do
+			url="${c%%|*}"
+			label="${c##*|}"
+			case "$(proxy_probe "${url}")" in
+			denied) pass "rejected: ${label} (${url})" ;;
+			tls) fail "TLS verification failed while testing ${label}" ;;
+			*) fail "${label} was not rejected with a policy denial (${url})" ;;
+			esac
+		done
+
+		# Dynamic voice-signalling ports are allowed for discord.media only. The
+		# exact port is supplied by Discord at call time; any permitted port must
+		# pass the ACL (the origin may still refuse the connection).
+		media_case="$(proxy_probe "https://sweetwater-12345.discord.media:2048/")"
+		if [[ "${media_case}" == "denied" ]]; then
+			fail "CONNECT to a dynamic discord.media port was denied"
+		else
+			pass "CONNECT to a dynamic discord.media port is permitted (${media_case})"
+		fi
+		case "$(proxy_probe "https://gateway.discord.com:2048/")" in
+		denied) pass "the dynamic port range is not available to other Discord domains" ;;
+		tls) skip "dynamic-port isolation not tested: the proxy certificate did not verify" ;;
+		*) fail "a non-media Discord domain was allowed on a dynamic port" ;;
 		esac
-	done
-
-	# Dynamic voice-signalling ports are allowed for discord.media only. The
-	# exact port is supplied by Discord at call time; any permitted port must
-	# pass the ACL (the origin may still refuse the connection).
-	media_case="$(proxy_probe "https://sweetwater-12345.discord.media:2048/")"
-	if [[ "${media_case}" == "denied" ]]; then
-		fail "CONNECT to a dynamic discord.media port was denied"
-	else
-		pass "CONNECT to a dynamic discord.media port is permitted (${media_case})"
 	fi
-	case "$(proxy_probe "https://gateway.discord.com:2048/")" in
-	denied) pass "the dynamic port range is not available to other Discord domains" ;;
-	tls) skip "dynamic-port isolation not tested: the proxy certificate did not verify" ;;
-	*) fail "a non-media Discord domain was allowed on a dynamic port" ;;
-	esac
 fi
 
 # --- HTTPS API --------------------------------------------------------------
@@ -676,8 +678,14 @@ for target in "${PROXY_HOST}:${PROXY_PORT}|proxy endpoint" "${SERVER_HOST}:${TLS
 	label="${target##*|}"
 	host="${hostport%:*}"
 	port="${hostport##*:}"
+	# The proxy may be checked against its own CA (staging certificates), while the
+	# TURN listener uses the general one.
 	openssl_ca=()
-	[[ -n "${CA_FILE}" ]] && openssl_ca=(-CAfile "${CA_FILE}")
+	if [[ "${label}" == "proxy endpoint" && -n "${PROXY_CA}" ]]; then
+		openssl_ca=(-CAfile "${PROXY_CA}")
+	elif [[ -n "${CA_FILE}" ]]; then
+		openssl_ca=(-CAfile "${CA_FILE}")
+	fi
 	if ! ss -Hltn "sport = :${port}" 2>/dev/null | grep -q .; then
 		skip "${label}: TCP ${port} is not listening"
 		continue
@@ -698,6 +706,21 @@ for target in "${PROXY_HOST}:${PROXY_PORT}|proxy endpoint" "${SERVER_HOST}:${TLS
 		fi
 	fi
 done
+
+# A certificate from a public CA is only usable if its intermediate is sent as
+# well. Squid's GnuTLS builds never do that, which is why the installer requires
+# the OpenSSL flavour; this check catches a regression on either side.
+if ss -Hltn "sport = :${PROXY_PORT}" 2>/dev/null | grep -q .; then
+	chain_sent="$(timeout 10 openssl s_client -connect "${PROXY_HOST}:${PROXY_PORT}" \
+		-servername "${PROXY_HOST}" -showcerts 2>/dev/null </dev/null | grep -c 'BEGIN CERTIFICATE' || true)"
+	if [[ "${chain_sent:-0}" -ge 2 ]]; then
+		pass "proxy sends the full certificate chain (${chain_sent} certificates)"
+	elif [[ "${chain_sent:-0}" -eq 1 ]]; then
+		fail "proxy sends only its leaf certificate, so clients cannot build a trusted chain; this needs the OpenSSL build of Squid (GnuTLS builds never send intermediates)"
+	else
+		warn "could not read the proxy certificate chain"
+	fi
+fi
 
 if [[ -r "${TLS_CERT}" ]]; then
 	not_after="$(openssl x509 -in "${TLS_CERT}" -noout -enddate | cut -d= -f2)"
