@@ -888,19 +888,65 @@ install_deploy_hook() {
 	info "installed ${HOOK}"
 }
 
+# port80_pid prints the pid of the process listening on TCP port 80, if any.
+port80_pid() {
+	ss -Hltnp 'sport = :80' 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+}
+
+# responder_answers NAME succeeds when the challenge file NAME is served on
+# port 80 by whatever is holding the port.
+responder_answers() {
+	[[ "$(curl -fsS --max-time 2 "http://127.0.0.1/.well-known/acme-challenge/$1" 2>/dev/null || true)" == "ok" ]]
+}
+
+# is_our_binary PID succeeds when PID is this project's own executable.
+is_our_binary() {
+	[[ -n "$1" && -r "/proc/$1/exe" ]] || return 1
+	[[ "$(readlink -f "/proc/$1/exe" 2>/dev/null)" == "$(readlink -f "${BIN}")" ]]
+}
+
 start_acme_bootstrap() {
 	install -d -m 0755 -o root -g root "${WEBROOT}"
 	[[ -n "${BOOTSTRAP_PID}" ]] && return 0
-	if ss -Hltn 'sport = :80' 2>/dev/null | grep -q .; then
+
+	local probe_dir="${WEBROOT}/.well-known/acme-challenge"
+	local holder
+	holder="$(port80_pid)"
+	if [[ -n "${holder}" ]]; then
+		# An interrupted run can leave its own responder behind. It belongs to
+		# this project, so reuse it when it works and replace it when it does not;
+		# anything else on port 80 is someone else's service and is never touched.
 		if systemctl is-active --quiet "${API_UNIT}"; then
 			info "port 80 is already served by ${API_UNIT}"
 			return 0
+		elif is_our_binary "${holder}"; then
+			install -d -m 0755 -o root -g root "${probe_dir}"
+			local reused="probe${RANDOM}${RANDOM}"
+			printf 'ok\n' >"${probe_dir}/${reused}"
+			if responder_answers "${reused}"; then
+				rm -f "${probe_dir}/${reused}"
+				BOOTSTRAP_PID="${holder}"
+				info "a previous ACME responder (pid ${holder}) is still running and answering; reusing it"
+				return 0
+			fi
+			rm -f "${probe_dir}/${reused}"
+			info "replacing a stopped ACME responder left behind by an earlier run (pid ${holder})"
+			kill "${holder}" 2>/dev/null || true
+			local waited
+			for waited in $(seq 1 25); do
+				[[ -z "$(port80_pid)" ]] && break
+				sleep 0.2
+			done
+		else
+			printf '  listener: %s\n' "$(ss -Hltnp 'sport = :80' 2>/dev/null | head -1)" >&2
+			die "port 80 is used by another service; stop it or move it before installing (this installer never reconfigures existing web servers)"
 		fi
-		die "port 80 is in use; cannot answer the ACME HTTP-01 challenge"
+		if [[ -n "$(port80_pid)" ]]; then
+			die "port 80 is still in use after stopping a stale responder; check 'ss -Hltnp \"sport = :80\"'"
+		fi
 	fi
 
 	local probe="probe${RANDOM}${RANDOM}"
-	local probe_dir="${WEBROOT}/.well-known/acme-challenge"
 	info "starting the ACME HTTP-01 responder on port 80"
 	install -d -m 0755 -o root -g root "${probe_dir}"
 	printf 'ok\n' >"${probe_dir}/${probe}"
@@ -1181,6 +1227,10 @@ EOF
 
 main() {
 	parse_args "$@"
+	# Never leave an ACME responder holding port 80 if this run is interrupted.
+	trap 'stop_acme_bootstrap' EXIT
+	trap 'stop_acme_bootstrap; exit 130' INT
+	trap 'stop_acme_bootstrap; exit 143' TERM
 	printf 'Dohcord-relay installer %s\n' "${INSTALLER_VERSION}"
 
 	step_msg "Collecting how clients connect"

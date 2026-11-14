@@ -678,9 +678,18 @@ propagation), or pass the matching `--ip`. If the domain has an AAAA record but
 the VPS has no global IPv6, remove the AAAA record.
 
 **Certificate issuance fails.**
-Port 80 must be reachable from the internet for the domain/IP. Check the cloud
-firewall and `journalctl -u dohcord-relay-api.service`. Re-run the installer; it
-retries issuance when the current certificate is missing or near expiry.
+Port 80 must be reachable from the internet for the domain/IP — the cloud
+security group matters as much as the host firewall. Check
+`journalctl -u dohcord-relay-api.service` and the certbot log, then re-run the
+installer; it retries issuance when the current certificate is missing or near
+expiry.
+
+**"port 80 is used by another service".** The installer prints the listener. If
+it is something of yours (nginx, Caddy), stop or move it: the relay will not take
+port 80 from another web server. If it names `dohcord-relay`, it is this
+installer's own ACME responder left behind by an interrupted run — the installer
+now reuses it when it answers and replaces it when it does not, but you can clear
+it manually with `sudo ss -Hltnp 'sport = :80'` and `sudo kill <pid>`.
 
 **Certificate renewal fails (IP installs especially).**
 IP certificates last 160 hours, so watch this. `deploy/verify.sh` includes
