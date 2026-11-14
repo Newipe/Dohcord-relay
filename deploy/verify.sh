@@ -93,10 +93,9 @@ POLICY_FILE="${POLICY_FILE:-/etc/dohcord-relay/destination-policy.conf}"
 ALLOW_FILE="$(cfg SQUID_ALLOW_FILE)"
 ALLOW_FILE="${ALLOW_FILE:-/etc/dohcord-relay/squid-allow.conf}"
 
-# split_url URL -> sets URL_SCHEME URL_HOST URL_PORT
+# split_url URL -> sets URL_HOST URL_PORT
 split_url() {
 	local u="$1"
-	URL_SCHEME="${u%%://*}"
 	local rest="${u#*://}"
 	rest="${rest%%/*}"
 	if [[ "${rest}" == *:* && "${rest##*:}" =~ ^[0-9]+$ ]]; then
@@ -112,7 +111,6 @@ split_url "${PROXY_URL}"
 PROXY_HOST="${URL_HOST}"
 PROXY_PORT="${URL_PORT:-443}"
 split_url "${API_URL}"
-API_HOST="${URL_HOST:-${PROXY_HOST}}"
 API_PORT="${URL_PORT:-8443}"
 
 UDP_URL=""

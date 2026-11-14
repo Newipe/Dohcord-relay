@@ -22,7 +22,7 @@
 # valid certificate, and only rewrites files it owns.
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="2.0.0"
+readonly INSTALLER_VERSION="2.0.1"
 
 # --- Defaults ---------------------------------------------------------------
 MODE=""            # "domain" or "ip"; asked interactively when empty
@@ -98,6 +98,7 @@ die() {
 on_error() {
 	local rc=$?
 	printf '\nerror: installer failed at line %s (exit %s)\n' "${BASH_LINENO[0]}" "${rc}" >&2
+	printf '       while running: %s\n' "${BASH_COMMAND}" >&2
 	stop_acme_bootstrap
 	exit "${rc}"
 }
@@ -323,7 +324,7 @@ EOF
 
 	if [[ -z "${PUBLIC_IP}" ]]; then
 		local detected
-		detected="$(detect_outbound_ip)"
+		detected="$(detect_outbound_ip || true)"
 		if [[ -n "${detected}" && -t 0 && ${ASSUME_YES} -eq 0 ]]; then
 			read -r -p "Public IPv4 [${detected}]: " PUBLIC_IP
 			PUBLIC_IP="${PUBLIC_IP:-${detected}}"
@@ -380,7 +381,7 @@ verify_dns() {
 	[[ "${MODE}" == "domain" ]] || return 0
 
 	local a_records
-	a_records="$(dns_lookup a "${DOMAIN}" | tr '\n' ' ')"
+	a_records="$(dns_lookup a "${DOMAIN}" | tr '\n' ' ' || true)"
 	[[ -n "${a_records// /}" ]] ||
 		die "${DOMAIN} has no A record; create one pointing at ${PUBLIC_IP} and wait for DNS to propagate"
 	if ! grep -qw "${PUBLIC_IP}" <<<"${a_records}"; then
@@ -389,7 +390,7 @@ verify_dns() {
 	info "${DOMAIN} A record includes ${PUBLIC_IP}"
 
 	local aaaa_records
-	aaaa_records="$(dns_lookup aaaa "${DOMAIN}" | tr '\n' ' ')"
+	aaaa_records="$(dns_lookup aaaa "${DOMAIN}" | tr '\n' ' ' || true)"
 	if [[ -n "${aaaa_records// /}" ]]; then
 		if has_ipv6_egress; then
 			info "${DOMAIN} also has AAAA [${aaaa_records% }] and this host has global IPv6, so dual-stack clients can connect"
@@ -519,7 +520,7 @@ detect_network() {
 	info "primary local address: ${PRIVATE_IP}"
 
 	local seen
-	seen="$(detect_outbound_ip)"
+	seen="$(detect_outbound_ip || true)"
 	if [[ -n "${seen}" && "${seen}" != "${PUBLIC_IP}" ]]; then
 		warn "outbound traffic appears to leave from ${seen}, not ${PUBLIC_IP}; TURN allocations and the proxy may not be reachable at ${PUBLIC_IP}"
 	fi
@@ -960,7 +961,9 @@ start_acme_bootstrap() {
 
 	local probe_dir="${WEBROOT}/.well-known/acme-challenge"
 	local holder
-	holder="$(port80_pid)"
+	# port80_pid exits non-zero when nothing is listening, which is the normal
+	# case here; `|| true` keeps errexit from treating that as a failure.
+	holder="$(port80_pid || true)"
 	if [[ -n "${holder}" ]]; then
 		# An interrupted run can leave its own responder behind. It belongs to
 		# this project, so reuse it when it works and replace it when it does not;
@@ -976,9 +979,8 @@ start_acme_bootstrap() {
 			# asking the operator to hunt it down.
 			info "retiring ${holder_unit} from the earlier design; it holds port 80"
 			systemctl disable --now "${holder_unit}" >/dev/null 2>&1 || true
-			local retired
-			for retired in $(seq 1 25); do
-				[[ -z "$(port80_pid)" ]] && break
+			for _ in $(seq 1 25); do
+				[[ -z "$(port80_pid || true)" ]] && break
 				sleep 0.2
 			done
 		elif is_our_binary "${holder}"; then
@@ -994,9 +996,8 @@ start_acme_bootstrap() {
 			rm -f "${probe_dir}/${reused}"
 			info "replacing a stopped ACME responder left behind by an earlier run (pid ${holder})"
 			kill "${holder}" 2>/dev/null || true
-			local waited
-			for waited in $(seq 1 25); do
-				[[ -z "$(port80_pid)" ]] && break
+			for _ in $(seq 1 25); do
+				[[ -z "$(port80_pid || true)" ]] && break
 				sleep 0.2
 			done
 		else
@@ -1015,8 +1016,7 @@ start_acme_bootstrap() {
 	"${BIN}" -config "${ETC_DIR}/config.env" -acme-only >>"${LOG_DIR}/acme-bootstrap.log" 2>&1 &
 	BOOTSTRAP_PID=$!
 
-	local i
-	for i in $(seq 1 60); do
+	for _ in $(seq 1 60); do
 		if [[ "$(curl -fsS --max-time 2 "http://127.0.0.1/.well-known/acme-challenge/${probe}" 2>/dev/null || true)" == "ok" ]]; then
 			rm -f "${probe_dir}/${probe}"
 			info "ACME responder is answering on port 80"
