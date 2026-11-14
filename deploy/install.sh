@@ -437,6 +437,30 @@ install_base_packages() {
 
 # check_ports refuses to take over a port that another service owns, so an
 # existing web server is never disrupted.
+# retire_legacy_units removes the service installed by the earlier,
+# credentials-only design. That unit binds :80 and :443 permanently, and its
+# process name matches this project's, so the port check would otherwise treat
+# both busy ports as "ours" and leave the new services unable to start.
+retire_legacy_units() {
+	local unit retired=0
+	local -a legacy=(dohcord-relay-credentials.service)
+	for unit in "${legacy[@]}"; do
+		[[ -f "/etc/systemd/system/${unit}" ]] || systemctl cat "${unit}" >/dev/null 2>&1 || continue
+		info "found ${unit} from the earlier design; stopping and removing it"
+		systemctl disable --now "${unit}" >/dev/null 2>&1 || true
+		rm -f "/etc/systemd/system/${unit}"
+		retired=1
+	done
+	if [[ ${retired} -eq 1 ]]; then
+		systemctl daemon-reload >/dev/null 2>&1 || true
+		if [[ -x /usr/local/bin/dohcord-relay-credentials ]]; then
+			info "the old binary /usr/local/bin/dohcord-relay-credentials is kept but no longer runs"
+		fi
+	else
+		info "no earlier Dohcord-relay service found"
+	fi
+}
+
 check_ports() {
 	local busy=0 conflicts=()
 
@@ -811,6 +835,13 @@ build_endpoint() {
 
 render_config_env() {
 	local target="${ETC_DIR}/config.env"
+	local rendered="${target}.rendered"
+	sed -e "s|@PUBLIC_HOST@|${PUBLIC_HOST}|g" \
+		-e "s|@PROXY_PORT@|${PROXY_PORT}|g" \
+		-e "s|@API_PORT@|${API_PORT}|g" \
+		-e "s|@TLS_DIR@|${TLS_DIR}|g" \
+		"${REPO_DIR}/deploy/config.env.tmpl" >"${rendered}"
+
 	if [[ -f "${target}" ]] && grep -q '^HTTPS_PROXY_URL=' "${target}"; then
 		# Keep operator tuning, but refresh the public identity and ports so a
 		# change of domain/IP is picked up.
@@ -819,18 +850,26 @@ render_config_env() {
 			-e "s|^NETWORK_CONFIG_URL=.*|NETWORK_CONFIG_URL=https://${PUBLIC_HOST}:${API_PORT}/network-config|" \
 			-e "s|^TURN_URLS=.*|TURN_URLS=turn:${PUBLIC_HOST}:3478?transport=udp,turns:${PUBLIC_HOST}:5349?transport=tcp|" \
 			"${target}"
+		# Add any setting this version needs that the file predates (for example
+		# after upgrading from the credentials-only design).
+		local line key
+		while IFS= read -r line; do
+			[[ "${line}" == *=* ]] || continue
+			key="${line%%=*}"
+			[[ "${key}" =~ ^[A-Z0-9_]+$ ]] || continue
+			if ! grep -q "^${key}=" "${target}"; then
+				printf '%s\n' "${line}" >>"${target}"
+				info "added ${key} to ${target}"
+			fi
+		done <"${rendered}"
 		info "updated the public endpoints in ${target}"
 	else
-		sed -e "s|@PUBLIC_HOST@|${PUBLIC_HOST}|g" \
-			-e "s|@PROXY_PORT@|${PROXY_PORT}|g" \
-			-e "s|@API_PORT@|${API_PORT}|g" \
-			-e "s|@TLS_DIR@|${TLS_DIR}|g" \
-			"${REPO_DIR}/deploy/config.env.tmpl" >"${target}.new"
-		chown root:dohcord-relay "${target}.new"
-		chmod 0640 "${target}.new"
-		mv "${target}.new" "${target}"
+		chown root:dohcord-relay "${rendered}"
+		chmod 0640 "${rendered}"
+		mv "${rendered}" "${target}"
 		info "wrote ${target}"
 	fi
+	rm -f "${rendered}"
 	install -d -m 0755 -o root -g root "${WEBROOT}"
 }
 
@@ -893,16 +932,26 @@ port80_pid() {
 	ss -Hltnp 'sport = :80' 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
 }
 
+# unit_of_pid prints the systemd unit a process belongs to, if any.
+unit_of_pid() {
+	[[ -n "$1" && -r "/proc/$1/cgroup" ]] || return 1
+	grep -oE '[A-Za-z0-9@._:\\-]+\.service' "/proc/$1/cgroup" 2>/dev/null | head -1
+}
+
 # responder_answers NAME succeeds when the challenge file NAME is served on
 # port 80 by whatever is holding the port.
 responder_answers() {
 	[[ "$(curl -fsS --max-time 2 "http://127.0.0.1/.well-known/acme-challenge/$1" 2>/dev/null || true)" == "ok" ]]
 }
 
-# is_our_binary PID succeeds when PID is this project's own executable.
+# is_our_binary PID succeeds when PID runs a Dohcord-relay executable. The
+# prefix match also covers the binary shipped by the earlier, credentials-only
+# design (/usr/local/bin/dohcord-relay-credentials), which binds :80 and :443.
 is_our_binary() {
 	[[ -n "$1" && -r "/proc/$1/exe" ]] || return 1
-	[[ "$(readlink -f "/proc/$1/exe" 2>/dev/null)" == "$(readlink -f "${BIN}")" ]]
+	local exe
+	exe="$(readlink -f "/proc/$1/exe" 2>/dev/null)" || return 1
+	[[ "$(basename "${exe}")" == dohcord-relay* ]]
 }
 
 start_acme_bootstrap() {
@@ -916,9 +965,22 @@ start_acme_bootstrap() {
 		# An interrupted run can leave its own responder behind. It belongs to
 		# this project, so reuse it when it works and replace it when it does not;
 		# anything else on port 80 is someone else's service and is never touched.
+		local holder_unit
+		holder_unit="$(unit_of_pid "${holder}" || true)"
 		if systemctl is-active --quiet "${API_UNIT}"; then
 			info "port 80 is already served by ${API_UNIT}"
 			return 0
+		elif [[ -n "${holder_unit}" && "${holder_unit}" == dohcord-relay-* && "${holder_unit}" != "${API_UNIT}" ]]; then
+			# An earlier Dohcord-relay service (the credentials-only design) still
+			# runs and binds :80 and :443. It is ours, so retire it instead of
+			# asking the operator to hunt it down.
+			info "retiring ${holder_unit} from the earlier design; it holds port 80"
+			systemctl disable --now "${holder_unit}" >/dev/null 2>&1 || true
+			local retired
+			for retired in $(seq 1 25); do
+				[[ -z "$(port80_pid)" ]] && break
+				sleep 0.2
+			done
 		elif is_our_binary "${holder}"; then
 			install -d -m 0755 -o root -g root "${probe_dir}"
 			local reused="probe${RANDOM}${RANDOM}"
@@ -1242,6 +1304,9 @@ main() {
 
 	step_msg "Checking name resolution"
 	verify_dns
+
+	step_msg "Retiring an earlier Dohcord-relay service, if present"
+	retire_legacy_units
 
 	step_msg "Checking the ports this relay needs"
 	check_ports

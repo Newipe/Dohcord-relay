@@ -632,6 +632,14 @@ Re-running the installer is the supported upgrade path: it rebuilds the endpoint
 re-renders configuration, re-validates the policy and restarts the services. Your
 allowlist edits, TURN secret and valid certificate are kept.
 
+**Upgrading from the earlier credentials-only design.** That version installed
+`dohcord-relay-credentials.service`, which holds TCP 80 and 443 permanently. The
+installer detects it, stops it, disables it and removes its unit file before the
+port checks, so the new services can take those ports. The old binary is left in
+`/usr/local/bin` but no longer runs; delete it yourself once the new install
+works. Settings in `config.env` that the new version needs are added
+automatically, and existing values are kept.
+
 - **coturn:** `sudo deploy/install.sh --coturn-version 4.19.0` (only 4.18.0 has a
   pinned checksum; other versions build without one and print a warning).
 - **Squid:** upgraded by `apt`; the installer re-checks TLS support and version
