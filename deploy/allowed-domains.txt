@@ -22,3 +22,10 @@ discord.gg
 discordapp.com
 discordapp.net
 discord.media
+
+# Discord uploads attachments (images, files) to this exact Cloud Storage host.
+# The leading '=' means "this host name only": without it the entry would also
+# cover subdomains, and on Cloud Storage a subdomain is just another bucket that
+# somebody else can create. Do not widen this to *.storage.googleapis.com or
+# *.googleapis.com.
+=discord-attachments-uploads-prd.storage.googleapis.com

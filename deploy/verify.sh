@@ -360,18 +360,27 @@ def portspec(spec):
         else:
             parts.append(str(int(p)))
     return " ".join(parts)
+def name(entry):
+    return entry.lower().rstrip(".").lstrip("=")
+
 policy = {}
+exact = set()
 for line in entries(policy_file):
     f = line.split()
-    policy[f[0].lower().rstrip(".")] = portspec(f[1])
+    policy[name(f[0])] = portspec(f[1])
+    if f[0].startswith("="):
+        exact.add(name(f[0]))
 allow = open(allow_file).read()
-want = set(entries(domains_file))
-if want != set(policy):
+if {name(e) for e in entries(domains_file)} != set(policy):
     print("allowlist and port policy disagree")
     sys.exit(1)
 for domain, ports in policy.items():
-    if f"dstdomain .{domain}" not in allow:
-        print(f"missing dstdomain for {domain}")
+    scope = domain if domain in exact else f".{domain}"
+    if f"dstdomain {scope}" not in allow:
+        print(f"missing dstdomain for {domain} (expected scope {scope})")
+        sys.exit(1)
+    if domain not in exact and f"dstdomain .{domain}" in allow and f"dstdomain {domain}" in allow:
+        print(f"{domain} is listed with and without subdomain scope")
         sys.exit(1)
     if f"port {ports}" not in allow:
         print(f"missing port rule {ports} for {domain}")
@@ -461,6 +470,10 @@ else
 			"https://evil-discord.com/|similar-looking domain"
 			"https://1.1.1.1/|IP-literal destination"
 			"https://discord.com:2053/|port outside discord.com's policy"
+			"https://storage.googleapis.com/|shared Google infrastructure"
+			"https://other-bucket.storage.googleapis.com/|an unrelated Cloud Storage bucket"
+			"https://evil.discord-attachments-uploads-prd.storage.googleapis.com/|a subdomain of the exact upload host"
+			"https://discord-attachments-uploads-prd.storage.googleapis.com:2053/|a port outside the upload host's policy"
 		)
 		for c in "${denied_cases[@]}"; do
 			url="${c%%|*}"
@@ -486,6 +499,16 @@ else
 		tls) skip "dynamic-port isolation not tested: the proxy certificate did not verify" ;;
 		*) fail "a non-media Discord domain was allowed on a dynamic port" ;;
 		esac
+
+		# Discord uploads attachments (images, files) to this exact Cloud Storage
+		# host on 443. The tunnel must open; Cloud Storage may still answer the
+		# request with 403 of its own, which is not a proxy denial.
+		upload_case="$(proxy_probe "https://discord-attachments-uploads-prd.storage.googleapis.com/")"
+		if [[ "${upload_case}" == "denied" ]]; then
+			fail "CONNECT to the attachment upload host was denied"
+		else
+			pass "CONNECT to the attachment upload host is permitted (${upload_case})"
+		fi
 	fi
 fi
 
@@ -552,16 +575,21 @@ def portspec(spec):
             parts.append(str(int(p)))
     return " ".join(parts)
 
+def name(entry):
+    # A leading '=' marks an exact host; the published document carries the
+    # plain name, so compare without the marker.
+    return entry.lower().rstrip(".").lstrip("=")
+
 want = {}
 for line in entries(policy_file):
     fields = line.split()
-    want[fields[0].lower().rstrip(".")] = portspec(fields[1])
+    want[name(fields[0])] = portspec(fields[1])
 
 got = {}
 for dest in d.get("httpsProxy", {}).get("allowedDestinations", []):
     parts = [str(int(p)) for p in dest.get("ports", [])]
     parts += [f'{int(r["from"])}-{int(r["to"])}' for r in dest.get("portRanges", [])]
-    got[dest["domain"]] = " ".join(parts)
+    got[name(dest["domain"])] = " ".join(parts)
 
 ice = d.get("rtcRelay", {}).get("iceServers", [{}])[0]
 print("SCHEMA=" + shlex.quote(str(d.get("version"))))

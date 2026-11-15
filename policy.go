@@ -36,11 +36,24 @@ type PortRange struct {
 }
 
 // Destination is one allowlisted domain and the TCP ports permitted for it.
+//
+// Exact marks a host that is allowed on its own name only, without its
+// subdomains. It is written with a leading "=" in both policy files and is not
+// part of the network-configuration document, which only needs the name and its
+// ports.
 type Destination struct {
 	Domain     string      `json:"domain"`
 	Ports      []int       `json:"ports"`
 	PortRanges []PortRange `json:"portRanges,omitempty"`
+	Exact      bool        `json:"-"`
 }
+
+// exactPrefix marks an allowlist entry as that exact host name only. Without it
+// a bare name also covers its subdomains ("discord.com" covers
+// "gateway.discord.com"), which is right for Discord's own domains but wrong for
+// a host under shared infrastructure such as Google Cloud Storage: there, every
+// subdomain of the name can be a bucket owned by somebody else.
+const exactPrefix = "="
 
 // Policy is the authoritative destination policy.
 type Policy struct {
@@ -204,30 +217,58 @@ func readConfigLines(path string) ([]configLine, error) {
 	return lines, nil
 }
 
+// domainEntry is one parsed allowlist entry: a host name and whether it is
+// restricted to that exact name.
+type domainEntry struct {
+	Domain string
+	Exact  bool
+}
+
+// parseDomainEntry parses one allowlist/port-policy entry, honouring the
+// optional leading "=" that restricts it to the exact host name.
+func parseDomainEntry(text string) (domainEntry, error) {
+	exact := strings.HasPrefix(text, exactPrefix)
+	if exact {
+		text = strings.TrimSpace(strings.TrimPrefix(text, exactPrefix))
+	}
+	domain, err := normalizeDomain(text)
+	if err != nil {
+		return domainEntry{}, err
+	}
+	return domainEntry{Domain: domain, Exact: exact}, nil
+}
+
 // loadDomainList parses allowed-domains.txt.
-func loadDomainList(path string) ([]string, error) {
+func loadDomainList(path string) ([]domainEntry, error) {
 	lines, err := readConfigLines(path)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
-	var domains []string
+	var domains []domainEntry
 	seen := make(map[string]bool)
 	for _, line := range lines {
-		domain, err := normalizeDomain(line.text)
+		entry, err := parseDomainEntry(line.text)
 		if err != nil {
 			return nil, fmt.Errorf("%s line %d: %w", path, line.number, err)
 		}
-		if seen[domain] {
-			return nil, fmt.Errorf("%s line %d: %q is listed twice", path, line.number, domain)
+		key := domainKey(entry)
+		if seen[key] {
+			return nil, fmt.Errorf("%s line %d: %q is listed twice", path, line.number, entry.Domain)
 		}
-		seen[domain] = true
-		domains = append(domains, domain)
+		seen[key] = true
+		domains = append(domains, entry)
 	}
 	if len(domains) == 0 {
 		return nil, fmt.Errorf("%s contains no domains; refusing to build a proxy policy", path)
 	}
-	sort.Strings(domains)
+	sort.Slice(domains, func(i, j int) bool { return domains[i].Domain < domains[j].Domain })
 	return domains, nil
+}
+
+// domainKey identifies an entry independently of its exactness, so the same host
+// cannot be listed twice with different scopes.
+func domainKey(e domainEntry) string {
+	return e.Domain
 }
 
 // parseDestinationPolicy parses destination-policy.conf into a domain->ports map.
@@ -242,18 +283,18 @@ func parseDestinationPolicy(path string) (map[string]Destination, error) {
 		if len(fields) != 2 {
 			return nil, fmt.Errorf("%s line %d: expected \"<domain> <ports>\", got %q", path, line.number, line.text)
 		}
-		domain, err := normalizeDomain(fields[0])
+		entry, err := parseDomainEntry(fields[0])
 		if err != nil {
 			return nil, fmt.Errorf("%s line %d: %w", path, line.number, err)
 		}
-		if _, dup := out[domain]; dup {
-			return nil, fmt.Errorf("%s line %d: %q has more than one policy line", path, line.number, domain)
+		if _, dup := out[entry.Domain]; dup {
+			return nil, fmt.Errorf("%s line %d: %q has more than one policy line", path, line.number, entry.Domain)
 		}
 		ports, ranges, err := parsePortSpec(fields[1])
 		if err != nil {
 			return nil, fmt.Errorf("%s line %d: %w", path, line.number, err)
 		}
-		out[domain] = Destination{Domain: domain, Ports: ports, PortRanges: ranges}
+		out[entry.Domain] = Destination{Domain: entry.Domain, Ports: ports, PortRanges: ranges, Exact: entry.Exact}
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("%s contains no entries; refusing to build a proxy policy", path)
@@ -276,13 +317,26 @@ func LoadPolicy(domainsPath, policyPath string) (*Policy, error) {
 	}
 
 	var missing, extra []string
-	for _, d := range domains {
-		if _, ok := byDomain[d]; !ok {
-			missing = append(missing, d)
+	for _, entry := range domains {
+		d, ok := byDomain[entry.Domain]
+		if !ok {
+			missing = append(missing, entry.Domain)
+			continue
+		}
+		// The two files must agree on the scope. A missing "=" in one of them
+		// would quietly widen the proxy to every subdomain, so it is an error.
+		if d.Exact != entry.Exact {
+			return nil, fmt.Errorf("%q is spelled %q in %s but %q in %s; use the same leading '=' in both files",
+				entry.Domain, map[bool]string{true: "=" + entry.Domain, false: entry.Domain}[entry.Exact], domainsPath,
+				map[bool]string{true: "=" + d.Domain, false: d.Domain}[d.Exact], policyPath)
 		}
 	}
+	entries := make(map[string]bool, len(domains))
+	for _, entry := range domains {
+		entries[entry.Domain] = true
+	}
 	for d := range byDomain {
-		if !containsString(domains, d) {
+		if !entries[d] {
 			extra = append(extra, d)
 		}
 	}
@@ -298,19 +352,10 @@ func LoadPolicy(domainsPath, policyPath string) (*Policy, error) {
 	}
 
 	p := &Policy{Version: schemaVersion}
-	for _, d := range domains {
-		p.Destinations = append(p.Destinations, byDomain[d])
+	for _, entry := range domains {
+		p.Destinations = append(p.Destinations, byDomain[entry.Domain])
 	}
 	return p, nil
-}
-
-func containsString(list []string, want string) bool {
-	for _, v := range list {
-		if v == want {
-			return true
-		}
-	}
-	return false
 }
 
 // Allows reports whether host:port is inside the policy using strict domain
@@ -323,7 +368,11 @@ func (p *Policy) Allows(host string, port int) bool {
 		return false
 	}
 	for _, d := range p.Destinations {
-		if h != d.Domain && !strings.HasSuffix(h, "."+d.Domain) {
+		if d.Exact {
+			if h != d.Domain {
+				continue
+			}
+		} else if h != d.Domain && !strings.HasSuffix(h, "."+d.Domain) {
 			continue
 		}
 		for _, p := range d.Ports {
@@ -369,8 +418,14 @@ func (p *Policy) SquidACL() string {
 	b.WriteString("# /etc/dohcord-relay/destination-policy.conf.\n")
 	b.WriteString("# Do not edit: change those two files and run the policy command instead.\n\n")
 	for i, d := range p.Destinations {
+		// A leading dot covers the name and every subdomain; an exact entry is
+		// written bare so Squid matches that host only.
+		scope := "." + d.Domain
+		if d.Exact {
+			scope = d.Domain
+		}
 		fmt.Fprintf(&b, "# %s\n", d.Domain)
-		fmt.Fprintf(&b, "acl dohcord_domain_%d dstdomain .%s\n", i, d.Domain)
+		fmt.Fprintf(&b, "acl dohcord_domain_%d dstdomain %s\n", i, scope)
 		fmt.Fprintf(&b, "acl dohcord_ports_%d port %s\n", i, d.PortList())
 		fmt.Fprintf(&b, "http_access allow CONNECT dohcord_domain_%d dohcord_ports_%d\n\n", i, i)
 	}

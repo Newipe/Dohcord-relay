@@ -177,10 +177,16 @@ discord.gg        443
 discordapp.com    443
 discordapp.net    443
 discord.media     443,1024-65535
+=discord-attachments-uploads-prd.storage.googleapis.com  443
+=discord-attachments-uploads-prd.storage.googleapis.com  443
 ```
 
 The proxy never rewrites the requested port to 443 and never decrypts the
 WebSocket. The sample port 2048 is not hardcoded anywhere.
+
+That last line is how attachments are uploaded: Discord sends files to a fixed
+Cloud Storage host over HTTPS, so it needs a CONNECT to exactly that name on 443 —
+not to Cloud Storage in general.
 
 ### 3. Voice media
 
@@ -208,6 +214,7 @@ discord.gg
 discordapp.com
 discordapp.net
 discord.media
+=discord-attachments-uploads-prd.storage.googleapis.com
 ```
 
 A domain allows itself and its subdomains, matched on DNS label boundaries:
@@ -220,6 +227,21 @@ A domain allows itself and its subdomains, matched on DNS label boundaries:
 | `discord.com.evil.example` | **deny** |
 | `evil-discord.com` | **deny** |
 | `example.com` | **deny** |
+| `discord-attachments-uploads-prd.storage.googleapis.com` | allow |
+| `evil.discord-attachments-uploads-prd.storage.googleapis.com` | **deny** |
+| `storage.googleapis.com` | **deny** |
+
+A leading `=` restricts an entry to **that host name only**, with no subdomains:
+
+```text
+=discord-attachments-uploads-prd.storage.googleapis.com
+```
+
+Discord uploads attachments to that exact host. It is exact on purpose: on Cloud
+Storage a subdomain is just another bucket, so a plain (subdomain-covering) entry
+would let anyone who registers `something.discord-attachments-uploads-prd`
+receive those requests. `*.storage.googleapis.com`, `*.googleapis.com` and
+arbitrary buckets are all denied, and only TCP 443 is permitted for the host.
 
 `/etc/dohcord-relay/destination-policy.conf` — which TCP ports each domain may
 use:
@@ -230,6 +252,7 @@ discord.gg        443
 discordapp.com    443
 discordapp.net    443
 discord.media     443,1024-65535
+=discord-attachments-uploads-prd.storage.googleapis.com  443
 ```
 
 Every domain in the allowlist must have a policy line, and every policy line must
@@ -439,7 +462,9 @@ The `/network-config` document looks like this (shortened):
       { "domain": "discordapp.com", "ports": [443] },
       { "domain": "discordapp.net", "ports": [443] },
       { "domain": "discord.media", "ports": [443],
-        "portRanges": [{ "from": 1024, "to": 65535 }] }
+        "portRanges": [{ "from": 1024, "to": 65535 }] },
+      { "domain": "discord-attachments-uploads-prd.storage.googleapis.com",
+        "ports": [443] }
     ]
   },
   "rtcRelay": {
@@ -493,6 +518,7 @@ discord.gg
 discordapp.com
 discordapp.net
 discord.media
+=discord-attachments-uploads-prd.storage.googleapis.com
 ```
 
 ```text
@@ -502,6 +528,7 @@ discord.gg        443
 discordapp.com    443
 discordapp.net    443
 discord.media     443,1024-65535
+=discord-attachments-uploads-prd.storage.googleapis.com  443
 ```
 
 Then apply them:
@@ -858,6 +885,14 @@ This project is a networking product, so treat "works" claims carefully.
 - Two more bugs that running the verifier found and fixed: it treated the word
   `ssl_bump` inside a comment as a configured directive, and it reported a failed
   proxy certificate check as "a non-media domain was allowed on a dynamic port".
+- **The attachment upload host**: with the shipped policy files loaded into
+  Squid, CONNECT to `discord-attachments-uploads-prd.storage.googleapis.com:443`
+  succeeded over a real TLS connection, while `storage.googleapis.com`,
+  `other-bucket.storage.googleapis.com`,
+  `evil.discord-attachments-uploads-prd.storage.googleapis.com` and the same host
+  on port 2053 were all denied with 403. `discord.com`, `gateway.discord.gg` and
+  `cdn.discordapp.com` still worked, and `/network-config` published the host as
+  `{"domain": "…", "ports": [443]}` with six destinations in total.
 - **The certificate-chain defect found on a real VPS**: Squid's GnuTLS build
   accepts `tls-cert=` with a full chain and silently sends only the leaf, so a
   Let's Encrypt certificate is unusable. Reproduced with a root→intermediate→leaf

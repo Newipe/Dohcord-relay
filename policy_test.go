@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -224,5 +225,66 @@ func TestPolicyCachePrefersStateFile(t *testing.T) {
 	}
 	if len(got.Destinations) != 1 {
 		t.Fatalf("unexpected policy after falling back to sources: %+v", got.Destinations)
+	}
+}
+
+// TestExactDestination covers the '=' prefix: the host is allowed on its own
+// name only, which is what keeps an exact Cloud Storage endpoint from widening
+// to every bucket on the service.
+func TestExactDestination(t *testing.T) {
+	const host = "discord-attachments-uploads-prd.storage.googleapis.com"
+
+	d, p := writeFiles(t, "discord.com\n="+host+"\n", "discord.com 443\n="+host+" 443\n")
+	policy, err := LoadPolicy(d, p)
+	if err != nil {
+		t.Fatalf("LoadPolicy: %v", err)
+	}
+
+	var found *Destination
+	for i := range policy.Destinations {
+		if policy.Destinations[i].Domain == host {
+			found = &policy.Destinations[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("exact host missing from the policy: %+v", policy.Destinations)
+	}
+	if !found.Exact {
+		t.Error("entry was not marked exact")
+	}
+	if !policy.Allows(host, 443) {
+		t.Error("the exact host is not allowed on 443")
+	}
+	if policy.Allows("evil."+host, 443) {
+		t.Error("a subdomain of the exact host was allowed")
+	}
+	if policy.Allows(strings.TrimPrefix(host, "discord-attachments-uploads-prd."), 443) {
+		t.Error("storage.googleapis.com itself was allowed")
+	}
+	if policy.Allows(host, 80) {
+		t.Error("a port outside the policy was allowed")
+	}
+
+	acl := policy.SquidACL()
+	if !strings.Contains(acl, "dstdomain "+host+"\n") {
+		t.Errorf("exact host is not rendered as an exact dstdomain:\n%s", acl)
+	}
+	if strings.Contains(acl, "dstdomain ."+host) {
+		t.Errorf("exact host was rendered with subdomain scope:\n%s", acl)
+	}
+
+	// The marker is a file-format detail; the published document must not carry it.
+	blob, err := json.Marshal(policy)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(blob), "Exact") || strings.Contains(string(blob), "="+host) {
+		t.Errorf("published policy leaks the exact marker: %s", blob)
+	}
+
+	// A '=' in one file but not the other would silently widen the proxy.
+	d2, p2 := writeFiles(t, "="+host+"\n", host+" 443\n")
+	if _, err := LoadPolicy(d2, p2); err == nil {
+		t.Error("the two files disagreeing about '=' was accepted")
 	}
 }
