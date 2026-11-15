@@ -389,6 +389,65 @@ func (p *Policy) Allows(host string, port int) bool {
 	return false
 }
 
+// RoutingRule is one entry of the client-facing routing policy published by
+// /network-config. It describes the same policy Squid enforces, in the form a
+// client needs to decide which requests to send to the proxy.
+type RoutingRule struct {
+	Host string `json:"host"`
+	// Match is "exact" (this host name only) or "suffix" (this host and its
+	// subdomains, matched on DNS label boundaries).
+	Match string      `json:"match"`
+	Ports []PortRange `json:"ports"`
+}
+
+// matchExact and matchSuffix are the two matching modes of a routing rule.
+const (
+	matchExact  = "exact"
+	matchSuffix = "suffix"
+)
+
+// RoutingRules renders the policy as the routing contract published by
+// /network-config. It is derived from the same parsed policy that produces the
+// Squid ACLs, so the two can never disagree: an exact entry stays exact, a
+// domain entry stays suffix-scoped, and each rule lists exactly the ports it is
+// allowed to use (single ports as from==to, ranges unchanged).
+func (p *Policy) RoutingRules() []RoutingRule {
+	out := make([]RoutingRule, 0, len(p.Destinations))
+	for _, d := range p.Destinations {
+		match := matchSuffix
+		if d.Exact {
+			match = matchExact
+		}
+		ports := make([]PortRange, 0, len(d.Ports)+len(d.PortRanges))
+		for _, port := range d.Ports {
+			ports = append(ports, PortRange{From: port, To: port})
+		}
+		ports = append(ports, d.PortRanges...)
+		sort.Slice(ports, func(i, j int) bool {
+			if ports[i].From != ports[j].From {
+				return ports[i].From < ports[j].From
+			}
+			return ports[i].To < ports[j].To
+		})
+		out = append(out, RoutingRule{Host: d.Domain, Match: match, Ports: ports})
+	}
+	return out
+}
+
+// Matches reports whether the rule names host, using the same DNS label-boundary
+// rule Squid applies for dstdomain. It exists so the published contract can be
+// tested directly.
+func (r RoutingRule) Matches(host string) bool {
+	h, err := normalizeDomain(host)
+	if err != nil {
+		return false
+	}
+	if r.Match == matchExact {
+		return h == r.Host
+	}
+	return h == r.Host || strings.HasSuffix(h, "."+r.Host)
+}
+
 // PortList renders the ports of a destination the way Squid's "port" ACL wants
 // them: space separated single ports and inclusive ranges.
 func (d Destination) PortList() string {
@@ -466,10 +525,36 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	return os.Rename(tmp, path)
 }
 
+// policyState is the on-disk record of the policy Squid is enforcing. It carries
+// the exact/suffix scope, which the published document deliberately does not:
+// without it, a reload would describe an exact host as a suffix rule while Squid
+// kept enforcing the exact one.
+type policyState struct {
+	Version      int                `json:"version"`
+	GeneratedAt  string             `json:"generatedAt,omitempty"`
+	Destinations []stateDestination `json:"destinations"`
+}
+
+type stateDestination struct {
+	Domain     string      `json:"domain"`
+	Exact      bool        `json:"exact,omitempty"`
+	Ports      []int       `json:"ports"`
+	PortRanges []PortRange `json:"portRanges,omitempty"`
+}
+
 // SavePolicyState writes the policy Squid is enforcing to path.
 func SavePolicyState(path string, p *Policy) error {
 	p.GeneratedAt = time.Now().UTC().Format(time.RFC3339)
-	data, err := json.MarshalIndent(p, "", "  ")
+	state := policyState{Version: p.Version, GeneratedAt: p.GeneratedAt}
+	for _, d := range p.Destinations {
+		state.Destinations = append(state.Destinations, stateDestination{
+			Domain:     d.Domain,
+			Exact:      d.Exact,
+			Ports:      d.Ports,
+			PortRanges: d.PortRanges,
+		})
+	}
+	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -482,25 +567,32 @@ func loadPolicyState(path string) (*Policy, error) {
 	if err != nil {
 		return nil, err
 	}
-	var p Policy
-	if err := json.Unmarshal(data, &p); err != nil {
+	var state policyState
+	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	if p.Version != schemaVersion {
-		return nil, fmt.Errorf("%s has schema version %d, expected %d", path, p.Version, schemaVersion)
+	if state.Version != schemaVersion {
+		return nil, fmt.Errorf("%s has schema version %d, expected %d", path, state.Version, schemaVersion)
 	}
-	if len(p.Destinations) == 0 {
+	if len(state.Destinations) == 0 {
 		return nil, fmt.Errorf("%s contains no destinations", path)
 	}
-	for _, d := range p.Destinations {
+	p := &Policy{Version: state.Version, GeneratedAt: state.GeneratedAt}
+	for _, d := range state.Destinations {
 		if _, err := normalizeDomain(d.Domain); err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
 		if len(d.Ports) == 0 && len(d.PortRanges) == 0 {
 			return nil, fmt.Errorf("%s: destination %q has no ports", path, d.Domain)
 		}
+		p.Destinations = append(p.Destinations, Destination{
+			Domain:     d.Domain,
+			Ports:      d.Ports,
+			PortRanges: d.PortRanges,
+			Exact:      d.Exact,
+		})
 	}
-	return &p, nil
+	return p, nil
 }
 
 // policyCache returns the policy the proxy is enforcing. The state file written

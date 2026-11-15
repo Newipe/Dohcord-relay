@@ -16,7 +16,7 @@ Plus one tiny HTTPS endpoint that tells Dohcord where those two services are:
 
 | Endpoint | What it returns | Port |
 |---|---|---|
-| `GET /network-config` | proxy URL, the destinations the proxy allows, temporary TURN credentials | TCP 8443 |
+| `GET /network-config` | proxy endpoint, the routing policy (hosts, exact/suffix matching, ports), temporary TURN credentials | TCP 8443 |
 
 ```text
                         YOUR VPS
@@ -421,8 +421,10 @@ valid certificate and any allowlist edits, and only rewrites the files it owns.
 3. Save and select it.
 
 Dohcord fetches that one document and gets everything else from it: the HTTPS
-proxy URL, the destinations the proxy permits, and fresh TURN credentials with an
-expiry. There is nothing else to type in, and no account or API key.
+proxy endpoint, the routing rules (`routing.domains` — which hosts, exact or
+suffix matching, which ports), and fresh TURN credentials with an expiry. The
+client keeps no allowlist of its own, so adding a destination never needs a
+Dohcord release. There is nothing else to type in, and no account or API key.
 
 ### On the VPS
 
@@ -449,22 +451,34 @@ TURN TLS              turns:relay.example.com:5349?transport=tcp
 For an IP install, `relay.example.com` is replaced by your IPv4 address
 everywhere. Both are generated from your answers — nothing is hardcoded.
 
-The `/network-config` document looks like this (shortened):
+The `/network-config` document is the source of client routing configuration.
+Dohcord reads it and sends proxy requests according to `routing.domains`; it
+holds no allowlist of its own. A shortened document:
 
 ```json
 {
+  "schemaVersion": 1,
   "version": 1,
+  "proxy": { "scheme": "https", "host": "relay.example.com", "port": 443 },
+  "routing": {
+    "domains": [
+      { "host": "discord.com", "match": "suffix",
+        "ports": [{ "from": 443, "to": 443 }] },
+      { "host": "discord.media", "match": "suffix",
+        "ports": [{ "from": 443, "to": 443 },
+                  { "from": 1024, "to": 65535 }] },
+      { "host": "discord-attachments-uploads-prd.storage.googleapis.com",
+        "match": "exact",
+        "ports": [{ "from": 443, "to": 443 }] }
+    ]
+  },
   "httpsProxy": {
     "url": "https://relay.example.com:443",
     "allowedDestinations": [
       { "domain": "discord.com", "ports": [443] },
-      { "domain": "discord.gg", "ports": [443] },
-      { "domain": "discordapp.com", "ports": [443] },
       { "domain": "discordapp.net", "ports": [443] },
       { "domain": "discord.media", "ports": [443],
-        "portRanges": [{ "from": 1024, "to": 65535 }] },
-      { "domain": "discord-attachments-uploads-prd.storage.googleapis.com",
-        "ports": [443] }
+        "portRanges": [{ "from": 1024, "to": 65535 }] }
     ]
   },
   "rtcRelay": {
@@ -481,10 +495,44 @@ The `/network-config` document looks like this (shortened):
 }
 ```
 
-- It is HTTPS-only, `Cache-Control: no-store`, and rate limited per client IP and
-  globally.
-- The advertised destination list is read from the policy Squid is **actually**
-  enforcing, so the document cannot drift from reality.
+### The routing contract
+
+| Field | Meaning |
+|---|---|
+| `schemaVersion` | Version of this document, currently `1`. `version` carries the same value for clients written before it existed. |
+| `proxy.scheme` | Scheme for the CONNECT proxy, always `https`. |
+| `proxy.host` | The proxy host, without a port. For an IP install this is the address (or domain). |
+| `proxy.port` | The proxy port, `443`. This is the **proxy**; `8443` is the configuration endpoint and is not published as a proxy target. |
+| `routing.domains[].host` | A destination host name, already normalized (lower case, no trailing dot). |
+| `routing.domains[].match` | `exact` for that host name only, `suffix` for the host and its subdomains on DNS label boundaries. |
+| `routing.domains[].ports[].from` / `.to` | An allowed TCP port range, inclusive. A single port has `from == to`. |
+| `httpsProxy` | The pre-routing shape of the same information, kept for older clients. |
+| `rtcRelay` | Temporary TURN credentials and their expiry, unchanged. |
+
+Matching follows what Squid enforces. A `suffix` rule for `discord.com` matches
+`discord.com` and `gateway.discord.com`, but never `notdiscord.com` or
+`discord.com.example.org`. An `exact` rule matches one host name and nothing
+else, which is why the attachment upload host is published as `exact` and not as
+`*.storage.googleapis.com`.
+
+Ports are reported as they are enforced: `discord.media` publishes `443` and
+`1024-65535` because that is its policy line. Nothing is widened to look tidier.
+
+`routing.domains` is generated from the policy Squid is **actually** enforcing,
+not from a second list: both come from one parse of the two policy files, so a
+destination cannot be advertised without being allowed, or allowed without being
+advertised. After `-policy-apply`, both change together.
+
+Behaviour clients should rely on:
+
+- HTTPS only, `Cache-Control: no-store`, rate limited per client IP and globally.
+- `503` with `{"error": "destination policy unavailable"}` or
+  `{"error": "proxy configuration unavailable"}` when the policy or the proxy
+  endpoint cannot be described. An error never carries partial routing data;
+  Dohcord should keep its previous working configuration and retry later rather
+  than fall back to an empty or permissive one.
+- `200` always means the document is complete: version, proxy endpoint and every
+  routing rule the proxy enforces.
 - `GET /turn-credentials` still exists for older Dohcord builds and returns only
   the `expiresAt` + `iceServers` part.
 - The permanent TURN secret never leaves the server and is never logged.
@@ -550,6 +598,26 @@ What that command does, in order:
 If anything fails, the command prints the reason, changes nothing, and Squid
 keeps enforcing the previous policy. `-policy-check` validates without applying.
 
+This is the whole workflow for destinations. Adding, changing or removing a line
+in those two files and applying them updates Squid's authorization and the
+`routing.domains` that Dohcord reads, in the same operation. No client-side list
+needs editing and no Dohcord release is needed — which is the point: it
+removes the class of bug where a new Discord host works only after the app is
+updated. Adding a domain is exactly:
+
+```bash
+sudoedit /etc/dohcord-relay/allowed-domains.txt        # add: example.com
+sudoedit /etc/dohcord-relay/destination-policy.conf    # add: example.com  443
+dohcord-relay -config /etc/dohcord-relay/config.env -policy-check
+sudo dohcord-relay -config /etc/dohcord-relay/config.env -policy-apply
+curl -sS https://relay.example.com:8443/network-config | python3 -m json.tool  # it is there
+```
+
+To remove a destination, delete its lines from both files and apply. To narrow or
+widen a port, edit its policy line and apply; the published `from`/`to` values
+follow. If the edit is invalid, nothing is applied and the previous policy —
+Squid's and the endpoint's — stays in force.
+
 `discord.media`'s dynamic range is configurable — it is just that line. Keep it
 exclusive to `discord.media`: other Discord domains do not need it, and giving it
 to them widens the proxy for no benefit.
@@ -614,7 +682,9 @@ matching the policy files exactly; real CONNECT tests through the proxy
 (`discord.com:443` and `gateway.discord.gg:443` succeed; unlisted domains,
 `discord.com.evil.example`, similarity tricks, IP literals, disallowed ports and
 the dynamic range on *other* domains are denied); the `/network-config` document
-matching the policy and not leaking the TURN secret; TURN allocation, wrong
+matching the policy and not leaking the TURN secret, declaring `schemaVersion` 1,
+publishing a `proxy` endpoint distinct from the configuration port, and its
+`routing.domains` matching both the policy files and the installed Squid ACLs; TURN allocation, wrong
 password, expired username, quota and bidirectional media (when coturn's
 utilities are installed); outbound UDP; and certificate validity plus
 `certbot renew --dry-run`.
@@ -893,6 +963,19 @@ This project is a networking product, so treat "works" claims carefully.
   on port 2053 were all denied with 403. `discord.com`, `gateway.discord.gg` and
   `cdn.discordapp.com` still worked, and `/network-config` published the host as
   `{"domain": "…", "ports": [443]}` with six destinations in total.
+- **The routing contract**: `go test` covers the document schema, exact versus
+  suffix matching (including `notdiscord.com` and `discord.com.example.org`),
+  single ports versus ranges, adding and removing a domain and seeing the
+  endpoint follow, the endpoint and Squid ACLs agreeing, a broken policy and an
+  unsupported state schema both returning `503` with no routing data, and an
+  unusable proxy URL never being published. Against a live Squid 6.14 and the
+  real binary: adding `example.com 443,2053` and applying produced
+  `acl dohcord_domain_6 dstdomain .example.com` / `acl dohcord_ports_6 port 443 2053`
+  and the endpoint published
+  `{"host": "example.com", "match": "suffix", "ports": [{"from":443,"to":443},{"from":2053,"to":2053}]}`;
+  removing it removed both. One defect was found this way and fixed: the
+  applied-policy snapshot did not record exact/suffix, so after a reload the
+  endpoint described the exact upload host as suffix-scoped.
 - **The certificate-chain defect found on a real VPS**: Squid's GnuTLS build
   accepts `tls-cert=` with a full chain and silently sends only the leaf, so a
   Let's Encrypt certificate is unusable. Reproduced with a root→intermediate→leaf

@@ -547,9 +547,9 @@ CREDENTIAL=""
 EXPIRES_AT=""
 DOC_PROXY=""
 if [[ "${http_status}" == "200" ]]; then
-	eval "$(python3 - "${BODY_FILE}" "${POLICY_FILE}" <<'PY'
-import json, shlex, sys
-body, policy_file = sys.argv[1:3]
+	eval "$(python3 - "${BODY_FILE}" "${POLICY_FILE}" "${ALLOWED_FILE}" "${ALLOW_FILE}" "${API_PORT}" <<'PY'
+import json, re, shlex, sys, urllib.parse
+body, policy_file, domains_file, allow_file, api_port = sys.argv[1:6]
 try:
     d = json.load(open(body))
 except Exception:
@@ -581,9 +581,19 @@ def name(entry):
     return entry.lower().rstrip(".").lstrip("=")
 
 want = {}
+ranges = {}
 for line in entries(policy_file):
     fields = line.split()
     want[name(fields[0])] = portspec(fields[1])
+    pairs = []
+    for p in fields[1].split(","):
+        p = p.strip()
+        if "-" in p:
+            a, b = p.split("-", 1)
+            pairs.append((int(a), int(b)))
+        else:
+            pairs.append((int(p), int(p)))
+    ranges[name(fields[0])] = sorted(pairs)
 
 got = {}
 for dest in d.get("httpsProxy", {}).get("allowedDestinations", []):
@@ -591,8 +601,59 @@ for dest in d.get("httpsProxy", {}).get("allowedDestinations", []):
     parts += [f'{int(r["from"])}-{int(r["to"])}' for r in dest.get("portRanges", [])]
     got[name(dest["domain"])] = " ".join(parts)
 
+# Routing rules must describe the same policy: exact/suffix from the '=' marker in
+# the allowlist, ports from the policy file.
+want_routing = {}
+for line in entries(domains_file):
+    want_routing[name(line)] = ("exact" if line.startswith("=") else "suffix",
+                                ranges.get(name(line), []))
+
+got_routing = {}
+for rule in d.get("routing", {}).get("domains", []):
+    host = name(str(rule.get("host", "")))
+    ports = sorted((int(p["from"]), int(p["to"])) for p in rule.get("ports", []))
+    got_routing[host] = (rule.get("match"), ports)
+
+raw_routing = d.get("routing", {}).get("domains", [])
+for rule in raw_routing:
+    host = str(rule.get("host", ""))
+    if host != host.lower().rstrip("."):
+        got_routing["__unnormalized__"] = (host, [])
+
+proxy = d.get("proxy", {})
+try:
+    url_port = urllib.parse.urlsplit(d.get("httpsProxy", {}).get("url", "")).port or 443
+except ValueError:
+    url_port = None
+proxy_ok = (1 if proxy.get("scheme") == "https"
+            and proxy.get("host")
+            and proxy.get("port") == url_port
+            and str(proxy.get("port")) != str(api_port)
+            else 0)
+
+# The published rules must match the Squid include that is installed.
+acl_ok = 0
+try:
+    acl = open(allow_file).read()
+    scopes = []
+    for host, (match, _) in got_routing.items():
+        if host == "__unnormalized__":
+            continue
+        scopes.append(("exact", host) if match == "exact" else ("suffix", "." + host))
+    allows = len(re.findall(r"^http_access allow CONNECT", acl, re.M))
+    acl_ok = (1 if allows == len(scopes) and all(
+        re.search(r"^acl dohcord_domain_\d+ dstdomain " + re.escape(scope) + r"$", acl, re.M)
+        for _, scope in scopes) else 0)
+except OSError:
+    acl_ok = 0
+
 ice = d.get("rtcRelay", {}).get("iceServers", [{}])[0]
 print("SCHEMA=" + shlex.quote(str(d.get("version"))))
+print("SCHEMA_VERSION=" + shlex.quote(str(d.get("schemaVersion"))))
+print("SCHEMA_VERSION_1=" + ("1" if d.get("schemaVersion") == 1 else "0"))
+print("ROUTING_MATCH=" + ("1" if want_routing == got_routing else "0"))
+print("PROXY_OK=" + str(proxy_ok))
+print("ACL_MATCH=" + str(acl_ok))
 print("DOC_PROXY=" + shlex.quote(d.get("httpsProxy", {}).get("url", "")))
 print("USERNAME=" + shlex.quote(ice.get("username", "")))
 print("CREDENTIAL=" + shlex.quote(ice.get("credential", "")))
@@ -610,6 +671,26 @@ PY
 		pass "advertised domain-and-port policy matches the policy files exactly"
 	else
 		fail "advertised policy does not match ${POLICY_FILE}"
+	fi
+	if [[ "${SCHEMA_VERSION_1:-0}" == "1" ]]; then
+		pass "response declares schemaVersion 1"
+	else
+		fail "schemaVersion is '${SCHEMA_VERSION:-missing}', expected 1"
+	fi
+	if [[ "${PROXY_OK:-0}" == "1" ]]; then
+		pass "proxy object names the https proxy endpoint, distinct from the ${API_PORT} configuration endpoint"
+	else
+		fail "proxy object is missing, not https, or on the configuration port"
+	fi
+	if [[ "${ROUTING_MATCH:-0}" == "1" ]]; then
+		pass "routing.domains matches the policy files (hosts, exact/suffix, ports)"
+	else
+		fail "routing.domains does not match ${POLICY_FILE}"
+	fi
+	if [[ "${ACL_MATCH:-0}" == "1" ]]; then
+		pass "routing.domains agrees with the installed Squid authorization"
+	else
+		fail "routing.domains and ${ALLOW_FILE} disagree"
 	fi
 
 	if [[ -n "${DOC_PROXY}" ]]; then

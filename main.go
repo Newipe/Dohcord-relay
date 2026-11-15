@@ -287,6 +287,11 @@ func (c config) validate() error {
 	if err := validatePublicURL("HTTPS_PROXY_URL", c.proxyURL); err != nil {
 		return err
 	}
+	// The endpoint publishes these fields, so an unusable proxy URL must stop the
+	// service at startup rather than produce a document with missing routing data.
+	if _, err := endpointFromURL(c.proxyURL); err != nil {
+		return fmt.Errorf("HTTPS_PROXY_URL: %w", err)
+	}
 	if c.apiURL != "" {
 		if err := validatePublicURL("NETWORK_CONFIG_URL", c.apiURL); err != nil {
 			return err
@@ -566,10 +571,56 @@ type httpsProxyInfo struct {
 	AllowedDestinations []Destination `json:"allowedDestinations"`
 }
 
+// proxyEndpoint is where clients reach the HTTPS CONNECT proxy. It is not the
+// network-configuration endpoint: that one is normally on port 8443, while this
+// is the proxy listener on port 443.
+type proxyEndpoint struct {
+	Scheme string `json:"scheme"`
+	Host   string `json:"host"`
+	Port   int    `json:"port"`
+}
+
+// routingPolicy is the client-facing routing contract: the destinations Dohcord
+// may send through the proxy, with the matching mode and permitted ports. It is
+// generated from the same policy that produces the Squid ACLs.
+type routingPolicy struct {
+	Domains []RoutingRule `json:"domains"`
+}
+
 type networkConfig struct {
-	Version    int            `json:"version"`
-	HTTPSProxy httpsProxyInfo `json:"httpsProxy"`
-	RTCRelay   rtcRelay       `json:"rtcRelay"`
+	// SchemaVersion is the version of this document. version (below) is the
+	// field older clients read and carries the same value.
+	SchemaVersion int            `json:"schemaVersion"`
+	Version       int            `json:"version"`
+	Proxy         proxyEndpoint  `json:"proxy"`
+	HTTPSProxy    httpsProxyInfo `json:"httpsProxy"`
+	Routing       routingPolicy  `json:"routing"`
+	RTCRelay      rtcRelay       `json:"rtcRelay"`
+}
+
+// endpointFromURL splits the public proxy URL into the fields clients need. The
+// port defaults to 443 when the URL does not name one.
+func endpointFromURL(raw string) (proxyEndpoint, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return proxyEndpoint{}, fmt.Errorf("parse %q: %w", raw, err)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return proxyEndpoint{}, fmt.Errorf("%q has no host name", raw)
+	}
+	port := 443
+	if p := u.Port(); p != "" {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return proxyEndpoint{}, fmt.Errorf("%q has a non-numeric port %q", raw, p)
+		}
+		port = n
+	}
+	if port < 1 || port > 65535 {
+		return proxyEndpoint{}, fmt.Errorf("%q has port %d outside 1-65535", raw, port)
+	}
+	return proxyEndpoint{Scheme: u.Scheme, Host: host, Port: port}, nil
 }
 
 // credentialsResponse is the legacy /turn-credentials document.
@@ -663,12 +714,25 @@ func (s *server) handleNetworkConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A proxy URL that cannot be described precisely is a configuration error,
+	// not something to paper over: clients would be told to use an endpoint the
+	// relay cannot state.
+	desc, err := endpointFromURL(s.cfg.proxyURL)
+	if err != nil {
+		s.log.Printf("ERROR proxy endpoint unusable: %v", err)
+		writeJSON(w, http.StatusServiceUnavailable, errorBody("proxy configuration unavailable"))
+		return
+	}
+
 	writeJSON(w, http.StatusOK, networkConfig{
-		Version: schemaVersion,
+		SchemaVersion: schemaVersion,
+		Version:       schemaVersion,
+		Proxy:         desc,
 		HTTPSProxy: httpsProxyInfo{
 			URL:                 s.cfg.proxyURL,
 			AllowedDestinations: policy.Destinations,
 		},
+		Routing:  routingPolicy{Domains: policy.RoutingRules()},
 		RTCRelay: rtcRelay{ExpiresAt: expiresAt, IceServers: ice},
 	})
 
