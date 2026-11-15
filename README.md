@@ -362,7 +362,7 @@ Useful options (see `--help`):
 | `--total-quota N` | concurrent allocations for the relay (default 1200) |
 | `--max-bps N` | per-session TURN bandwidth, bytes/s (default 2 MB/s) |
 | `--bps-capacity N` | total TURN bandwidth reservation (default 250 MB/s) |
-| `--max-connections N` | concurrent proxy connections per client IP (default 20) |
+| `--max-connections N` | concurrent proxy connections per client IP (default 40) |
 | `--distro-coturn` | use the distribution coturn package instead of building 4.18.0 |
 | `--skip-verify` | skip the final verification suite |
 | `--yes` | skip the confirmation prompt (still needs `--mode`) |

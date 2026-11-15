@@ -43,7 +43,7 @@ MAX_BPS=2000000
 BPS_CAPACITY=250000000
 PROXY_PORT=443
 API_PORT=8443
-MAX_CONN_PER_IP=20
+MAX_CONN_PER_IP=40
 MAX_FDS=8192
 READ_TIMEOUT="10 minutes"
 CLIENT_LIFETIME="4 hours"
@@ -130,7 +130,7 @@ Service sizes:
   --max-bps N              Per-session bandwidth ceiling, bytes/s (default: 2000000).
   --bps-capacity N         Total relay bandwidth reservation, bytes/s
                            (default: 250000000).
-  --max-connections N      Concurrent proxy connections per client IP (default: 20).
+  --max-connections N      Concurrent proxy connections per client IP (default: 40).
 
 Other:
   --yes                    Do not ask for confirmation (still needs --mode).
