@@ -62,6 +62,9 @@ readonly TURN_RUN_DIR="/run/dohcord-relay-coturn"
 readonly WEBROOT="/var/www/dohcord-relay"
 readonly BIN="/usr/local/bin/dohcord-relay"
 readonly HOOK="/usr/local/bin/dohcord-relay-tls-deploy"
+readonly MANAGER="/usr/local/bin/dohcord-relay-manager"
+readonly LIB_DIR="/usr/local/lib/dohcord-relay"
+readonly INFO_FILE="${ETC_DIR}/install-info"
 readonly CERT_NAME="dohcord-relay"
 readonly API_UNIT="dohcord-relay-api.service"
 readonly SQUID_UNIT="dohcord-relay-squid.service"
@@ -84,21 +87,86 @@ SQUID_INSTALLED_VERSION=""
 COTURN_INSTALLED_VERSION=""
 
 # --- Output helpers ---------------------------------------------------------
+# Colour is used only when standard output is a terminal that can show it; the
+# plain fallback is the same text without escape codes, so logs and
+# non-interactive runs stay readable.
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+	C_RESET=$'\033[0m' C_BOLD=$'\033[1m' C_DIM=$'\033[2m'
+	C_CYAN=$'\033[36m' C_GREEN=$'\033[32m' C_RED=$'\033[31m' C_YELLOW=$'\033[33m'
+else
+	C_RESET="" C_BOLD="" C_DIM="" C_CYAN="" C_GREEN="" C_RED="" C_YELLOW=""
+fi
+
 step=0
-step_msg() {
-	step=$((step + 1))
-	printf '\n[%d] %s\n' "${step}" "$*"
+stage_names=()
+stage_done=()
+
+banner() {
+	cat <<EOF
+
+${C_CYAN}${C_BOLD}  ╭──────────────────────────────────────────────────────╮
+  │                                                      │
+  │                   Dohcord-relay                      │
+  │                   Installation                       │
+  │                                                      │
+  ╰──────────────────────────────────────────────────────╯${C_RESET}
+
+  Welcome to Dohcord-relay ${INSTALLER_VERSION}.
+
+  This server will host two services for Dohcord:
+
+    · an HTTPS proxy on 443, limited to the destinations in the policy
+    · a TURN relay on 3478/udp and 5349/tcp for voice and video
+
+  plus a small HTTPS endpoint on 8443 that tells Dohcord how to reach
+  them. Nothing on this server is decrypted; the proxy forwards encrypted
+  connections and only decides where they may go.
+
+  Nothing has been changed yet. The steps below are shown as they run,
+  and the summary at the end lists what is reachable and how to manage it.
+EOF
 }
-info() { printf '    %s\n' "$*"; }
-warn() { printf '    warning: %s\n' "$*" >&2; }
+
+step_msg() {
+	if ((step > 0)); then
+		stage_done[step - 1]=1
+	fi
+	step=$((step + 1))
+	stage_names+=("$*")
+	printf '\n  %s%02d%s  %s%s%s\n' "${C_DIM}" "${step}" "${C_RESET}" "${C_BOLD}" "$*" "${C_RESET}"
+}
+info() { printf '      %s\n' "$*"; }
+ok() { printf '      %s✓%s %s\n' "${C_GREEN}" "${C_RESET}" "$*"; }
+warn() { printf '      %s!%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*" >&2; }
 die() {
-	printf '\nerror: %s\n' "$*" >&2
+	printf '\n  %s✗ %s%s\n' "${C_RED}" "$*" "${C_RESET}" >&2
+	printf '  Nothing was left half-configured: this installer stops before it\n  would leave a service on an unvalidated configuration.\n\n' >&2
 	exit 1
+}
+
+# print_progress draws the stage list. A stage is shown as OK only when the
+# script actually reached the next one; a failure exits before this runs, so a
+# failed installation can never print a success list.
+print_progress() {
+	if ((step > 0)); then
+		stage_done[step - 1]=1
+	fi
+	local i
+	printf '\n  %s╭─ Installation progress ──────────────────────────────╮%s\n' "${C_CYAN}" "${C_RESET}"
+	for i in "${!stage_names[@]}"; do
+		if [[ "${stage_done[i]:-0}" == "1" ]]; then
+			printf '  │ %s[OK]%s %-46s │\n' "${C_GREEN}" "${C_RESET}" "${stage_names[i]}"
+		else
+			printf '  │ %s[--]%s %-46s │\n' "${C_DIM}" "${C_RESET}" "${stage_names[i]}"
+		fi
+	done
+	printf '  %s╰──────────────────────────────────────────────────────╯%s\n' "${C_CYAN}" "${C_RESET}"
 }
 on_error() {
 	local rc=$?
-	printf '\nerror: installer failed at line %s (exit %s)\n' "${BASH_LINENO[0]}" "${rc}" >&2
-	printf '       while running: %s\n' "${BASH_COMMAND}" >&2
+	printf '\n  %s✗ The installer stopped at line %s (exit %s)%s\n' "${C_RED}" "${BASH_LINENO[0]}" "${rc}" "${C_RESET}" >&2
+	printf '    while running: %s\n' "${BASH_COMMAND}" >&2
+	printf '    Re-run the same command to retry: completed steps are safe to repeat,\n    and existing configuration and certificates are kept.\n' >&2
 	stop_acme_bootstrap
 	exit "${rc}"
 }
@@ -108,6 +176,13 @@ trap 'stop_acme_bootstrap; exit 130' INT TERM
 usage() {
 	cat <<'EOF'
 Usage: sudo deploy/install.sh [options]
+
+Normally you do not run this file directly. Use the one-line installer:
+
+  bash <(curl -fsSL https://raw.githubusercontent.com/Newipe/Dohcord-relay/main/install.sh)
+
+or, in a checkout of this repository, `bash install.sh` at the top level.
+Both end up here and accept the options below.
 
 How clients connect (choose one):
   --mode domain            Clients use a domain name (recommended).
@@ -305,21 +380,28 @@ wizard() {
 			die "no --mode given and no terminal to ask on; use --mode domain --domain NAME or --mode ip --ip ADDRESS"
 		fi
 		cat <<'EOF'
-Dohcord-relay Installation
 
-How should clients connect to this server?
+  How should Dohcord reach this server?
 
-  1. Domain name (recommended)
-  2. Public IPv4 address
+    1. By domain name (recommended)
+       Clients connect to https://relay.example.com:443 and the certificate
+       is trusted everywhere. Needs a DNS A record pointing at this server.
+
+    2. By public IPv4 address
+       No DNS needed. The certificate covers the address and is short-lived,
+       renewed automatically. Works with any client happy to trust an IP
+       certificate.
 
 EOF
 		local choice
-		read -r -p "Choose [1/2]: " choice
-		case "${choice}" in
-		1) MODE="domain" ;;
-		2) MODE="ip" ;;
-		*) die "please answer 1 or 2" ;;
-		esac
+		while true; do
+			read -r -p "  Choose 1 or 2: " choice || die "cancelled"
+			case "${choice}" in
+			1) MODE="domain" && break ;;
+			2) MODE="ip" && break ;;
+			*) warn "please answer 1 or 2" ;;
+			esac
+		done
 	fi
 
 	if [[ -z "${PUBLIC_IP}" ]]; then
@@ -337,8 +419,13 @@ EOF
 		fi
 	fi
 	[[ -n "${PUBLIC_IP}" ]] || die "a public IPv4 address is required"
-	is_public_ipv4 "${PUBLIC_IP}" ||
-		die "${PUBLIC_IP} is not a public IPv4 address (loopback, private, CGNAT, link-local, multicast and reserved ranges are rejected)"
+	if ! is_public_ipv4 "${PUBLIC_IP}"; then
+		[[ -t 0 ]] || die "${PUBLIC_IP} is not a public IPv4 address (loopback, private, CGNAT, link-local, multicast and reserved ranges are rejected)"
+		while ! is_public_ipv4 "${PUBLIC_IP}"; do
+			warn "${PUBLIC_IP} is not a public IPv4 address (private, loopback, CGNAT and reserved ranges are rejected)"
+			read -r -p "  Public IPv4 address of this server: " PUBLIC_IP || die "cancelled"
+		done
+	fi
 
 	if [[ "${MODE}" == "domain" ]]; then
 		if [[ -z "${DOMAIN}" ]]; then
@@ -347,8 +434,13 @@ EOF
 		fi
 		DOMAIN="${DOMAIN,,}"
 		DOMAIN="${DOMAIN%.}"
-		is_domain_name "${DOMAIN}" || die "'${DOMAIN}' is not a valid fully qualified domain name"
-		DOMAIN="${DOMAIN,,}"
+		while ! is_domain_name "${DOMAIN}"; do
+			[[ -t 0 ]] || die "'${DOMAIN}' is not a valid fully qualified domain name"
+			warn "'${DOMAIN}' is not a fully qualified domain name (for example relay.example.com)"
+			read -r -p "  Domain: " DOMAIN || die "cancelled"
+			DOMAIN="${DOMAIN,,}"
+			DOMAIN="${DOMAIN%.}"
+		done
 		PUBLIC_HOST="${DOMAIN}"
 	else
 		PUBLIC_HOST="${PUBLIC_IP}"
@@ -357,21 +449,26 @@ EOF
 
 	cat <<EOF
 
-Server address .... ${PUBLIC_HOST} (${PUBLIC_IP})
-Mode .............. ${MODE}
-HTTPS proxy ....... https://${PUBLIC_HOST}:${PROXY_PORT}
-Network config .... https://${PUBLIC_HOST}:${API_PORT}/network-config
-TURN UDP .......... turn:${PUBLIC_HOST}:3478?transport=udp
-TURN TLS .......... turns:${PUBLIC_HOST}:5349?transport=tcp
+  This server will be reachable as
+
+    address          ${PUBLIC_HOST} (${PUBLIC_IP})
+    mode             ${MODE}
+    HTTPS proxy      https://${PUBLIC_HOST}:${PROXY_PORT}
+    network config   https://${PUBLIC_HOST}:${API_PORT}/network-config
+    TURN (UDP)       turn:${PUBLIC_HOST}:3478?transport=udp
+    TURN (TLS)       turns:${PUBLIC_HOST}:5349?transport=tcp
 
 EOF
 	if [[ ${ASSUME_YES} -eq 0 ]]; then
 		local answer
-		read -r -p "Install with these settings? [Y/n]: " answer
-		case "${answer}" in
-		"" | y | Y | yes | YES) ;;
-		*) die "cancelled" ;;
-		esac
+		while true; do
+			read -r -p "  Install with these settings? [Y/n]: " answer || die "cancelled"
+			case "${answer}" in
+			"" | y | Y | yes | YES) break ;;
+			n | N | no | NO) die "cancelled; nothing was changed" ;;
+			*) warn "please answer y or n" ;;
+			esac
+		done
 	fi
 }
 
@@ -907,6 +1004,55 @@ install_api_unit() {
 	info "installed /etc/systemd/system/${API_UNIT}"
 }
 
+# install_management_tools puts the small operator-facing pieces where they
+# survive deleting the checkout: the management console, the verification
+# suite, the uninstaller and a copy of the bootstrap installer. None of them
+# change how traffic is handled; they drive the services installed above.
+install_management_tools() {
+	install -d -m 0755 -o root -g root "${LIB_DIR}"
+	if [[ -f "${REPO_DIR}/deploy/dohcord-relay-manager.sh" ]]; then
+		install -m 0755 "${REPO_DIR}/deploy/dohcord-relay-manager.sh" "${MANAGER}"
+		info "installed ${MANAGER}"
+	else
+		warn "the management console is missing from this checkout; skipping it"
+	fi
+	install -m 0755 "${REPO_DIR}/deploy/verify.sh" "${LIB_DIR}/verify.sh"
+	if [[ -f "${REPO_DIR}/uninstall.sh" ]]; then
+		install -m 0755 "${REPO_DIR}/uninstall.sh" "${LIB_DIR}/uninstall.sh"
+	fi
+	if [[ -f "${REPO_DIR}/install.sh" ]]; then
+		# Repair and update re-use the bootstrap, which fetches a complete tree.
+		install -m 0755 "${REPO_DIR}/install.sh" "${LIB_DIR}/bootstrap.sh"
+	fi
+	ok "management console and verification suite installed to ${LIB_DIR}"
+}
+
+# write_install_info records what the management console reports. It contains no
+# secrets: only the public endpoints and how this relay was installed.
+write_install_info() {
+	local ref stamp
+	ref="${DOHCORD_RELAY_REF:-main}"
+	if command -v git >/dev/null 2>&1 && [[ -d "${REPO_DIR}/.git" ]]; then
+		ref="$(git -C "${REPO_DIR}" rev-parse --short HEAD 2>/dev/null || printf '%s' "${ref}")"
+	fi
+	stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	umask 022
+	cat >"${INFO_FILE}.new" <<EOF
+INSTALLER_VERSION=${INSTALLER_VERSION}
+INSTALLED_AT=${stamp}
+MODE=${MODE}
+PUBLIC_HOST=${PUBLIC_HOST}
+PUBLIC_IP=${PUBLIC_IP}
+PROXY_PORT=${PROXY_PORT}
+API_PORT=${API_PORT}
+REPO_REF=${ref}
+EOF
+	chown root:root "${INFO_FILE}.new"
+	chmod 0644 "${INFO_FILE}.new"
+	mv "${INFO_FILE}.new" "${INFO_FILE}"
+	info "wrote ${INFO_FILE}"
+}
+
 install_policy_files() {
 	local name src dst
 	for name in allowed-domains.txt destination-policy.conf; do
@@ -1306,7 +1452,10 @@ Firewall ports       80/tcp, ${PROXY_PORT}/tcp, ${API_PORT}/tcp,
                      3478/udp, 5349/tcp, 49152-65535/udp
 
 Services             systemctl status ${SQUID_UNIT} ${COTURN_UNIT} ${API_UNIT}
-Re-check any time    sudo bash ${REPO_DIR}/deploy/verify.sh
+Management console   sudo dohcord-relay-manager
+Re-check any time    sudo dohcord-relay-manager diagnostics
+Uninstall safely     sudo dohcord-relay-manager  (option 10)
+                     keeps configuration and certificates unless you purge
 
 In Dohcord: Settings -> Custom Profile -> add this server:
   Network Configuration URL: https://${PUBLIC_HOST}:${API_PORT}/network-config
@@ -1320,7 +1469,7 @@ main() {
 	trap 'stop_acme_bootstrap' EXIT
 	trap 'stop_acme_bootstrap; exit 130' INT
 	trap 'stop_acme_bootstrap; exit 143' TERM
-	printf 'Dohcord-relay installer %s\n' "${INSTALLER_VERSION}"
+	banner
 
 	step_msg "Collecting how clients connect"
 	wizard
@@ -1371,6 +1520,9 @@ main() {
 	step_msg "Building the configuration endpoint"
 	build_endpoint
 
+	step_msg "Installing the management console"
+	install_management_tools
+
 	step_msg "Installing the TLS deploy hook"
 	install_deploy_hook
 
@@ -1395,10 +1547,13 @@ main() {
 		run_verification || verify_rc=1
 	fi
 
+	write_install_info
+	print_progress
 	if [[ ${verify_rc} -eq 0 ]]; then
-		printf '\nInstallation complete.\n'
+		printf '\n  %s✓ Installation complete.%s\n' "${C_GREEN}${C_BOLD}" "${C_RESET}"
 	else
-		printf '\nInstallation finished, but some checks failed — do not hand this URL out until they are resolved.\n'
+		printf '\n  %s! Installed, but some checks failed — do not hand this URL out until they are fixed.%s\n' "${C_YELLOW}${C_BOLD}" "${C_RESET}"
+		printf '    Run the management console and choose Diagnostics for details.\n'
 	fi
 	print_report "${verify_rc}"
 }
