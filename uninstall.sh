@@ -15,7 +15,8 @@ ETC_DIR="/etc/dohcord-relay"
 LOG_DIR="/var/log/dohcord-relay"
 WEBROOT="/var/www/dohcord-relay"
 LIB_DIR="/usr/local/lib/dohcord-relay"
-BIN="/usr/local/bin/dohcord-relay"
+DAEMON="/usr/local/bin/dohcord-relayd"
+CLI="/usr/local/bin/dohcord-relay"
 MANAGER="/usr/local/bin/dohcord-relay-manager"
 HOOK="/usr/local/bin/dohcord-relay-tls-deploy"
 CERT_NAME="dohcord-relay"
@@ -97,8 +98,8 @@ ${C_CYAN}${C_BOLD}  ── Dohcord-relay uninstall ──${C_RESET}
 
     · the services ${C_BOLD}dohcord-relay-api${C_RESET}, ${C_BOLD}dohcord-relay-squid${C_RESET} and ${C_BOLD}dohcord-relay-coturn${C_RESET}
     · their systemd units and the certificate renewal timer
-    · ${BIN}
-    · ${MANAGER}
+    · ${DAEMON} and ${CLI}
+    · ${MANAGER} (compatibility alias)
     · ${HOOK}
     · ${LIB_DIR}
     · ${WEBROOT} and ${LOG_DIR}
@@ -154,7 +155,9 @@ systemctl reset-failed >/dev/null 2>&1 || true
 # --- 3. binaries and libraries ---------------------------------------------
 say ""
 say "  ${C_BOLD}Removing programs${C_RESET}"
-for file in "${BIN}" "${MANAGER}" "${HOOK}"; do
+# Remove the alias before the binary it points at. ${CLI} also covers a daemon
+# left there by a pre-rename release.
+for file in "${MANAGER}" "${DAEMON}" "${CLI}" "${HOOK}"; do
 	if [[ -e "${file}" ]]; then
 		rm -f "${file}"
 		ok "removed ${file}"

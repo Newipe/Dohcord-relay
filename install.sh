@@ -79,9 +79,14 @@ it. Installer options are passed through unchanged:
   --ip ADDRESS            Public IPv4 of this relay (detected when omitted).
   --email ADDRESS         Let's Encrypt contact address (optional).
   --staging               Use the Let's Encrypt staging CA (test installs).
+  --api-port N            Network Configuration API port (default 8443).
+  --version vX.Y.Z        Release to install (default: the latest stable one).
   --yes                   Do not ask for confirmation.
   --skip-verify           Do not run the verification suite at the end.
   --help                  Show the full installer help.
+
+The installer downloads precompiled, checksum-verified binaries from GitHub
+Releases; no Go compiler is needed on the server.
 
 Environment (optional):
   DOHCORD_RELAY_REF           Branch or tag to install (default: main).
@@ -216,8 +221,9 @@ main() {
 		die "cannot extract the downloaded archive; nothing was installed"
 
 	local repo="${WORKDIR}/src/${top}"
-	[[ -f "${repo}/deploy/install.sh" && -f "${repo}/go.mod" && -f "${repo}/main.go" ]] ||
-		die "the archive does not look like Dohcord-relay (expected deploy/install.sh and the Go sources); nothing was installed"
+	[[ -f "${repo}/deploy/install.sh" && -f "${repo}/go.mod" &&
+		-f "${repo}/cmd/dohcord-relay/main.go" && -f "${repo}/cmd/dohcord-relayd/main.go" ]] ||
+		die "the archive does not look like Dohcord-relay (expected deploy/install.sh and the cmd/ entry points); nothing was installed"
 	ok "archive looks complete"
 	# The installer runs as root in a moment; it only needs to read this tree.
 	chmod -R a+rX "${WORKDIR}/src"

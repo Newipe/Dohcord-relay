@@ -7,6 +7,10 @@ and short-lived TURN credentials, all active at install time.
 GET https://<relay>:8443/network-config
 ```
 
+The port is configurable (`NETWORK_CONFIG_PORT`, default `8443`); the path, the
+JSON document, TLS and rate limiting are the same on any port. Dohcord profiles
+must name the configured port in their Network Configuration URL.
+
 - HTTPS only; TLS is validated normally — nothing here asks a client to skip
   verification.
 - `Content-Type: application/json`, `Cache-Control: no-store`.
@@ -64,7 +68,7 @@ before `schemaVersion` existed.
 |---|---|
 | `scheme` | Always `https`. |
 | `host` | The proxy host, no port. A domain or an IPv4 address, matching your install mode. |
-| `port` | The CONNECT proxy port, normally `443`. **This is not the configuration endpoint**; 8443 is where this document lives and is never a proxy target. |
+| `port` | The CONNECT proxy port, normally `443`. **This is not the configuration endpoint**; the configured API port (8443 by default) is where this document lives and is never a proxy target. |
 
 ### `routing.domains[]`
 
@@ -167,5 +171,5 @@ Dohcord build is needed.
 ```bash
 curl -sS https://relay.example.com:8443/network-config | python3 -m json.tool
 curl -sSI https://relay.example.com:8443/network-config | grep -i cache-control
-sudo dohcord-relay-manager network
+sudo dohcord-relay network
 ```

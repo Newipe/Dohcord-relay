@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Dohcord-relay management console.
 #
-# Installed as /usr/local/bin/dohcord-relay-manager by install.sh. It is a
-# front-end for the components that already exist: the systemd units, the
-# dohcord-relay binary and its -policy-apply/-policy-check commands, certbot,
-# and deploy/verify.sh (installed at /usr/local/lib/dohcord-relay/verify.sh).
+# Installed as /usr/local/lib/dohcord-relay/manager.sh and started by the
+# dohcord-relay binary, the command users run. /usr/local/bin/dohcord-relay-manager
+# remains as a compatibility alias for the previous name. It is a front-end for
+# the components that already exist: the systemd units, the dohcord-relayd daemon
+# and its -policy-apply/-policy-check commands, certbot, and verify.sh (installed
+# at /usr/local/lib/dohcord-relay/verify.sh).
 #
 # It never re-implements networking logic and never edits Squid or coturn
 # configuration itself: policy changes go through the binary, which validates
@@ -25,7 +27,11 @@ SQUID_CONF="${ETC_DIR}/squid.conf"
 TURNSERVER_CONF="${ETC_DIR}/turnserver.conf"
 LOG_DIR="/var/log/dohcord-relay"
 LIB_DIR="${DOHCORD_RELAY_LIB_DIR:-/usr/local/lib/dohcord-relay}"
-BIN="${DOHCORD_RELAY_BIN:-/usr/local/bin/dohcord-relay}"
+BIN="${DOHCORD_RELAY_BIN:-/usr/local/bin/dohcord-relayd}"
+CONSOLE_BIN="${DOHCORD_RELAY_CONSOLE_BIN:-/usr/local/bin/dohcord-relay}"
+# The name shown in help and errors. The binary is called dohcord-relay; the
+# previous dohcord-relay-manager name stays valid as an alias.
+PROGRAM="${DOHCORD_RELAY_PROGRAM:-dohcord-relay}"
 HOOK="/usr/local/bin/dohcord-relay-tls-deploy"
 CERTBOT="/opt/dohcord-relay-certbot/bin/certbot"
 CERT_NAME="dohcord-relay"
@@ -161,10 +167,12 @@ url_port() { # url_port PROXY|API -> the port in that URL, defaulting sensibly
 	local url default hostport port
 	if [[ "$1" == "API" ]]; then
 		url="$(api_url)"
-		default=8443
+		default="$(config_value NETWORK_CONFIG_PORT)"
+		[[ "${default}" =~ ^[0-9]+$ ]] || default=""
+		default="${default:-8443}"
 	else
 		url="$(proxy_url)"
-		default=443
+		default="${PROXY_PORT:-443}"
 	fi
 	hostport="${url#*://}"
 	hostport="${hostport%%/*}"
@@ -176,20 +184,90 @@ url_port() { # url_port PROXY|API -> the port in that URL, defaulting sensibly
 	fi
 }
 
+# api_port prints the authoritative Network Configuration API port: the
+# configured NETWORK_CONFIG_PORT, or the port in NETWORK_CONFIG_URL for
+# configurations written by older releases, or 8443.
+api_port() { url_port API; }
+
+# api_listen_addr prints the address the endpoint binds, with a sensible
+# fallback for a configuration that predates the setting.
+api_listen_addr() {
+	local addr
+	addr="$(config_value HTTPS_LISTEN)"
+	if [[ -z "${addr}" ]]; then
+		printf ':%s' "$(api_port)"
+	else
+		printf '%s' "${addr}"
+	fi
+}
+
+port_listening() { ss -Hltn "( sport = :$1 )" 2>/dev/null | grep -q .; }
+
+port_free() { # succeeds when this host could bind the TCP port
+	have python3 || return 1
+	python3 - "$1" <<'PY' 2>/dev/null
+try:
+    import socket, sys
+    s = socket.socket()
+    try:
+        s.bind(("0.0.0.0", int(sys.argv[1])))
+    finally:
+        s.close()
+except OSError:
+    sys.exit(1)
+PY
+}
+
+# api_port_conflict prints why PORT cannot be used by the API and returns 0.
+# It returns 1 with no output when the port is usable.
+api_port_conflict() {
+	local port="$1" owner
+	if [[ ! "${port}" =~ ^[0-9]+$ ]]; then
+		printf '%s is not a number' "${port}"
+		return 0
+	fi
+	port=$((10#${port}))
+	if ((port < 1024 || port > 65535)); then
+		printf '%d is outside the usable range 1024-65535 (ports below 1024 are reserved for system services)' "${port}"
+		return 0
+	fi
+	case "${port}" in
+	80) printf '80 is used for ACME HTTP-01 certificate validation'; return 0 ;;
+	443) printf '443 is used by the HTTPS CONNECT proxy'; return 0 ;;
+	3478) printf '3478 is used by the TURN relay'; return 0 ;;
+	5349) printf '5349 is used by TURN over TLS'; return 0 ;;
+	esac
+	if port_listening "${port}"; then
+		owner="$(ss -Hltnp "( sport = :${port} )" 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -1)"
+		[[ "${owner}" == *dohcord-relay* ]] && return 1
+		printf 'port %d is already in use%s' "${port}" "${owner:+ by ${owner}}"
+		return 0
+	fi
+	return 1
+}
+
 # --- Dashboard --------------------------------------------------------------
 dashboard() {
-	local state days host mode version
+	local state days host mode version release
 	heading "Dashboard"
 
 	# Installation
 	if installed; then
 		version="$(info_value INSTALLER_VERSION)"
-		local installed_at
+		release="$(info_value RELEASE_VERSION)"
+		local installed_at label
 		installed_at="$(info_value INSTALLED_AT)"
-		printf '  %-22s %s\n' "Installation" "$( [[ -n "${version}" ]] && echo "v${version} installed ${installed_at}" || echo "present" )"
+		if [[ -n "${release}" && "${release}" != "unknown" ]]; then
+			label="release ${release} (installer ${version:-unknown}) installed ${installed_at}"
+		elif [[ -n "${version}" ]]; then
+			label="v${version} installed ${installed_at}"
+		else
+			label="present"
+		fi
+		printf '  %-22s %s\n' "Installation" "${label}"
 	else
 		printf '  %-22s %snot installed%s\n' "Installation" "${C_RED}" "${C_RESET}"
-		printf '\n  Run the one-line installer from the README, or `dohcord-relay-manager repair`.\n'
+		printf '\n  Run the one-line installer from the README, or `%s repair`.\n' "${PROGRAM}"
 		return 0
 	fi
 
@@ -226,6 +304,7 @@ dashboard() {
 	say ""
 	printf '  %-22s %s\n' "HTTPS proxy" "$(proxy_url)"
 	printf '  %-22s %s\n' "Network config" "$(api_url)"
+	printf '  %-22s %s\n' "Network config port" "$(api_port)"
 	local turn
 	turn="$(turn_urls)"
 	printf '  %-22s %s\n' "TURN" "${turn:-unknown}"
@@ -403,6 +482,8 @@ network_info() {
 	say ""
 	printf '  %-24s %s\n' "HTTPS CONNECT proxy" "$(proxy_url)"
 	printf '  %-24s %s\n' "Network config URL" "$(api_url)"
+	printf '  %-24s %s\n' "Network config port" "$(api_port)"
+	printf '  %-24s %s\n' "API listen address" "$(api_listen_addr)"
 	local turn
 	turn="$(turn_urls)"
 	printf '  %-24s %s\n' "TURN endpoints" "${turn%%,*}"
@@ -491,7 +572,7 @@ policy_show() {
 policy_add() {
 	need_root
 	require_install
-	[[ -t 0 ]] || die "adding a domain is interactive; run dohcord-relay-manager policy add in a terminal"
+	[[ -t 0 ]] || die "adding a domain is interactive; run ${PROGRAM} policy add in a terminal"
 
 	heading "Add a destination"
 	say "  A destination is a host name plus the TCP ports clients may reach."
@@ -853,10 +934,41 @@ diagnostics() {
 		fi
 	fi
 
-	# Firewall
+	# Network Configuration API port, its listener and its firewall rule
+	local api_p listen_addr state
+	api_p="$(api_port)"
+	listen_addr="$(api_listen_addr)"
+	printf '  %-24s %s\n' "API port (configured)" "${api_p}"
+	printf '  %-24s %s\n' "API listen address" "${listen_addr}"
+	if [[ "${listen_addr##*:}" != "${api_p}" ]]; then
+		bad "HTTPS_LISTEN (${listen_addr}) and NETWORK_CONFIG_PORT (${api_p}) disagree: configuration error"
+		problems=$((problems + 1))
+	fi
+	if port_listening "${api_p}"; then
+		ok "TCP ${api_p} is listening (network configuration endpoint)"
+	elif port_free "${api_p}"; then
+		warn "TCP ${api_p} is free but nothing is listening: the API did not start on the configured port"
+		problems=$((problems + 1))
+	else
+		bad "TCP ${api_p} is in use by another process: port conflict"
+		problems=$((problems + 1))
+	fi
+	state="$(firewall_api_state "${api_p}")"
+	case "${state}" in
+	allowed) ok "firewall allows TCP ${api_p}" ;;
+	missing)
+		bad "the firewall does not allow TCP ${api_p}"
+		problems=$((problems + 1))
+		;;
+	*)
+		dim "no active ufw/firewalld; allow TCP ${api_p} in your provider firewall"
+		;;
+	esac
+
+	# General firewall presence for the other relay ports
 	if have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
 		local port missing=0
-		for port in 80/tcp 443/tcp 8443/tcp 3478/udp 5349/tcp; do
+		for port in 80/tcp "$(url_port PROXY)/tcp" 3478/udp 5349/tcp; do
 			ufw status | grep -q "${port%%/*}" || missing=1
 		done
 		if ((missing)); then
@@ -873,11 +985,11 @@ diagnostics() {
 		warn "${problems} problem(s) found — use Repair to fix what can be fixed automatically"
 	fi
 
-	if [[ -x "${LIB_DIR}/verify.sh" || -x "${PWD}/deploy/verify.sh" ]]; then
+	if [[ -x "${LIB_DIR}/verify.sh" || -x "${PWD}/deploy/scripts/verify.sh" ]]; then
 		say ""
 		if confirm "Run the full verification suite now (about a minute)?"; then
 			local script="${LIB_DIR}/verify.sh"
-			[[ -x "${script}" ]] || script="${PWD}/deploy/verify.sh"
+			[[ -x "${script}" ]] || script="${PWD}/deploy/scripts/verify.sh"
 			say ""
 			DOHCORD_RELAY_SKIP_RENEW=1 bash "${script}" || true
 		fi
@@ -885,89 +997,281 @@ diagnostics() {
 }
 
 # --- Update -----------------------------------------------------------------
+# Updates download the published release archive for this architecture and
+# verify it against checksums.txt. Only the two executables are replaced:
+# configuration, certificates, policies and runtime data are never touched.
+release_arch() {
+	case "${1:-$(uname -m)}" in
+	x86_64 | amd64) printf 'amd64' ;;
+	aarch64 | arm64) printf 'arm64' ;;
+	*) return 1 ;;
+	esac
+}
+
+release_api_url() {
+	printf '%s' "${DOHCORD_RELAY_LATEST_API:-https://api.github.com/repos/${REPO_SLUG}/releases/latest}"
+}
+
+release_download_base() {
+	printf '%s' "${DOHCORD_RELAY_RELEASE_BASE_URL:-https://github.com/${REPO_SLUG}/releases/download}"
+}
+
+# release_fetch URL DEST accepts HTTPS, plus file:// and loopback HTTP for tests.
+release_fetch() {
+	local url="$1" dest="$2"
+	case "${url}" in
+	https://*)
+		curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+			--max-time 180 --retry 2 --retry-delay 2 -o "${dest}" "${url}"
+		;;
+	file://* | http://127.0.0.1:* | http://localhost:*)
+		curl -fsSL --max-time 180 -o "${dest}" "${url}"
+		;;
+	*)
+		return 1
+		;;
+	esac
+}
+
+normalize_release_version() {
+	local v="$1"
+	[[ -n "${v}" && "${v}" != latest ]] || return 1
+	[[ "${v}" == v* ]] || v="v${v}"
+	[[ "${v}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+	printf '%s' "${v}"
+}
+
+release_latest_tag() {
+	local json tag
+	json="$(mktemp)"
+	if ! release_fetch "$(release_api_url)" "${json}"; then
+		rm -f "${json}"
+		return 1
+	fi
+	if have jq; then
+		tag="$(jq -r '.tag_name // empty' "${json}" 2>/dev/null || true)"
+	else
+		tag="$(python3 - "${json}" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("tag_name", ""))
+except Exception:
+    pass
+PY
+)"
+	fi
+	rm -f "${json}"
+	normalize_release_version "${tag}"
+}
+
+installed_release_version() {
+	local v
+	v="$(info_value RELEASE_VERSION)"
+	if [[ -z "${v}" || "${v}" == "unknown" ]] && [[ -x "${BIN}" ]]; then
+		v="$("${BIN}" -version 2>/dev/null | awk '{print $2}' || true)"
+	fi
+	printf '%s' "${v:-unknown}"
+}
+
+record_release_version() { # VERSION ARCH
+	[[ -r "${INFO_FILE}" ]] || return 0
+	local tmp
+	tmp="$(mktemp)" || return 0
+	awk -v v="$1" -v a="$2" '
+		/^RELEASE_VERSION=/ { print "RELEASE_VERSION=" v; seen = 1; next }
+		/^RELEASE_ARCH=/ { print "RELEASE_ARCH=" a; seen_arch = 1; next }
+		{ print }
+		END {
+			if (!seen) print "RELEASE_VERSION=" v
+			if (!seen_arch) print "RELEASE_ARCH=" a
+		}' "${INFO_FILE}" >"${tmp}" || {
+		rm -f "${tmp}"
+		return 0
+	}
+	mv "${tmp}" "${INFO_FILE}"
+}
+
+# release_download_archive TAG DIR downloads, verifies and extracts an archive.
+# On success RELEASE_UNPACK and RELEASE_ASSET describe it. On failure every
+# installed file is untouched.
+release_download_archive() {
+	local tag="$1" dir="$2" arch asset base checksums file magic
+	arch="$(release_arch "$(uname -m)")" || {
+		bad "unsupported architecture '$(uname -m)': releases exist for linux/amd64 and linux/arm64"
+		return 1
+	}
+	asset="dohcord-relay_linux_${arch}.tar.gz"
+	base="$(release_download_base)"
+	base="${base%/}"
+	mkdir -p "${dir}"
+	dim "downloading ${base}/${tag}/${asset}"
+	if ! release_fetch "${base}/${tag}/${asset}" "${dir}/${asset}"; then
+		bad "cannot download ${asset}; the installed binaries were not changed"
+		return 1
+	fi
+	if ! release_fetch "${base}/${tag}/checksums.txt" "${dir}/checksums.txt"; then
+		bad "cannot download checksums.txt; refusing to install unverified binaries"
+		return 1
+	fi
+	checksums="${dir}/checksums.txt"
+	if ! grep -qE "^[0-9a-fA-F]{64}[[:space:]]+\*?${asset}$" "${checksums}"; then
+		bad "checksums.txt has no SHA256 entry for ${asset}; refusing to install unverified binaries"
+		return 1
+	fi
+	if ! (cd "${dir}" && sha256sum -c --ignore-missing checksums.txt >/dev/null); then
+		bad "SHA256 verification failed for ${asset}; the installed binaries were not changed"
+		return 1
+	fi
+	ok "SHA256 verified ${asset}"
+	mkdir -p "${dir}/unpacked"
+	if ! tar -xzf "${dir}/${asset}" -C "${dir}/unpacked" --no-same-owner; then
+		bad "cannot extract ${asset}; the installed binaries were not changed"
+		return 1
+	fi
+	for file in dohcord-relayd dohcord-relay; do
+		if [[ ! -f "${dir}/unpacked/${file}" || -L "${dir}/unpacked/${file}" ]]; then
+			bad "${asset} does not contain a regular ${file} file"
+			return 1
+		fi
+		magic="$(od -An -tx1 -N4 "${dir}/unpacked/${file}" | tr -d ' \n')"
+		if [[ "${magic}" != "7f454c46" ]]; then
+			bad "${asset} contains ${file} that is not a Linux executable"
+			return 1
+		fi
+	done
+	if [[ "${arch}" == "$(release_arch "$(uname -m)")" ]]; then
+		if ! "${dir}/unpacked/dohcord-relayd" -version 2>/dev/null | grep -Fq " ${tag} "; then
+			bad "the downloaded dohcord-relayd does not report ${tag}; refusing a mismatched release"
+			return 1
+		fi
+	fi
+	RELEASE_UNPACK="${dir}/unpacked"
+	RELEASE_ASSET="${asset}"
+	dim "extracted ${RELEASE_ASSET}"
+}
+
 update_menu() {
 	need_root
 	require_install
 	heading "Update Dohcord-relay"
-	local current
-	current="$(info_value INSTALLER_VERSION)"
-	printf '  %-18s %s\n' "Installed" "${current:-unknown}"
-	printf '  %-18s %s\n' "Source" "github.com/${REPO_SLUG} ($(info_value REPO_REF || echo main))"
+
+	local current latest requested target arch dir backup
+	current="$(installed_release_version)"
+	latest="$(release_latest_tag 2>/dev/null || true)"
+	arch="$(release_arch "$(uname -m)" || true)"
+	[[ -n "${arch}" ]] ||
+		die "unsupported architecture '$(uname -m)': releases exist for linux/amd64 and linux/arm64"
+
+	printf '  %-18s %s\n' "Installed" "${current}"
+	printf '  %-18s linux/%s\n' "Architecture" "${arch}"
+	printf '  %-18s %s\n' "Latest release" "${latest:-unavailable}"
 	say ""
-
-	local workdir
-	workdir="$(mktemp -d "${TMPDIR:-/tmp}/dohcord-relay-update.XXXXXX")"
-	# shellcheck disable=SC2064
-	trap "rm -rf -- '${workdir}'" RETURN
-
-	local ref url
-	ref="$(info_value REPO_REF)"
-	ref="${ref:-main}"
-	url="https://codeload.github.com/${REPO_SLUG}/tar.gz/refs/heads/${ref}"
-
-	dim "downloading ${url}"
-	if ! curl -fsSL --proto '=https' --tlsv1.2 --max-time 120 -o "${workdir}/repo.tar.gz" "${url}"; then
-		die "cannot download the update; nothing was changed"
-	fi
-	tar -xzf "${workdir}/repo.tar.gz" -C "${workdir}" --strip-components=1 ||
-		die "cannot extract the update; nothing was changed"
-	[[ -f "${workdir}/deploy/install.sh" ]] || die "the downloaded archive does not look like Dohcord-relay"
-
-	local remote
-	remote="$(grep -m1 '^readonly INSTALLER_VERSION=' "${workdir}/deploy/install.sh" | cut -d'"' -f2 || true)"
-	printf '  %-18s %s\n' "Available" "${remote:-unknown}"
-	say ""
-
-	if [[ -n "${remote}" && "${remote}" == "${current}" ]] &&
-		! confirm "Already on ${current}. Re-run the installer to repair it?"; then
-		return 0
-	fi
-
-	say "  This will:"
-	info "back up ${ETC_DIR} to $(policy_backup_dir)/config-\$(date)"
-	info "keep your configuration, policy and certificates (the installer preserves them)"
-	info "rebuild the binary, re-render unit files and configuration, restart services"
-	info "verify the result"
-	say ""
-	confirm "Continue?" || die "cancelled; nothing was changed"
-
-	local backup
-	backup="$(policy_backup_dir)/config-$(date +%Y%m%d-%H%M%S)"
-	mkdir -p "$(dirname "${backup}")"
-	chmod 0700 "$(dirname "${backup}")"
-	if cp -a "${ETC_DIR}" "${backup}" 2>/dev/null; then
-		ok "configuration backed up to ${backup}"
+	printf '  Version to install [%s]: ' "${latest:-vX.Y.Z}"
+	read -r requested || die "cancelled"
+	if [[ -n "${requested}" ]]; then
+		target="$(normalize_release_version "${requested}")" ||
+			die "'${requested}' is not a semantic version tag (expected vX.Y.Z)"
+	elif [[ -n "${latest}" ]]; then
+		target="${latest}"
 	else
-		warn "could not back up ${ETC_DIR}; continuing anyway"
-		backup=""
+		die "cannot determine the latest release; enter a version such as v1.1.0"
 	fi
 
-	local -a args=(--yes)
-	local mode host ip
-	mode="$(info_value MODE)"
-	host="$(info_value PUBLIC_HOST)"
-	ip="$(info_value PUBLIC_IP)"
-	[[ -n "${mode}" ]] && args+=(--mode "${mode}")
-	[[ -n "${host}" && "${mode}" == "domain" ]] && args+=(--domain "${host}")
-	[[ -n "${ip}" ]] && args+=(--ip "${ip}")
-
-	say ""
-	if bash "${workdir}/deploy/install.sh" "${args[@]}"; then
-		ok "update finished and the installer reported success"
+	if [[ "${target}" == "${current}" ]] &&
+		! confirm "${current} is already installed. Reinstall it anyway?"; then
 		return 0
 	fi
 
 	say ""
-	bad "the update did not complete"
-	if [[ -n "${backup}" && -d "${backup}" ]]; then
-		if confirm "Restore the configuration backup from ${backup}?" yes; then
-			rm -rf -- "${ETC_DIR}"
-			cp -a "${backup}" "${ETC_DIR}"
-			ok "configuration restored"
-			info "Services may need a restart: dohcord-relay-manager services"
-		fi
+	say "  This will:"
+	info "download dohcord-relay_linux_${arch}.tar.gz for ${target}"
+	info "verify it against the release's checksums.txt"
+	info "back up the current executables"
+	info "replace ${BIN} and ${CONSOLE_BIN}, then restart ${API_UNIT}"
+	info "keep configuration, certificates, policies and runtime data unchanged"
+	info "restore the previous executables if the service does not come back"
+	say ""
+	confirm "Install ${target}?" || die "cancelled; nothing was changed"
+
+	dir="$(mktemp -d "${TMPDIR:-/tmp}/dohcord-relay-update.XXXXXX")"
+	# shellcheck disable=SC2064
+	trap "rm -rf -- '${dir}'" RETURN
+	if ! release_download_archive "${target}" "${dir}"; then
+		trap - RETURN
+		rm -rf -- "${dir}"
+		return 1
 	fi
-	return 1
+
+	backup="$(policy_backup_dir)/binaries-$(date +%Y%m%d-%H%M%S)"
+	mkdir -p "${backup}"
+	chmod 0700 "${backup}"
+	[[ -e "${BIN}" ]] && cp -a "${BIN}" "${backup}/"
+	[[ -e "${CONSOLE_BIN}" ]] && cp -a "${CONSOLE_BIN}" "${backup}/"
+	ok "current executables backed up to ${backup}"
+
+	rollback_update() {
+		local restored=0
+		if [[ -f "${backup}/dohcord-relayd" ]]; then
+			install -m 0755 "${backup}/dohcord-relayd" "${BIN}"
+			restored=1
+		fi
+		if [[ -f "${backup}/dohcord-relay" ]]; then
+			install -m 0755 "${backup}/dohcord-relay" "${CONSOLE_BIN}"
+			restored=1
+		fi
+		((restored)) || return 1
+		systemctl restart "${API_UNIT}" >/dev/null 2>&1 || true
+		if api_reachable "$(api_port)"; then
+			ok "rolled back to the previous executables; the API is answering again"
+		else
+			bad "rolled back, but the API is not answering; check journalctl -u ${API_UNIT}"
+		fi
+	}
+
+	install -m 0755 "${RELEASE_UNPACK}/dohcord-relayd" "${BIN}.new" || {
+		rollback_update
+		die "cannot stage the new daemon; the previous executables were kept"
+	}
+	install -m 0755 "${RELEASE_UNPACK}/dohcord-relay" "${CONSOLE_BIN}.new" || {
+		rm -f "${BIN}.new"
+		rollback_update
+		die "cannot stage the new console; the previous executables were kept"
+	}
+	mv -f "${BIN}.new" "${BIN}"
+	mv -f "${CONSOLE_BIN}.new" "${CONSOLE_BIN}"
+
+	if unit_exists "${API_UNIT}"; then
+		info "restarting ${API_UNIT}"
+		systemctl restart "${API_UNIT}" || true
+	else
+		warn "${API_UNIT} is not installed; start the daemon yourself"
+	fi
+
+	local ready=0 i
+	for i in $(seq 1 15); do
+		if ! unit_exists "${API_UNIT}" || systemctl is-active --quiet "${API_UNIT}"; then
+			if api_reachable "$(api_port)"; then
+				ready=1
+				break
+			fi
+		fi
+		sleep 1
+	done
+
+	if [[ ${ready} -eq 0 ]]; then
+		bad "${target} did not start cleanly"
+		journalctl -u "${API_UNIT}" -n 20 --no-pager 2>/dev/null | sed 's/^/  /' || true
+		rollback_update
+		trap - RETURN
+		rm -rf -- "${dir}"
+		return 1
+	fi
+
+	record_release_version "${target}" "${arch}"
+	ok "updated ${current} -> ${target} (linux/${arch}); the API is answering"
+	info "configuration, certificates and policies were not touched"
+	trap - RETURN
+	rm -rf -- "${dir}"
 }
 
 # --- Repair -----------------------------------------------------------------
@@ -1130,7 +1434,7 @@ menu() {
 		case "${choice}" in
 		1) dashboard ;;
 		2) service_menu ;;
-		3) network_info ;;
+		3) network_menu ;;
 		4) policy_menu ;;
 		5) firewall_info ;;
 		6) cert_menu ;;
@@ -1178,30 +1482,266 @@ cert_menu() {
 
 firewall_info() {
 	heading "Firewall"
-	local missing=0 port
+	local missing=0 port api_p
+	api_p="$(api_port)"
 	if have ufw; then
 		ufw status verbose 2>/dev/null | sed 's/^/  /' || true
 	fi
 	if have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
-		for port in 80 443 8443 3478 5349; do
+		for port in 80 "$(url_port PROXY)" "${api_p}" 3478 5349; do
 			if ! ufw status | grep -qE "(^|[^0-9])${port}([/ ]|$)"; then
 				warn "port ${port} does not appear in the ufw rules"
 				missing=1
 			fi
 		done
-		((missing)) || ok "the relay ports are allowed in ufw"
+		((missing)) || ok "the relay ports are allowed in ufw (API port ${api_p})"
 		return 0
 	fi
 	if have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
 		say ""
 		firewall-cmd --list-all 2>/dev/null | sed 's/^/  /' || true
+		if [[ "$(firewall_api_state "${api_p}")" == "allowed" ]]; then
+			ok "firewalld allows the API port ${api_p}"
+		else
+			warn "firewalld does not allow the API port ${api_p}"
+		fi
 		return 0
 	fi
 	warn "no active ufw or firewalld found"
 	say "  If your provider has a firewall (EC2 security groups, Hetzner, OVH), open:"
-	say "    80/tcp, 443/tcp, 8443/tcp, 3478/udp, 5349/tcp, 49152-65535/udp"
+	say "    80/tcp, $(url_port PROXY)/tcp, ${api_p}/tcp, 3478/udp, 5349/tcp, 49152-65535/udp"
 	say ""
 	dim "The host firewall cannot open ports in a cloud security group for you."
+}
+
+# firewall_api_state prints allowed, missing or unmanaged for a TCP port.
+firewall_api_state() {
+	local port="$1"
+	if have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
+		if ufw status | grep -qE "^${port}/tcp[[:space:]]+ALLOW"; then
+			printf 'allowed'
+		else
+			printf 'missing'
+		fi
+	elif have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+		if firewall-cmd --query-port="${port}/tcp" >/dev/null 2>&1; then
+			printf 'allowed'
+		else
+			printf 'missing'
+		fi
+	else
+		printf 'unmanaged'
+	fi
+}
+
+# ufw_api_rule_numbers lists the numbered ufw rules this project added for a
+# port, newest first. The comment tag means unrelated rules are never removed.
+ufw_api_rule_numbers() {
+	local port="$1"
+	ufw status numbered 2>/dev/null |
+		awk -v want="${port}/tcp" -v tag="dohcord-relay network config" '
+			index($0, want) && index($0, tag) {
+				line = $0
+				sub(/^\[[[:space:]]*/, "", line)
+				sub(/\].*/, "", line)
+				print line
+			}' | sort -rn
+}
+
+# firewall_set_api_port replaces the API port rule, leaving every unrelated rule
+# (including Squid's and coturn's) alone. Returns non-zero if the new port is not
+# allowed afterwards.
+firewall_set_api_port() { # OLD NEW
+	local old="$1" new="$2" n
+	if have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
+		if [[ "${old}" != "${new}" ]]; then
+			while read -r n; do
+				[[ -n "${n}" ]] || continue
+				ufw --force delete "${n}" >/dev/null || warn "could not remove the old ufw rule for ${old}/tcp"
+			done < <(ufw_api_rule_numbers "${old}")
+		fi
+		ufw allow "${new}/tcp" comment 'dohcord-relay network config' >/dev/null || return 1
+		[[ "$(firewall_api_state "${new}")" == "allowed" ]]
+		return
+	fi
+	if have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+		firewall-cmd --permanent --add-port="${new}/tcp" >/dev/null || return 1
+		if [[ "${old}" != "${new}" ]]; then
+			firewall-cmd --permanent --remove-port="${old}/tcp" >/dev/null 2>&1 || true
+		fi
+		firewall-cmd --reload >/dev/null || return 1
+		[[ "$(firewall_api_state "${new}")" == "allowed" ]]
+		return
+	fi
+	warn "no active ufw/firewalld; open TCP ${new} in your provider firewall yourself"
+	return 0
+}
+
+# api_reachable succeeds when the configured endpoint answers on PORT. The
+# public host name is resolved locally, so no DNS lookup or external round trip
+# is needed and the certificate is still verified for the real host name.
+api_reachable() {
+	local port="$1" url host
+	url="$(api_url)"
+	[[ "${url}" == *://* ]] || return 1
+	host="${url#*://}"
+	host="${host%%/*}"
+	host="${host%%:*}"
+	[[ -n "${host}" ]] || return 1
+	curl -fsS --max-time 10 --resolve "${host}:${port}:127.0.0.1" -o /dev/null "${url}" 2>/dev/null
+}
+
+# write_api_port_config records PORT in config.env as the authoritative value
+# and keeps the public URL and listen address on the same port.
+write_api_port_config() {
+	local port="$1" tmp url scheme rest host path listen owner mode
+	url="$(api_url)"
+	[[ -n "${url}" ]] || url="https://$(info_value PUBLIC_HOST)"
+	scheme="${url%%://*}"
+	rest="${url#*://}"
+	host="${rest%%/*}"
+	host="${host%%:*}"
+	if [[ "${rest}" == */* ]]; then path="/${rest#*/}"; else path="/network-config"; fi
+	url="${scheme}://${host}:${port}${path}"
+
+	listen="$(api_listen_addr)"
+	listen="${listen%:*}:${port}"
+
+	tmp="$(mktemp)" || return 1
+	awk -v port="${port}" -v url="${url}" -v listen="${listen}" '
+		BEGIN { p = 0; u = 0; l = 0 }
+		/^NETWORK_CONFIG_PORT=/ { print "NETWORK_CONFIG_PORT=" port; p = 1; next }
+		/^NETWORK_CONFIG_URL=/ { print "NETWORK_CONFIG_URL=" url; u = 1; next }
+		/^HTTPS_LISTEN=/ { print "HTTPS_LISTEN=" listen; l = 1; next }
+		{ print }
+		END {
+			if (!p) print "NETWORK_CONFIG_PORT=" port
+			if (!u) print "NETWORK_CONFIG_URL=" url
+			if (!l) print "HTTPS_LISTEN=" listen
+		}' "${CONFIG_FILE}" >"${tmp}" || {
+		rm -f "${tmp}"
+		return 1
+	}
+	owner="$(stat -c '%U:%G' "${CONFIG_FILE}" 2>/dev/null || printf 'root:root')"
+	mode="$(stat -c '%a' "${CONFIG_FILE}" 2>/dev/null || printf '640')"
+	chown "${owner}" "${tmp}" 2>/dev/null || true
+	chmod "${mode}" "${tmp}" 2>/dev/null || true
+	mv "${tmp}" "${CONFIG_FILE}"
+
+	# install-info is informational, but its API_PORT should not disagree with
+	# the configuration it describes.
+	if [[ -r "${INFO_FILE}" ]]; then
+		local itmp
+		itmp="$(mktemp)" || return 0
+		awk -v port="${port}" '
+			/^API_PORT=/ { print "API_PORT=" port; seen = 1; next }
+			{ print }
+			END { if (!seen) print "API_PORT=" port }
+		' "${INFO_FILE}" >"${itmp}" || {
+			rm -f "${itmp}"
+			return 0
+		}
+		mv "${itmp}" "${INFO_FILE}"
+	fi
+}
+
+# network_change_port changes the API port in one guarded transaction: config,
+# firewall, service restart and an end-to-end request. Any failure restores the
+# previous configuration and listening state.
+network_change_port() {
+	need_root
+	require_install
+	[[ -t 0 ]] || die "changing the API port is interactive; run ${PROGRAM} in a terminal"
+
+	local current port reason backup dir stamp
+	current="$(api_port)"
+	heading "Network Configuration API port"
+	printf '  %-24s %s\n' "Configured port" "${current}"
+	printf '  %-24s %s\n' "Listen address" "$(api_listen_addr)"
+	say ""
+	printf '  New port [%s]: ' "${current}"
+	read -r port || die "cancelled"
+	port="${port:-${current}}"
+	port="${port//[[:space:]]/}"
+
+	if reason="$(api_port_conflict "${port}")"; then
+		warn "${reason}"
+		return 1
+	fi
+	if [[ "${port}" == "${current}" ]]; then
+		ok "the Network Configuration API already uses port ${current}"
+		return 0
+	fi
+
+	say ""
+	warn "the API will be briefly unavailable while its port changes"
+	info "Dohcord profiles using https://$(info_value PUBLIC_HOST):${current}/network-config"
+	info "must be updated to port ${port}; remote management also uses this port"
+	confirm "Change the Network Configuration API port from ${current} to ${port}?" ||
+		die "cancelled; nothing was changed"
+
+	dir="$(policy_backup_dir)"
+	mkdir -p "${dir}"
+	chmod 0700 "${dir}"
+	stamp="$(date +%Y%m%d-%H%M%S)"
+	backup="${dir}/config.env.${stamp}"
+	cp -a "${CONFIG_FILE}" "${backup}" || die "cannot back up ${CONFIG_FILE}; nothing was changed"
+	dim "configuration backup: ${backup}"
+
+	rollback_port() { # rollback_port OLD NEW
+		cp -a "${backup}" "${CONFIG_FILE}" || warn "could not restore ${backup}"
+		firewall_set_api_port "$2" "$1" || warn "could not restore the firewall rule for ${1}/tcp"
+		systemctl restart "${API_UNIT}" >/dev/null 2>&1 || warn "could not restart ${API_UNIT}"
+		if api_reachable "$1"; then
+			ok "the previous configuration was restored; the API answers on ${1} again"
+		else
+			bad "the previous configuration was restored, but the API does not answer on ${1}"
+			info "check: journalctl -u ${API_UNIT} -n 40 --no-pager"
+		fi
+		die "the port change failed and was rolled back"
+	}
+
+	info "updating ${CONFIG_FILE}"
+	write_api_port_config "${port}" || rollback_port "${current}" "${port}"
+
+	info "updating the firewall for TCP ${port}"
+	firewall_set_api_port "${current}" "${port}" || rollback_port "${current}" "${port}"
+
+	info "restarting ${API_UNIT}"
+	if ! systemctl restart "${API_UNIT}"; then
+		bad "${API_UNIT} failed to restart; recent log:"
+		journalctl -u "${API_UNIT}" -n 20 --no-pager 2>/dev/null | sed 's/^/  /' || true
+		rollback_port "${current}" "${port}"
+	fi
+
+	local ready=0
+	for _ in $(seq 1 30); do
+		if api_reachable "${port}"; then
+			ready=1
+			break
+		fi
+		sleep 1
+	done
+	if [[ ${ready} -eq 0 ]]; then
+		bad "the API did not answer on https://$(info_value PUBLIC_HOST):${port}/network-config"
+		journalctl -u "${API_UNIT}" -n 20 --no-pager 2>/dev/null | sed 's/^/  /' || true
+		rollback_port "${current}" "${port}"
+	fi
+
+	say ""
+	ok "the Network Configuration API now listens on port ${port}"
+	info "update the Network Configuration URL in Dohcord to https://$(info_value PUBLIC_HOST):${port}/network-config"
+}
+
+network_menu() {
+	network_info
+	say ""
+	printf '  1. Change the Network Configuration API port\n  0. Back\n\n  Select an option: '
+	local choice
+	read -r choice || return 0
+	case "${choice}" in
+	1) network_change_port ;;
+	esac
 }
 
 # --- Dispatch ---------------------------------------------------------------
@@ -1209,7 +1749,7 @@ usage() {
 	cat <<EOF
 Dohcord-relay management console ${MANAGER_VERSION}
 
-Usage: dohcord-relay-manager [command]
+Usage: ${PROGRAM} [command]
 
   (no command)          Interactive menu
   dashboard             Status of services, certificate, endpoints and resources
@@ -1218,6 +1758,7 @@ Usage: dohcord-relay-manager [command]
   services logs UNIT    Recent journal entries (add -f via 'services follow UNIT')
   services validate UNIT
   network               Endpoints, files and the document clients receive
+  network port          Change the Network Configuration API port
   policy show           Current destinations with matching and ports
   policy add|remove     Edit the policy files (validated, then optionally applied)
   policy check|apply    Validate, or validate and reload Squid
@@ -1245,14 +1786,21 @@ main() {
 		case "${action}" in
 		status) service_status ;;
 		start | stop | restart | reload | logs | follow | validate)
-			[[ -n "${unit}" ]] || die "usage: dohcord-relay-manager services ${action} UNIT"
+			[[ -n "${unit}" ]] || die "usage: ${PROGRAM} services ${action} UNIT"
 			service_action "${unit}" "${action}"
 			[[ "${action}" == "follow" ]] || true
 			;;
-		*) die "usage: dohcord-relay-manager services status|start|stop|restart|reload|logs|follow|validate [UNIT]" ;;
+		*) die "usage: ${PROGRAM} services status|start|stop|restart|reload|logs|follow|validate [UNIT]" ;;
 		esac
 		;;
-	network) network_info ;;
+	network)
+		shift
+		case "${1:-}" in
+		"") network_info ;;
+		port) network_change_port ;;
+		*) die "usage: ${PROGRAM} network [port]" ;;
+		esac
+		;;
 	policy)
 		shift
 		case "${1:-show}" in
@@ -1261,7 +1809,7 @@ main() {
 		remove | rm) policy_remove ;;
 		check | validate) policy_check ;;
 		apply) policy_apply ;;
-		*) die "usage: dohcord-relay-manager policy show|add|remove|check|apply" ;;
+		*) die "usage: ${PROGRAM} policy show|add|remove|check|apply" ;;
 		esac
 		;;
 	cert | certificate)
@@ -1269,7 +1817,7 @@ main() {
 		case "${1:-status}" in
 		status) cert_status ;;
 		renew) cert_renew ;;
-		*) die "usage: dohcord-relay-manager cert status|renew" ;;
+		*) die "usage: ${PROGRAM} cert status|renew" ;;
 		esac
 		;;
 	diagnostics | doctor) diagnostics ;;
@@ -1277,7 +1825,7 @@ main() {
 	repair) repair_menu ;;
 	uninstall) uninstall_menu ;;
 	firewall) firewall_info ;;
-	version | --version) printf 'dohcord-relay-manager %s\n' "${MANAGER_VERSION}" ;;
+	version | --version) printf '%s %s\n' "${PROGRAM}" "${MANAGER_VERSION}" ;;
 	help | -h | --help) usage ;;
 	*) usage; exit 1 ;;
 	esac

@@ -3,7 +3,7 @@
 Start here:
 
 ```bash
-sudo dohcord-relay-manager diagnostics
+sudo dohcord-relay diagnostics
 curl -sS https://relay.example.com:8443/network-config | python3 -m json.tool
 ```
 
@@ -40,7 +40,7 @@ Check, in order:
 ```bash
 curl -I http://relay.example.com/.well-known/acme-challenge/test   # from outside
 sudo ss -Hltnp 'sport = :80'                                        # who listens
-sudo dohcord-relay-manager services status
+sudo dohcord-relay services status
 ```
 
 - Port 80 must be open in the host firewall **and** the cloud security group.
@@ -81,8 +81,8 @@ openssl s_client -connect relay.example.com:443 -servername relay.example.com </
 | TLS handshake errors to a random host | Expected: only policy destinations are reachable |
 
 ```bash
-sudo dohcord-relay-manager policy show
-sudo dohcord-relay-manager services status
+sudo dohcord-relay policy show
+sudo dohcord-relay services status
 sudo tail -f /var/log/dohcord-relay/squid/cache.log
 grep TCP_DENIED /var/log/dohcord-relay/squid/access.log | tail
 ```
@@ -90,8 +90,8 @@ grep TCP_DENIED /var/log/dohcord-relay/squid/access.log | tail
 ### Squid will not start
 
 ```bash
-sudo dohcord-relay-manager policy check          # policy files valid?
-sudo dohcord-relay-manager services validate dohcord-relay-squid.service
+sudo dohcord-relay policy check          # policy files valid?
+sudo dohcord-relay services validate dohcord-relay-squid.service
 sudo journalctl -u dohcord-relay-squid -n 50 --no-pager
 ```
 
@@ -106,7 +106,7 @@ Almost always a policy or certificate problem:
 
 Voice connects but nobody hears anyone, or voice does not connect at all:
 
-1. `sudo dohcord-relay-manager services status` — is `dohcord-relay-coturn` running?
+1. `sudo dohcord-relay services status` — is `dohcord-relay-coturn` running?
 2. Open `3478/udp`, `5349/tcp` and `49152-65535/udp` in the host firewall and the
    cloud security group. The relay range is mandatory; TURN cannot fall back.
 3. Check the realm and the secret:
@@ -130,6 +130,7 @@ coturn reads differ. They are the same file; re-run the installer to re-render
 | Symptom | Cause |
 |---|---|
 | `connection refused` on 8443 | `dohcord-relay-api` is down, or the port is closed |
+| `connection refused` after changing the API port | The Dohcord profile still names the old port; run `sudo dohcord-relay diagnostics` and update the profile to the configured port |
 | `502`/`504` from a reverse proxy in front | You have something in front of it; the API expects to be reached directly |
 | `503 destination policy unavailable` | No valid policy/snapshot; run `-policy-check` |
 | `503 turn configuration unavailable` | `turn-secret` missing or shorter than 16 bytes |
@@ -138,18 +139,37 @@ coturn reads differ. They are the same file; re-run the installer to re-render
 
 ```bash
 sudo journalctl -u dohcord-relay-api -n 50 --no-pager
-sudo dohcord-relay-manager services validate dohcord-relay-api.service
+sudo dohcord-relay services validate dohcord-relay-api.service
+```
+
+## Updates
+
+| Symptom | Cause |
+|---|---|
+| `cannot download …` during install or update | github.com is unreachable, or the tag does not exist; nothing was replaced |
+| `SHA256 verification failed` | The archive does not match the release checksums; the installed binaries were kept |
+| `unsupported architecture` | Releases exist for linux/amd64 and linux/arm64 only |
+| Service does not start after an update | The updater restores the previous executables automatically; check `journalctl -u dohcord-relay-api` |
+
+```bash
+sudo dohcord-relay update        # latest, or enter a specific vX.Y.Z
+sudo dohcord-relay dashboard     # installed release and service state
 ```
 
 ## Firewall
 
 ```bash
-sudo dohcord-relay-manager firewall
+sudo dohcord-relay firewall
+sudo dohcord-relay diagnostics
 sudo ufw status numbered
 ```
 
-Required inbound: `80/tcp`, `443/tcp`, `8443/tcp`, `3478/udp`, `5349/tcp`,
-`49152-65535/udp`. A cloud security group (EC2, Hetzner, OVH, GCP) is separate
+`diagnostics` prints the configured API port, the listen address, whether the
+port is listening (or free, or taken by another process), whether the firewall
+allows it, and whether the endpoint answers.
+
+Required inbound: `80/tcp`, `443/tcp`, `8443/tcp` (or the configured API port),
+`3478/udp`, `5349/tcp`, `49152-65535/udp`. A cloud security group (EC2, Hetzner, OVH, GCP) is separate
 from the host firewall; the installer cannot open it for you.
 
 Do not close SSH while editing rules:
@@ -188,7 +208,7 @@ Expected: `config.env`, `turnserver.conf`, `turn-secret`, `privkey.pem`,
 `turnserver` is a member of the `dohcord-relay` group.
 
 ```bash
-sudo dohcord-relay-manager repair
+sudo dohcord-relay repair
 ```
 
 fixes these modes individually after asking.
@@ -196,8 +216,8 @@ fixes these modes individually after asking.
 ## Collecting a report
 
 ```bash
-sudo dohcord-relay-manager dashboard
-sudo dohcord-relay-manager diagnostics
+sudo dohcord-relay dashboard
+sudo dohcord-relay diagnostics
 sudo bash /usr/local/lib/dohcord-relay/verify.sh
 sudo journalctl -u dohcord-relay-api -u dohcord-relay-squid -u dohcord-relay-coturn --since '1 hour ago' --no-pager
 ```

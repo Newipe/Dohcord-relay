@@ -6,8 +6,9 @@
 #   Dohcord --TLS--> Squid :443 --CONNECT host:port--> Discord HTTPS/WSS
 #   Dohcord --TURN--> coturn :3478/udp, :5349/tcp --> Discord RTC media
 #
-# plus a small HTTPS endpoint on :8443 that publishes the proxy address, the
-# destination policy and temporary TURN credentials:
+# plus a small HTTPS endpoint (8443 by default, or the port chosen at install
+# time) that publishes the proxy address, the destination policy and temporary
+# TURN credentials:
 #
 #   https://<your host>:8443/network-config
 #
@@ -42,7 +43,12 @@ TOTAL_QUOTA=1200
 MAX_BPS=2000000
 BPS_CAPACITY=250000000
 PROXY_PORT=443
+# Port of the Network Configuration API. 8443 is the default; a fresh
+# interactive installation may choose another one (--api-port for automation).
 API_PORT=8443
+API_PORT_EXPLICIT=0
+# Port used before this run, so its firewall rule can be retired safely.
+PREVIOUS_API_PORT=""
 MAX_CONN_PER_IP=40
 MAX_FDS=8192
 READ_TIMEOUT="10 minutes"
@@ -60,10 +66,12 @@ readonly TURN_LOG_DIR="${LOG_DIR}/turnserver"
 readonly SQUID_RUN_DIR="/run/dohcord-relay-squid"
 readonly TURN_RUN_DIR="/run/dohcord-relay-coturn"
 readonly WEBROOT="/var/www/dohcord-relay"
-readonly BIN="/usr/local/bin/dohcord-relay"
+readonly DAEMON="/usr/local/bin/dohcord-relayd"
+readonly CLI="/usr/local/bin/dohcord-relay"
 readonly HOOK="/usr/local/bin/dohcord-relay-tls-deploy"
-readonly MANAGER="/usr/local/bin/dohcord-relay-manager"
+readonly MANAGER_ALIAS="/usr/local/bin/dohcord-relay-manager"
 readonly LIB_DIR="/usr/local/lib/dohcord-relay"
+readonly MANAGER_SCRIPT="${LIB_DIR}/manager.sh"
 readonly INFO_FILE="${ETC_DIR}/install-info"
 readonly CERT_NAME="dohcord-relay"
 readonly API_UNIT="dohcord-relay-api.service"
@@ -73,6 +81,18 @@ readonly RENEW_SERVICE="dohcord-relay-certbot-renew.service"
 readonly RENEW_TIMER="dohcord-relay-certbot-renew.timer"
 
 REPO_DIR=""
+# Release selection. An explicit tag (or DOHCORD_RELAY_VERSION) wins; otherwise
+# the latest stable GitHub Release is used. DOHCORD_RELAY_RELEASE_BASE_URL and
+# DOHCORD_RELAY_LATEST_API exist so the download path can be tested against a
+# local mirror; they are not needed in normal use.
+RELEASE_REQUEST="${DOHCORD_RELAY_VERSION:-}"
+RELEASE_TAG=""
+RELEASE_ARCH=""
+RELEASE_BASE_URL="${DOHCORD_RELAY_RELEASE_BASE_URL:-https://github.com/Newipe/Dohcord-relay/releases/download}"
+LATEST_RELEASE_API="${DOHCORD_RELAY_LATEST_API:-https://api.github.com/repos/Newipe/Dohcord-relay/releases/latest}"
+RELEASE_WORKDIR=""
+RELEASE_ARCHIVE_DIR=""
+BIN_BACKUP_DIR=""
 TURN_BINARY=""
 SQUID_BINARY=""
 CERTBOT=""
@@ -118,9 +138,10 @@ ${C_CYAN}${C_BOLD}  ╭───────────────────
     · an HTTPS proxy on 443, limited to the destinations in the policy
     · a TURN relay on 3478/udp and 5349/tcp for voice and video
 
-  plus a small HTTPS endpoint on 8443 that tells Dohcord how to reach
-  them. Nothing on this server is decrypted; the proxy forwards encrypted
-  connections and only decides where they may go.
+  plus a small HTTPS endpoint that tells Dohcord how to reach them. It
+  listens on port 8443 unless you choose another port below. Nothing on
+  this server is decrypted; the proxy forwards encrypted connections and
+  only decides where they may go.
 
   Nothing has been changed yet. The steps below are shown as they run,
   and the summary at the end lists what is reachable and how to manage it.
@@ -168,6 +189,7 @@ on_error() {
 	printf '    while running: %s\n' "${BASH_COMMAND}" >&2
 	printf '    Re-run the same command to retry: completed steps are safe to repeat,\n    and existing configuration and certificates are kept.\n' >&2
 	stop_acme_bootstrap
+	cleanup_release_workdir
 	exit "${rc}"
 }
 trap on_error ERR
@@ -207,15 +229,24 @@ Service sizes:
                            (default: 250000000).
   --max-connections N      Concurrent proxy connections per client IP (default: 40).
 
-Other:
+Network Configuration API:
+  --api-port N             Port for the Network Configuration API (default: 8443).
+                           Fresh interactive installs ask; upgrades keep the port
+                           already configured. Use this option with --yes for
+                           automated deployments.
+  --version VERSION        Release tag to install, for example v1.1.0
+                           (default: the latest stable GitHub Release).
+
+Release binaries: this installer downloads precompiled, checksum-verified
+binaries from GitHub Releases. It never runs a Go compiler on this server.
   --yes                    Do not ask for confirmation (still needs --mode).
   --skip-renew-test        Do not run `certbot renew --dry-run` at the end.
-  --skip-verify            Do not run deploy/verify.sh at the end.
+  --skip-verify            Do not run deploy/scripts/verify.sh at the end.
   -h, --help               Show this help.
 
 Ports used: 80/tcp (certificate validation), 443/tcp (HTTPS CONNECT proxy),
-8443/tcp (network configuration endpoint), 3478/udp and 5349/tcp (TURN),
-49152-65535/udp (TURN relay media).
+8443/tcp by default (network configuration endpoint, configurable with
+--api-port), 3478/udp and 5349/tcp (TURN), 49152-65535/udp (TURN relay media).
 EOF
 }
 
@@ -279,6 +310,15 @@ parse_args() {
 			MAX_CONN_PER_IP="${2:-}"
 			shift 2
 			;;
+		--api-port)
+			API_PORT="${2:-}"
+			API_PORT_EXPLICIT=1
+			shift 2
+			;;
+		--version)
+			RELEASE_REQUEST="${2:-}"
+			shift 2
+			;;
 		--yes)
 			ASSUME_YES=1
 			shift
@@ -311,6 +351,133 @@ parse_args() {
 	local o
 	for o in USER_QUOTA TOTAL_QUOTA MAX_BPS BPS_CAPACITY MAX_CONN_PER_IP PROXY_PORT API_PORT MAX_FDS; do
 		[[ "${!o}" =~ ^[0-9]+$ ]] || die "--${o,,} must be numeric"
+	done
+	if [[ ${API_PORT_EXPLICIT} -eq 1 ]]; then
+		((API_PORT >= 1024 && API_PORT <= 65535)) ||
+			die "--api-port must be between 1024 and 65535 (ports below 1024 are reserved for system services)"
+		case "${API_PORT}" in
+		80 | "${PROXY_PORT}" | 3478 | 5349)
+			die "--api-port ${API_PORT} is already used by another Dohcord-relay service"
+			;;
+		esac
+	fi
+}
+
+# existing_api_port prints the Network Configuration API port recorded by a
+# previous installation, or nothing on a fresh machine. HTTPS_LISTEN is the
+# fallback for configurations written before NETWORK_CONFIG_PORT existed.
+existing_api_port() {
+	local port=""
+	if [[ -r "${ETC_DIR}/config.env" ]]; then
+		port="$(sed -n 's/^NETWORK_CONFIG_PORT=//p' "${ETC_DIR}/config.env" | tail -1)"
+		if [[ -z "${port}" ]]; then
+			port="$(sed -n 's/^HTTPS_LISTEN=//p' "${ETC_DIR}/config.env" | tail -1)"
+			port="${port##*:}"
+		fi
+		if [[ ! "${port}" =~ ^[0-9]+$ ]]; then
+			port="$(sed -n 's/^NETWORK_CONFIG_URL=//p' "${ETC_DIR}/config.env" | tail -1)"
+			port="${port#*://}"
+			port="${port%%/*}"
+			port="${port##*:}"
+		fi
+	fi
+	if [[ ! "${port}" =~ ^[0-9]+$ && -r "${INFO_FILE}" ]]; then
+		port="$(sed -n 's/^API_PORT=//p' "${INFO_FILE}" | tail -1)"
+	fi
+	if [[ "${port}" =~ ^[0-9]+$ ]] && ((10#${port} >= 1 && 10#${port} <= 65535)); then
+		printf '%s' "$((10#${port}))"
+	fi
+}
+
+# api_port_owner prints the process name listening on a TCP port, if any.
+api_port_owner() {
+	ss -Hltnp "sport = :$1" 2>/dev/null |
+		sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -1
+}
+
+# api_port_problem prints why PORT cannot be used by the Network Configuration
+# API and returns 0. It returns 1 (with no output) when the port is usable.
+api_port_problem() {
+	local port="$1" owner
+	if [[ ! "${port}" =~ ^[0-9]+$ ]]; then
+		printf '%s is not a number' "${port}"
+		return 0
+	fi
+	port=$((10#${port}))
+	if ((port < 1024 || port > 65535)); then
+		printf '%d is outside the usable range 1024-65535 (ports below 1024 are reserved for system services)' "${port}"
+		return 0
+	fi
+	case "${port}" in
+	80) printf '80 is used for ACME HTTP-01 certificate validation' ;;
+	443 | "${PROXY_PORT}") printf '%d is used by the HTTPS CONNECT proxy' "${port}" ;;
+	3478) printf '3478 is used by the TURN relay' ;;
+	5349) printf '5349 is used by TURN over TLS' ;;
+	esac
+	case "${port}" in 80 | 443 | "${PROXY_PORT}" | 3478 | 5349) return 0 ;; esac
+	if command -v ss >/dev/null 2>&1 && ss -Hltn "sport = :${port}" 2>/dev/null | grep -q .; then
+		owner="$(api_port_owner "${port}")"
+		# Our own endpoint may hold its configured port on a re-run.
+		[[ "${owner}" == *dohcord-relay* ]] && return 1
+		printf 'port %d is already in use%s; stop that service or choose another port' \
+			"${port}" "${owner:+ by ${owner}}"
+		return 0
+	fi
+	return 1
+}
+
+# select_api_port settles the Network Configuration API port before anything is
+# written. Existing installations keep their port without being asked; only a
+# fresh installation prompts (or takes --api-port).
+select_api_port() {
+	local existing reason answer
+	existing="$(existing_api_port)"
+	if [[ -n "${existing}" && ${API_PORT_EXPLICIT} -eq 1 && "${API_PORT}" != "${existing}" ]]; then
+		# An explicitly requested port is an intentional change, not a prompt.
+		PREVIOUS_API_PORT="${existing}"
+		reason="$(api_port_problem "${API_PORT}")" || true
+		[[ -z "${reason}" ]] || die "--api-port ${API_PORT}: ${reason}"
+		info "changing the Network Configuration API port from ${existing} to ${API_PORT}"
+		return 0
+	fi
+	if [[ -n "${existing}" ]]; then
+		PREVIOUS_API_PORT="${existing}"
+		API_PORT="${existing}"
+		info "Network Configuration API port ${API_PORT} is already configured; keeping it"
+		return 0
+	fi
+	if [[ ${API_PORT_EXPLICIT} -eq 1 ]]; then
+		reason="$(api_port_problem "${API_PORT}")" || true
+		[[ -z "${reason}" ]] || die "--api-port ${API_PORT}: ${reason}"
+		info "Network Configuration API port: ${API_PORT}"
+		return 0
+	fi
+	if [[ ${ASSUME_YES} -eq 1 || ! -t 0 ]]; then
+		reason="$(api_port_problem "${API_PORT}")" || true
+		[[ -z "${reason}" ]] ||
+			die "the default Network Configuration API port ${API_PORT} cannot be used (${reason}); pass --api-port PORT"
+		info "Network Configuration API port: ${API_PORT} (default; --api-port changes it)"
+		return 0
+	fi
+
+	cat <<EOF
+
+  Network Configuration API
+
+  Choose the port used by the Network Configuration API.
+
+EOF
+	while true; do
+		read -r -p "  Port [${API_PORT}]: " answer || die "cancelled"
+		answer="${answer:-${API_PORT}}"
+		answer="${answer//[[:space:]]/}"
+		if reason="$(api_port_problem "${answer}")"; then
+			warn "${reason}"
+			continue
+		fi
+		API_PORT="${answer}"
+		ok "the Network Configuration API will listen on ${API_PORT}/tcp"
+		return 0
 	done
 }
 
@@ -447,6 +614,9 @@ EOF
 	fi
 	TURN_REALM="${TURN_REALM:-$( [[ "${MODE}" == "domain" ]] && echo "${DOMAIN}" || echo "dohcord.relay")}"
 
+	# Upgrades keep the recorded port; fresh installations choose one here.
+	select_api_port
+
 	cat <<EOF
 
   This server will be reachable as
@@ -518,8 +688,12 @@ check_root_and_os() {
 	fi
 
 	REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-	[[ -f "${REPO_DIR}/go.mod" && -f "${REPO_DIR}/main.go" ]] ||
-		die "cannot find the Go sources; run this script from a checkout of Dohcord-relay"
+	# The installer no longer compiles anything, but it still needs the
+	# templates, units and helper scripts that ship in the repository archive.
+	[[ -f "${REPO_DIR}/deploy/templates/config.env.tmpl" &&
+		-f "${REPO_DIR}/deploy/systemd/dohcord-relay-api.service" &&
+		-f "${REPO_DIR}/deploy/scripts/dohcord-relay-tls-deploy" ]] ||
+		die "cannot find the installer resources; run this script from a Dohcord-relay release archive"
 
 	command -v systemctl >/dev/null || die "systemd is required"
 	info "repository: ${REPO_DIR}"
@@ -756,7 +930,7 @@ render_squid_conf() {
 		-e "s|@BLOCKED_IP@|${PUBLIC_IP}/32|g" \
 		-e "s|@SQUID_USER@|proxy|g" \
 		-e "s|@SQUID_GROUP@|proxy|g" \
-		"${REPO_DIR}/deploy/squid.conf.tmpl" >"${target}.new"
+		"${REPO_DIR}/deploy/templates/squid.conf.tmpl" >"${target}.new"
 
 	chown root:root "${target}.new"
 	chmod 0644 "${target}.new"
@@ -766,7 +940,7 @@ render_squid_conf() {
 
 install_squid_unit() {
 	sed -e "s|@SQUID_BINARY@|${SQUID_BINARY}|g" \
-		"${REPO_DIR}/deploy/dohcord-relay-squid.service" >"/etc/systemd/system/${SQUID_UNIT}"
+		"${REPO_DIR}/deploy/systemd/dohcord-relay-squid.service" >"/etc/systemd/system/${SQUID_UNIT}"
 	chmod 0644 "/etc/systemd/system/${SQUID_UNIT}"
 	info "installed /etc/systemd/system/${SQUID_UNIT} (exec ${SQUID_BINARY})"
 }
@@ -888,7 +1062,7 @@ write_turn_secret() {
 }
 
 render_turnserver_conf() {
-	local secret template="${REPO_DIR}/deploy/turnserver.conf.tmpl" target="${ETC_DIR}/turnserver.conf"
+	local secret template="${REPO_DIR}/deploy/templates/turnserver.conf.tmpl" target="${ETC_DIR}/turnserver.conf"
 	secret="$(cat "${ETC_DIR}/turn-secret")"
 
 	sed -e "s|@PUBLIC_IP@|${PUBLIC_IP}|g" \
@@ -921,40 +1095,221 @@ render_turnserver_conf() {
 
 install_coturn_unit() {
 	sed -e "s|@TURN_BINARY@|${TURN_BINARY}|g" \
-		"${REPO_DIR}/deploy/dohcord-relay-coturn.service" >"/etc/systemd/system/${COTURN_UNIT}"
+		"${REPO_DIR}/deploy/systemd/dohcord-relay-coturn.service" >"/etc/systemd/system/${COTURN_UNIT}"
 	chmod 0644 "/etc/systemd/system/${COTURN_UNIT}"
 	info "installed /etc/systemd/system/${COTURN_UNIT}"
 }
 
-# --- endpoint ---------------------------------------------------------------
-install_go() {
-	export DEBIAN_FRONTEND=noninteractive
-	if command -v go >/dev/null 2>&1; then
-		local have
-		have="$(go version | grep -oE 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 | sed 's/^go//')"
-		if version_ge "${have}" "1.18"; then
-			info "using $(go version)"
-			return 0
-		fi
+# --- release binaries -------------------------------------------------------
+# The installer never compiles. It downloads the archive for this architecture
+# from the requested GitHub Release, verifies it against checksums.txt and only
+# then replaces anything. A failed download or checksum leaves the installed
+# binaries untouched.
+cleanup_release_workdir() {
+	if [[ -n "${RELEASE_WORKDIR}" && -d "${RELEASE_WORKDIR}" ]]; then
+		rm -rf -- "${RELEASE_WORKDIR}"
 	fi
-	apt-get install -y -qq --no-install-recommends golang-go >/dev/null
-	command -v go >/dev/null || die "installing golang-go did not provide a 'go' command"
-	local have
-	have="$(go version | grep -oE 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 | sed 's/^go//')"
-	version_ge "${have}" "1.18" || die "Go ${have} is too old (1.18+ required); install a newer Go and re-run"
-	info "installed $(go version)"
+	RELEASE_WORKDIR=""
 }
 
-build_endpoint() {
-	install_go
-	(
-		cd "${REPO_DIR}"
-		CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "${BIN}.new" .
-	) || die "building the endpoint failed"
-	install -m 0755 -o root -g root "${BIN}.new" "${BIN}"
-	rm -f "${BIN}.new"
-	info "installed ${BIN}"
+# download_release_url URL DEST fetches a release file. Only HTTPS is accepted
+# in normal use; file:// and loopback HTTP are allowed for the test suite.
+download_release_url() {
+	local url="$1" dest="$2"
+	case "${url}" in
+	https://*)
+		curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 \
+			--max-time 180 --retry 2 --retry-delay 2 -o "${dest}" "${url}"
+		;;
+	file://* | http://127.0.0.1:* | http://localhost:*)
+		curl -fsSL --max-time 180 -o "${dest}" "${url}"
+		;;
+	*)
+		die "refusing to download from ${url}: only HTTPS (or a local test mirror) is allowed"
+		;;
+	esac
 }
+
+# normalize_release_tag prints a vX.Y.Z tag. It returns 1 for empty input, for
+# "latest" and for anything that is not strict semantic versioning, so callers
+# decide whether that means "resolve latest" or "reject the request".
+normalize_release_tag() {
+	local tag="$1"
+	[[ -n "${tag}" && "${tag}" != "latest" ]] || return 1
+	[[ "${tag}" == v* ]] || tag="v${tag}"
+	[[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+	printf '%s' "${tag}"
+}
+
+latest_release_tag() {
+	local json tag
+	json="$(mktemp)"
+	if ! download_release_url "${LATEST_RELEASE_API}" "${json}"; then
+		rm -f "${json}"
+		die "cannot query the latest release from ${LATEST_RELEASE_API}; pass --version vX.Y.Z"
+	fi
+	if command -v jq >/dev/null 2>&1; then
+		tag="$(jq -r '.tag_name // empty' "${json}" 2>/dev/null || true)"
+	else
+		tag="$(python3 - "${json}" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("tag_name", ""))
+except Exception:
+    pass
+PY
+)"
+	fi
+	rm -f "${json}"
+	[[ -n "${tag}" ]] ||
+		die "the release service did not report a latest release tag; pass --version vX.Y.Z"
+	normalize_release_tag "${tag}"
+}
+
+resolve_release_tag() {
+	local tag
+	if [[ -n "${RELEASE_REQUEST}" && "${RELEASE_REQUEST}" != "latest" ]]; then
+		tag="$(normalize_release_tag "${RELEASE_REQUEST}")" ||
+			die "'${RELEASE_REQUEST}' is not a semantic version tag (expected vX.Y.Z, for example v1.1.0)"
+		RELEASE_TAG="${tag}"
+		info "release requested: ${RELEASE_TAG}"
+	else
+		RELEASE_TAG="$(latest_release_tag)" ||
+			die "cannot determine the latest stable release; pass --version vX.Y.Z"
+		info "latest stable release: ${RELEASE_TAG}"
+	fi
+}
+
+native_release_arch() {
+	case "${1:-$(uname -m)}" in
+	x86_64 | amd64) printf 'amd64' ;;
+	aarch64 | arm64) printf 'arm64' ;;
+	*) return 1 ;;
+	esac
+}
+
+detect_release_arch() {
+	local machine
+	[[ "$(uname -s)" == "Linux" ]] ||
+		die "release binaries are published for Linux only (this host is $(uname -s))"
+	machine="$(uname -m)"
+	RELEASE_ARCH="$(native_release_arch "${machine}")" ||
+		die "unsupported architecture '${machine}': Dohcord-relay publishes linux/amd64 and linux/arm64 release binaries"
+	info "release target: linux/${RELEASE_ARCH}"
+}
+
+# migrate_legacy_binary moves a pre-rename server binary out of the way. Older
+# releases installed the daemon as /usr/local/bin/dohcord-relay; that name now
+# belongs to the management console, so the existing executable is copied to
+# /usr/local/bin/dohcord-relayd before anything is replaced. Copying (rather than
+# moving) also keeps a running service's inode valid until it is restarted.
+migrate_legacy_binary() {
+	[[ -x "${DAEMON}" ]] && return 0
+	[[ -f "${CLI}" && ! -L "${CLI}" ]] || return 0
+	install -m 0755 -o root -g root "${CLI}" "${DAEMON}"
+	info "migrated the previous server binary ${CLI} to ${DAEMON}"
+}
+
+# backup_current_binaries copies the installed executables so a failed upgrade
+# can be undone. Configuration, certificates and policies are not touched.
+backup_current_binaries() {
+	if [[ ! -e "${DAEMON}" && ! -e "${CLI}" ]]; then
+		return 0
+	fi
+	local dir
+	dir="/var/backups/dohcord-relay/binaries-$(date +%Y%m%d-%H%M%S)"
+	mkdir -p "${dir}"
+	chmod 0700 "${dir}"
+	[[ -e "${DAEMON}" ]] && cp -a "${DAEMON}" "${dir}/"
+	[[ -e "${CLI}" ]] && cp -a "${CLI}" "${dir}/"
+	BIN_BACKUP_DIR="${dir}"
+	info "previous binaries backed up to ${dir}"
+}
+
+# restore_previous_binaries puts the backed-up executables back and restarts the
+# API service. Used only when a freshly installed binary fails to start.
+restore_previous_binaries() {
+	[[ -n "${BIN_BACKUP_DIR}" && -d "${BIN_BACKUP_DIR}" ]] || return 1
+	local restored=0
+	if [[ -f "${BIN_BACKUP_DIR}/dohcord-relayd" ]]; then
+		install -m 0755 -o root -g root "${BIN_BACKUP_DIR}/dohcord-relayd" "${DAEMON}"
+		restored=1
+	fi
+	if [[ -f "${BIN_BACKUP_DIR}/dohcord-relay" ]]; then
+		install -m 0755 -o root -g root "${BIN_BACKUP_DIR}/dohcord-relay" "${CLI}"
+		restored=1
+	fi
+	((restored)) || return 1
+	systemctl restart "${API_UNIT}" >/dev/null 2>&1 || true
+	info "restored the previous executables from ${BIN_BACKUP_DIR}"
+}
+
+download_release_binaries() {
+	local asset base url checksums unpack file magic
+	base="${RELEASE_BASE_URL%/}"
+	asset="dohcord-relay_linux_${RELEASE_ARCH}.tar.gz"
+	url="${base}/${RELEASE_TAG}/${asset}"
+
+	cleanup_release_workdir
+	RELEASE_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/dohcord-relay-release.XXXXXX")"
+	info "downloading ${url}"
+	download_release_url "${url}" "${RELEASE_WORKDIR}/${asset}" ||
+		die "cannot download ${asset} for ${RELEASE_TAG}; the installed binaries were not changed"
+	checksums="${RELEASE_WORKDIR}/checksums.txt"
+	download_release_url "${base}/${RELEASE_TAG}/checksums.txt" "${checksums}" ||
+		die "cannot download checksums.txt for ${RELEASE_TAG}; refusing to install unverified binaries"
+
+	if ! grep -qE "^[0-9a-fA-F]{64}[[:space:]]+\*?${asset}$" "${checksums}"; then
+		die "checksums.txt has no SHA256 entry for ${asset}; refusing to install unverified binaries"
+	fi
+	if ! (cd "${RELEASE_WORKDIR}" && sha256sum -c --ignore-missing checksums.txt >/dev/null); then
+		die "SHA256 verification failed for ${asset}; the installed binaries were not changed"
+	fi
+	info "SHA256 verified ${asset}"
+
+	unpack="${RELEASE_WORKDIR}/unpacked"
+	mkdir -p "${unpack}"
+	tar -xzf "${RELEASE_WORKDIR}/${asset}" -C "${unpack}" --no-same-owner ||
+		die "cannot extract ${asset}; the installed binaries were not changed"
+	for file in dohcord-relayd dohcord-relay; do
+		[[ -f "${unpack}/${file}" && ! -L "${unpack}/${file}" ]] ||
+			die "${asset} does not contain a regular ${file} file"
+		magic="$(od -An -tx1 -N4 "${unpack}/${file}" | tr -d ' \n')"
+		[[ "${magic}" == "7f454c46" ]] ||
+			die "${asset} contains ${file} that is not a Linux executable"
+	done
+
+	# On the native architecture the binaries can be checked directly. The tag
+	# embedded at build time must match the release being installed.
+	if [[ "${RELEASE_ARCH}" == "$(native_release_arch "$(uname -m)")" ]]; then
+		"${unpack}/dohcord-relayd" -version >"${RELEASE_WORKDIR}/daemon-version" 2>&1 ||
+			die "the downloaded dohcord-relayd cannot run on this host; the installed binaries were not changed"
+		grep -Fq " ${RELEASE_TAG} " "${RELEASE_WORKDIR}/daemon-version" ||
+			die "the downloaded dohcord-relayd does not report ${RELEASE_TAG}; refusing a mismatched release"
+	fi
+
+	RELEASE_ARCHIVE_DIR="${unpack}"
+}
+
+install_release_binaries() {
+	detect_release_arch
+	resolve_release_tag
+	download_release_binaries
+	migrate_legacy_binary
+	backup_current_binaries
+
+	# Both executables are staged before either is moved into place.
+	install -m 0755 -o root -g root "${RELEASE_ARCHIVE_DIR}/dohcord-relayd" "${DAEMON}.new"
+	install -m 0755 -o root -g root "${RELEASE_ARCHIVE_DIR}/dohcord-relay" "${CLI}.new"
+	mv -f "${DAEMON}.new" "${DAEMON}"
+	mv -f "${CLI}.new" "${CLI}"
+
+	cleanup_release_workdir
+	info "installed ${RELEASE_TAG} (linux/${RELEASE_ARCH}): ${DAEMON} and ${CLI}"
+}
+
+# Kept for callers written against the previous source-build name.
+build_endpoint() { install_release_binaries; }
 
 render_config_env() {
 	local target="${ETC_DIR}/config.env"
@@ -964,14 +1319,20 @@ render_config_env() {
 		-e "s|@API_PORT@|${API_PORT}|g" \
 		-e "s|@TLS_DIR@|${TLS_DIR}|g" \
 		-e "s|@SQUID_BINARY@|${SQUID_BINARY}|g" \
-		"${REPO_DIR}/deploy/config.env.tmpl" >"${rendered}"
+		"${REPO_DIR}/deploy/templates/config.env.tmpl" >"${rendered}"
 
 	if [[ -f "${target}" ]] && grep -q '^HTTPS_PROXY_URL=' "${target}"; then
 		# Keep operator tuning, but refresh the public identity and ports so a
-		# change of domain/IP is picked up.
+		# change of domain/IP is picked up. The listen address keeps its host
+		# part and only takes the selected port.
+		local listen_addr=":${API_PORT}" current_listen
+		current_listen="$(sed -n 's/^HTTPS_LISTEN=//p' "${target}" | tail -1)"
+		[[ "${current_listen}" == *:* ]] && listen_addr="${current_listen%:*}:${API_PORT}"
 		sed -i -E \
 			-e "s|^HTTPS_PROXY_URL=.*|HTTPS_PROXY_URL=https://${PUBLIC_HOST}:${PROXY_PORT}|" \
+			-e "s|^NETWORK_CONFIG_PORT=.*|NETWORK_CONFIG_PORT=${API_PORT}|" \
 			-e "s|^NETWORK_CONFIG_URL=.*|NETWORK_CONFIG_URL=https://${PUBLIC_HOST}:${API_PORT}/network-config|" \
+			-e "s|^HTTPS_LISTEN=.*|HTTPS_LISTEN=${listen_addr}|" \
 			-e "s|^TURN_URLS=.*|TURN_URLS=turn:${PUBLIC_HOST}:3478?transport=udp,turns:${PUBLIC_HOST}:5349?transport=tcp|" \
 			-e "s|^SQUID_BINARY=.*|SQUID_BINARY=${SQUID_BINARY}|" \
 			"${target}"
@@ -999,7 +1360,7 @@ render_config_env() {
 }
 
 install_api_unit() {
-	install -m 0644 "${REPO_DIR}/deploy/dohcord-relay-api.service" \
+	install -m 0644 "${REPO_DIR}/deploy/systemd/dohcord-relay-api.service" \
 		"/etc/systemd/system/${API_UNIT}"
 	info "installed /etc/systemd/system/${API_UNIT}"
 }
@@ -1010,13 +1371,16 @@ install_api_unit() {
 # change how traffic is handled; they drive the services installed above.
 install_management_tools() {
 	install -d -m 0755 -o root -g root "${LIB_DIR}"
-	if [[ -f "${REPO_DIR}/deploy/dohcord-relay-manager.sh" ]]; then
-		install -m 0755 "${REPO_DIR}/deploy/dohcord-relay-manager.sh" "${MANAGER}"
-		info "installed ${MANAGER}"
+	if [[ -f "${REPO_DIR}/deploy/scripts/dohcord-relay-manager.sh" ]]; then
+		install -m 0755 "${REPO_DIR}/deploy/scripts/dohcord-relay-manager.sh" "${MANAGER_SCRIPT}"
+		info "installed ${MANAGER_SCRIPT}"
+		# dohcord-relay is the console; keep the previous name working as an alias.
+		ln -sfn "${CLI}" "${MANAGER_ALIAS}"
+		info "linked ${MANAGER_ALIAS} -> ${CLI}"
 	else
 		warn "the management console is missing from this checkout; skipping it"
 	fi
-	install -m 0755 "${REPO_DIR}/deploy/verify.sh" "${LIB_DIR}/verify.sh"
+	install -m 0755 "${REPO_DIR}/deploy/scripts/verify.sh" "${LIB_DIR}/verify.sh"
 	if [[ -f "${REPO_DIR}/uninstall.sh" ]]; then
 		install -m 0755 "${REPO_DIR}/uninstall.sh" "${LIB_DIR}/uninstall.sh"
 	fi
@@ -1039,6 +1403,8 @@ write_install_info() {
 	umask 022
 	cat >"${INFO_FILE}.new" <<EOF
 INSTALLER_VERSION=${INSTALLER_VERSION}
+RELEASE_VERSION=${RELEASE_TAG:-unknown}
+RELEASE_ARCH=${RELEASE_ARCH:-unknown}
 INSTALLED_AT=${stamp}
 MODE=${MODE}
 PUBLIC_HOST=${PUBLIC_HOST}
@@ -1056,7 +1422,7 @@ EOF
 install_policy_files() {
 	local name src dst
 	for name in allowed-domains.txt destination-policy.conf; do
-		src="${REPO_DIR}/deploy/${name}"
+		src="${REPO_DIR}/deploy/templates/${name}"
 		dst="${ETC_DIR}/${name}"
 		if [[ -f "${dst}" ]]; then
 			info "keeping existing ${dst}"
@@ -1094,7 +1460,7 @@ install_deploy_hook() {
 	sed -e "s|@PUBLIC_IP@|${PUBLIC_IP}|g" \
 		-e "s|@PUBLIC_HOST@|${PUBLIC_HOST}|g" \
 		-e "s|@MODE@|${MODE}|g" \
-		"${REPO_DIR}/deploy/dohcord-relay-tls-deploy" >"${HOOK}.new"
+		"${REPO_DIR}/deploy/scripts/dohcord-relay-tls-deploy" >"${HOOK}.new"
 	chown root:root "${HOOK}.new"
 	chmod 0755 "${HOOK}.new"
 	mv "${HOOK}.new" "${HOOK}"
@@ -1186,7 +1552,7 @@ start_acme_bootstrap() {
 	info "starting the ACME HTTP-01 responder on port 80"
 	install -d -m 0755 -o root -g root "${probe_dir}"
 	printf 'ok\n' >"${probe_dir}/${probe}"
-	"${BIN}" -config "${ETC_DIR}/config.env" -acme-only >>"${LOG_DIR}/acme-bootstrap.log" 2>&1 &
+	"${DAEMON}" -config "${ETC_DIR}/config.env" -acme-only >>"${LOG_DIR}/acme-bootstrap.log" 2>&1 &
 	BOOTSTRAP_PID=$!
 
 	for _ in $(seq 1 60); do
@@ -1298,8 +1664,8 @@ obtain_certificate() {
 
 install_renewal() {
 	sed -e "s|@CERTBOT@|${CERTBOT}|g" \
-		"${REPO_DIR}/deploy/dohcord-relay-certbot-renew.service" >"/etc/systemd/system/${RENEW_SERVICE}"
-	install -m 0644 "${REPO_DIR}/deploy/dohcord-relay-certbot-renew.timer" "/etc/systemd/system/${RENEW_TIMER}"
+		"${REPO_DIR}/deploy/systemd/dohcord-relay-certbot-renew.service" >"/etc/systemd/system/${RENEW_SERVICE}"
+	install -m 0644 "${REPO_DIR}/deploy/systemd/dohcord-relay-certbot-renew.timer" "/etc/systemd/system/${RENEW_TIMER}"
 	systemctl daemon-reload
 	systemctl enable --now "${RENEW_TIMER}" >/dev/null
 	info "renewal timer enabled: ${RENEW_TIMER} (every 6h; certbot decides if a renewal is due)"
@@ -1311,20 +1677,78 @@ install_renewal() {
 }
 
 # --- Firewall ---------------------------------------------------------------
+# ufw_api_rule_numbers prints the numbers of the ufw rules this project added for
+# a port, newest first. Matching on the comment means unrelated rules - even on
+# the same port - are never deleted.
+ufw_api_rule_numbers() {
+	local port="$1"
+	ufw status numbered 2>/dev/null |
+		awk -v want="${port}/tcp" -v tag="dohcord-relay network config" '
+			index($0, want) && index($0, tag) {
+				line = $0
+				sub(/^\[[[:space:]]*/, "", line)
+				sub(/\].*/, "", line)
+				print line
+			}' | sort -rn
+}
+
+# firewall_remove_old_api_port retires the API rule for a port that is being
+# replaced. Ports that belong to the proxy, TURN or ACME are never touched, and
+# only rules carrying this project's API comment are removed from ufw.
+firewall_remove_old_api_port() {
+	local old="$1"
+	[[ -n "${old}" && "${old}" != "${API_PORT}" ]] || return 0
+	case "${old}" in 80 | "${PROXY_PORT}" | 443 | 3478 | 5349) return 0 ;; esac
+	if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+		local n
+		while read -r n; do
+			[[ -n "${n}" ]] || continue
+			ufw --force delete "${n}" >/dev/null ||
+				warn "could not remove the obsolete ufw rule for ${old}/tcp"
+		done < <(ufw_api_rule_numbers "${old}")
+		info "removed the obsolete ufw rule for ${old}/tcp"
+	elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+		firewall-cmd --permanent --remove-port="${old}/tcp" >/dev/null 2>&1 || true
+		firewall-cmd --reload >/dev/null 2>&1 || true
+		info "removed the obsolete firewalld rule for ${old}/tcp"
+	fi
+}
+
+# firewall_verify_api_port returns 0 when a supported firewall allows PORT,
+# 1 when it does not, and 2 when no managed firewall is active.
+firewall_verify_api_port() {
+	local port="$1"
+	if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+		ufw status | grep -qE "^${port}/tcp[[:space:]]+ALLOW" && return 0
+		return 1
+	fi
+	if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+		firewall-cmd --query-port="${port}/tcp" >/dev/null 2>&1 && return 0
+		return 1
+	fi
+	return 2
+}
+
 configure_firewall() {
-	local changed=0
+	local changed=0 verify=2
 	if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
 		ufw allow 80/tcp comment 'dohcord-relay ACME' >/dev/null
 		ufw allow "${PROXY_PORT}/tcp" comment 'dohcord-relay HTTPS CONNECT proxy' >/dev/null
+		# Retire the previous API rule before opening the selected port, so 8443
+		# is not left open when a different port was chosen.
+		firewall_remove_old_api_port "${PREVIOUS_API_PORT}"
 		ufw allow "${API_PORT}/tcp" comment 'dohcord-relay network config' >/dev/null
 		ufw allow 3478/udp comment 'dohcord-relay TURN' >/dev/null
 		ufw allow 5349/tcp comment 'dohcord-relay TURN TLS' >/dev/null
 		ufw allow 49152:65535/udp comment 'dohcord-relay media' >/dev/null
 		changed=1
 		info "opened the required ports in ufw (existing rules untouched)"
+		firewall_verify_api_port "${API_PORT}"
+		verify=$?
 	elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
 		firewall-cmd --permanent --add-port=80/tcp >/dev/null
 		firewall-cmd --permanent --add-port="${PROXY_PORT}/tcp" >/dev/null
+		firewall_remove_old_api_port "${PREVIOUS_API_PORT}"
 		firewall-cmd --permanent --add-port="${API_PORT}/tcp" >/dev/null
 		firewall-cmd --permanent --add-port=3478/udp >/dev/null
 		firewall-cmd --permanent --add-port=5349/tcp >/dev/null
@@ -1332,8 +1756,16 @@ configure_firewall() {
 		firewall-cmd --reload >/dev/null
 		changed=1
 		info "opened the required ports in firewalld"
+		firewall_verify_api_port "${API_PORT}"
+		verify=$?
 	else
 		warn "no active ufw/firewalld detected; make sure these ports are allowed in your firewall and cloud security group:"
+	fi
+
+	if [[ ${verify} -eq 1 ]]; then
+		die "the firewall did not accept the Network Configuration API port ${API_PORT}/tcp; open it manually and re-run"
+	elif [[ ${verify} -eq 0 ]]; then
+		ok "firewall allows the Network Configuration API on ${API_PORT}/tcp"
 	fi
 
 	cat <<EOF
@@ -1365,7 +1797,7 @@ apply_policy() {
 	[[ -r "${TLS_DIR}/squid.pem" ]] ||
 		die "${TLS_DIR}/squid.pem is missing; the certificate deploy hook did not run"
 
-	if ! "${BIN}" -config "${ETC_DIR}/config.env" -policy-apply -no-reload; then
+	if ! "${DAEMON}" -config "${ETC_DIR}/config.env" -policy-apply -no-reload; then
 		die "the destination policy is invalid or Squid rejected the generated configuration; nothing was reloaded"
 	fi
 	info "destination policy validated and written to ${ETC_DIR}/squid-allow.conf"
@@ -1396,6 +1828,11 @@ start_services() {
 	}
 	systemctl is-active --quiet "${API_UNIT}" || {
 		journalctl -u "${API_UNIT}" -n 20 --no-pager >&2 || true
+		# A previously working installation must not be left with a binary it
+		# cannot run. Fresh installs have nothing to restore.
+		if restore_previous_binaries; then
+			warn "the new release did not start; the previous executables are back in place"
+		fi
 		die "${API_UNIT} failed to start"
 	}
 	info "proxy, TURN relay and configuration endpoint are running"
@@ -1408,7 +1845,7 @@ run_verification() {
 		return 0
 	fi
 	if ! DOHCORD_RELAY_SKIP_RENEW="${SKIP_RENEW_TEST}" \
-		DOHCORD_RELAY_CERTBOT="${CERTBOT}" bash "${REPO_DIR}/deploy/verify.sh"; then
+		DOHCORD_RELAY_CERTBOT="${CERTBOT}" bash "${REPO_DIR}/deploy/scripts/verify.sh"; then
 		warn "one or more checks failed; see the output above"
 		return 1
 	fi
@@ -1439,6 +1876,8 @@ Destination policy   ${ETC_DIR}/allowed-domains.txt
                      ${ETC_DIR}/destination-policy.conf
                      (applied: ${ETC_DIR}/squid-allow.conf)
 
+Release              ${RELEASE_TAG:-unknown} (linux/${RELEASE_ARCH:-unknown})
+                     binaries verified against checksums.txt
 Software             squid ${SQUID_INSTALLED_VERSION}
                      coturn ${COTURN_INSTALLED_VERSION:-unknown}
                      certbot $("${CERTBOT}" --version 2>/dev/null | awk '{print $2}')
@@ -1452,9 +1891,10 @@ Firewall ports       80/tcp, ${PROXY_PORT}/tcp, ${API_PORT}/tcp,
                      3478/udp, 5349/tcp, 49152-65535/udp
 
 Services             systemctl status ${SQUID_UNIT} ${COTURN_UNIT} ${API_UNIT}
-Management console   sudo dohcord-relay-manager
-Re-check any time    sudo dohcord-relay-manager diagnostics
-Uninstall safely     sudo dohcord-relay-manager  (option 10)
+Management console   sudo dohcord-relay
+Re-check any time    sudo dohcord-relay diagnostics
+Uninstall safely     sudo dohcord-relay  (option 10)
+Server daemon        ${DAEMON} (dohcord-relay-api.service)
                      keeps configuration and certificates unless you purge
 
 In Dohcord: Settings -> Custom Profile -> add this server:
@@ -1465,10 +1905,11 @@ EOF
 
 main() {
 	parse_args "$@"
-	# Never leave an ACME responder holding port 80 if this run is interrupted.
-	trap 'stop_acme_bootstrap' EXIT
-	trap 'stop_acme_bootstrap; exit 130' INT
-	trap 'stop_acme_bootstrap; exit 143' TERM
+	# Never leave an ACME responder holding port 80 or a release download in /tmp
+	# if this run is interrupted.
+	trap 'stop_acme_bootstrap; cleanup_release_workdir' EXIT
+	trap 'stop_acme_bootstrap; cleanup_release_workdir; exit 130' INT
+	trap 'stop_acme_bootstrap; cleanup_release_workdir; exit 143' TERM
 	banner
 
 	step_msg "Collecting how clients connect"
@@ -1517,8 +1958,8 @@ main() {
 	render_config_env
 	install_api_unit
 
-	step_msg "Building the configuration endpoint"
-	build_endpoint
+	step_msg "Installing verified release binaries"
+	install_release_binaries
 
 	step_msg "Installing the management console"
 	install_management_tools

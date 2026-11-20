@@ -20,7 +20,7 @@ small HTTPS endpoint that tells the client exactly how to connect.
 - [Network Configuration API](#network-configuration-api) · [Domain policy](#domain-policy)
 - [Management](#management) · [Updating](#updating) · [Troubleshooting](#troubleshooting)
 - [Uninstalling](#uninstalling) · [Security](#security) · [Development](#development)
-- [Documentation](#documentation)
+- [Repository layout](#repository-layout) · [Documentation](#documentation)
 
 ---
 
@@ -34,8 +34,9 @@ and video. Dohcord-relay provides a server-side rendezvous for both:
   forwards them to a **short, server-enforced list of destinations**;
 - a **TURN relay** (coturn) for voice and video when a direct connection between
   peers is not possible;
-- a **Network Configuration API** on port 8443 that hands Dohcord the proxy
-  address, the routing policy and short-lived TURN credentials in one document.
+- a **Network Configuration API** (port 8443 by default, configurable at install
+  time) that hands Dohcord the proxy address, the routing policy and short-lived
+  TURN credentials in one document.
 
 Nothing is intercepted or re-encrypted. Discord's TLS session runs end-to-end
 between Dohcord and Discord; the proxy only sees host names and ports, and only
@@ -44,7 +45,10 @@ for destinations the relay has been told to allow.
 > **Compatibility promise.** The client-facing contract is unchanged by this
 > documentation and tooling work: same ports, same endpoints, same JSON, same
 > proxy and TURN protocols. An existing Dohcord build keeps working; no client
-> update is needed to use this version of the relay.
+> update is needed to use this version of the relay. The API port defaults to
+> 8443; if an administrator chooses a custom port, the Dohcord profile's Network
+> Configuration URL must name that port (the path, JSON, TLS and authentication
+> are unchanged).
 
 ---
 
@@ -58,7 +62,7 @@ for destinations the relay has been told to allow.
 | **TURN relay** | coturn on 3478/udp and 5349/tcp with REST credentials and a bounded relay range. |
 | **Network Configuration API** | One HTTPS document (`/network-config`) with the proxy endpoint, routing rules and temporary credentials. |
 | **Automated certificates** | certbot with a deploy hook and a systemd timer, including IP certificates for address-only installs. |
-| **Management console** | `dohcord-relay-manager` for status, policy, certificates, updates, repair and uninstall. |
+| **Management console** | `dohcord-relay` for status, policy, certificates, updates, repair and uninstall. |
 | **Idempotent installer** | Re-running it keeps your configuration, policy and certificates. |
 
 ---
@@ -77,8 +81,10 @@ That single command:
 2. downloads this repository's archive over HTTPS into a private temporary
    directory — the archive is extracted, never piped into a shell;
 3. asks how clients should reach the server (a domain name, recommended, or the
-   public IPv4 address), then shows every setting before changing anything;
-4. installs Squid, coturn, a pinned certbot and the relay binary;
+   public IPv4 address) and, on a fresh install, the Network Configuration API
+   port (8443 by default), then shows every setting before changing anything;
+4. installs Squid, coturn and a pinned certbot, then downloads the verified
+   precompiled relay binaries for this server's architecture;
 5. obtains a TLS certificate, opens the required firewall ports, installs the
    systemd services and validates the configuration;
 6. runs the verification suite and prints the URLs to paste into Dohcord.
@@ -93,14 +99,27 @@ https://relay.example.com:8443/network-config
 and a management console:
 
 ```bash
-sudo dohcord-relay-manager
+sudo dohcord-relay
 ```
+
+`dohcord-relay` is the management command; the previous `dohcord-relay-manager`
+name remains installed as an alias. The background server is `dohcord-relayd`,
+run by `dohcord-relay-api.service`; you do not normally start it yourself.
+
+**No compiler is required on the server.** The installer downloads
+`dohcord-relay_linux_amd64.tar.gz` or `dohcord-relay_linux_arm64.tar.gz` from
+the matching GitHub Release, verifies it against the release's `checksums.txt`,
+and only then installs the two executables. Supported targets are **linux/amd64**
+and **linux/arm64**; any other architecture stops with a clear error. `--version
+v1.1.0` installs a specific release, and omitting it installs the latest stable
+one. A download or checksum failure leaves the currently installed binaries
+untouched.
 
 Requirements and options are in [docs/installation.md](docs/installation.md).
 The installer needs root (it uses `sudo` itself when started as a normal user),
 outbound HTTPS to github.com and your package mirror, and these inbound ports:
-**80/tcp** (certificate validation), **443/tcp**, **8443/tcp**,
-**3478/udp**, **5349/tcp**, **49152–65535/udp**.
+**80/tcp** (certificate validation), **443/tcp**, **8443/tcp** (or your chosen
+API port), **3478/udp**, **5349/tcp**, **49152–65535/udp**.
 
 > **Security note.** This command downloads and runs the installer from this
 > repository. That is the same trust model as running any install script: you are
@@ -121,7 +140,7 @@ flowchart TB
     end
 
     subgraph vps["Your VPS"]
-        API["Network Configuration API<br/>:8443/network-config"]
+        API["Network Configuration API<br/>:<configured port>/network-config"]
         SQ["Squid HTTPS CONNECT proxy<br/>:443"]
         POLICY["Destination policy<br/>allowed-domains.txt<br/>destination-policy.conf"]
         ACL["Generated Squid ACLs<br/>squid-allow.conf"]
@@ -163,7 +182,7 @@ destination-policy.conf ┘        └─► /network-config    (client routing)
 | **Architecture** | `amd64`, `arm64` — anything Debian/Ubuntu and coturn build for |
 | **Init** | systemd |
 | **Privileges** | root (or a user with `sudo`) |
-| **Network** | outbound HTTPS; inbound TCP 80, 443, 8443, 5349 and UDP 3478, 49152–65535 |
+| **Network** | outbound HTTPS; inbound TCP 80, 443, 8443 (or the chosen API port), 5349 and UDP 3478, 49152–65535 |
 | **Client** | Dohcord's Custom Profile feature; no relay-specific client build |
 
 An IP-only install works without a domain, using a short-lived Let's Encrypt IP
@@ -195,7 +214,9 @@ Full details, including every `config.env` key: [docs/configuration.md](docs/con
 
 ## Network Configuration API
 
-`GET https://<your relay>:8443/network-config` is the only endpoint Dohcord needs.
+`GET https://<your relay>:8443/network-config` is the only endpoint Dohcord needs
+(replace `8443` with your configured API port if it is different; existing 8443
+profiles are unaffected by the default).
 
 ```json
 {
@@ -217,13 +238,13 @@ Full details, including every `config.env` key: [docs/configuration.md](docs/con
 
 - `routing.domains` — hosts to send through the proxy, with `exact` or `suffix`
   matching and the permitted port ranges.
-- `proxy` — where the proxy is (443). The **configuration** endpoint is 8443 and
-  is not a proxy target.
+- `proxy` — where the proxy is (443). The **configuration** endpoint is the
+  configured API port (8443 by default) and is not a proxy target.
 - `httpsProxy` and `rtcRelay` — the original fields, unchanged for older clients.
 
 The document is `no-store`, rate limited, and answers `503` rather than serving an
 incomplete policy. Full schema and error behaviour:
-[docs/network-config-api.md](docs/network-config-api.md).
+[docs/api/network-config.md](docs/api/network-config.md).
 
 ---
 
@@ -234,14 +255,14 @@ The allowlist is two plain text files, and the same workflow serves every change
 ```bash
 sudoedit /etc/dohcord-relay/allowed-domains.txt        # add: cdn.example.com
 sudoedit /etc/dohcord-relay/destination-policy.conf    # add: cdn.example.com  443
-sudo dohcord-relay -config /etc/dohcord-relay/config.env -policy-check
-sudo dohcord-relay -config /etc/dohcord-relay/config.env -policy-apply
+sudo dohcord-relayd -config /etc/dohcord-relay/config.env -policy-check
+sudo dohcord-relayd -config /etc/dohcord-relay/config.env -policy-apply
 ```
 
 Or without touching files:
 
 ```bash
-sudo dohcord-relay-manager        # Domain policy → Add a destination
+sudo dohcord-relay        # Domain policy → Add a destination
 ```
 
 `-policy-check` validates both files and the whole Squid configuration;
@@ -255,14 +276,14 @@ A leading `=` makes an entry exact-host (no subdomains):
 =discord-attachments-uploads-prd.storage.googleapis.com
 ```
 
-Format, matching rules and safety notes: [docs/domain-policy.md](docs/domain-policy.md).
+Format, matching rules and safety notes: [docs/api/domain-policy.md](docs/api/domain-policy.md).
 
 ---
 
 ## Management
 
 ```bash
-sudo dohcord-relay-manager
+sudo dohcord-relay
 ```
 
 ```text
@@ -287,16 +308,16 @@ Every menu entry is also a subcommand, for scripts and headless use:
 
 | Command | What it does |
 |---|---|
-| `dohcord-relay-manager dashboard` | Services, certificate, endpoints, listeners, load, policy state |
-| `dohcord-relay-manager network` | Addresses, files, policy validity, and the document clients receive |
-| `dohcord-relay-manager services status` | The three relay units and the renewal timer |
-| `dohcord-relay-manager services restart dohcord-relay-squid.service` | Restart one unit |
-| `dohcord-relay-manager policy show` | Every destination with its match type and ports |
-| `dohcord-relay-manager cert status` | Issuer, validity, days remaining, renewal timer |
-| `dohcord-relay-manager diagnostics` | Health checks, optionally the full verification suite |
-| `dohcord-relay-manager update` | Download, back up configuration, re-install, verify |
-| `dohcord-relay-manager repair` | Fix permissions, directories, stopped units |
-| `dohcord-relay-manager uninstall` | Remove the relay (see below) |
+| `dohcord-relay dashboard` | Services, certificate, endpoints, listeners, load, policy state |
+| `dohcord-relay network` | Addresses, files, policy validity, and the document clients receive |
+| `dohcord-relay services status` | The three relay units and the renewal timer |
+| `dohcord-relay services restart dohcord-relay-squid.service` | Restart one unit |
+| `dohcord-relay policy show` | Every destination with its match type and ports |
+| `dohcord-relay cert status` | Issuer, validity, days remaining, renewal timer |
+| `dohcord-relay diagnostics` | Health checks, optionally the full verification suite |
+| `dohcord-relay update` | Download and verify a release, back up the executables, replace, restart and verify |
+| `dohcord-relay repair` | Fix permissions, directories, stopped units |
+| `dohcord-relay uninstall` | Remove the relay (see below) |
 
 Prefer plain systemctl? Nothing depends on the console:
 
@@ -315,18 +336,24 @@ journalctl -u dohcord-relay-api -f
 ## Updating
 
 ```bash
-sudo dohcord-relay-manager        # Update
+sudo dohcord-relay        # Update
 ```
 
-The updater backs up `/etc/dohcord-relay`, downloads the current `main`, shows
-the installed and available versions, and runs the same installer with your
-saved mode, host and address. Configuration, domain policy, certificates and
-private keys are preserved — the installer never overwrites an existing
-`config.env`, policy file or valid certificate. If the update fails, it offers to
-restore the configuration backup.
+On an upgrade from a release that installed the server as
+`/usr/local/bin/dohcord-relay`, the installer copies that binary to
+`/usr/local/bin/dohcord-relayd` before installing the console under the old
+name. The systemd unit keeps its name and is rewritten to the new executable.
 
-Re-running the one-line installer does the same thing, and is always safe to
-repeat.
+`Update` shows the installed and latest release versions, asks which version to
+install (the latest by default), downloads the archive for this architecture,
+verifies it against `checksums.txt`, backs up the current executables to
+`/var/backups/dohcord-relay`, replaces them, restarts
+`dohcord-relay-api.service` and confirms the endpoint answers. If the new binary
+does not come up, it restores the previous executables automatically.
+
+Configuration, domain policy, certificates and private keys are never touched by
+a binary update. Re-running the one-line installer (`--version` optional) also
+preserves them, and is always safe to repeat.
 
 ---
 
@@ -335,28 +362,28 @@ repeat.
 Start with the built-in checks:
 
 ```bash
-sudo dohcord-relay-manager diagnostics
+sudo dohcord-relay diagnostics
 curl -sS https://relay.example.com:8443/network-config | python3 -m json.tool
 ```
 
 | Symptom | First thing to check |
 |---|---|
-| Installer stops at ports | Something already listens on 80/443/8443/3478/5349 — `sudo dohcord-relay-manager dashboard` |
+| Installer stops at ports | Something already listens on 80/443/8443/3478/5349 (or your chosen API port) — `sudo dohcord-relay dashboard` |
 | Certificate issuance fails | Port 80 reachable, A record points here, no AAAA record without IPv6 |
 | Let's Encrypt rate limit | The existing certificate is kept; wait for the stated reset. Do not retry in a loop |
 | Dohcord cannot connect | `curl` the config URL; check `dohcord-relay-api` and the firewall |
 | Proxy returns 403 | The host is not in the policy, or the port is not allowed for it |
 | Voice fails, text works | TURN ports/security group, or coturn is down (`services status`) |
-| Squid will not start | `dohcord-relay-manager policy check`, then `services validate` |
+| Squid will not start | `dohcord-relay policy check`, then `services validate` |
 
-Detailed causes and commands: [docs/troubleshooting.md](docs/troubleshooting.md).
+Detailed causes and commands: [docs/operations/troubleshooting.md](docs/operations/troubleshooting.md).
 
 ---
 
 ## Uninstalling
 
 ```bash
-sudo bash uninstall.sh            # or: dohcord-relay-manager → Uninstall
+sudo bash uninstall.sh            # or: dohcord-relay → Uninstall
 ```
 
 It stops and removes the services, units, binaries and runtime directories, then
@@ -390,20 +417,58 @@ place and reported at the end. Nothing is deleted without a typed confirmation.
 
 What it is not: not a VPN, not anonymity, not a way around network policy where
 the relay's own address is blocked. The threat model and its limits are in
-[docs/security.md](docs/security.md).
+[docs/operations/security.md](docs/operations/security.md).
+
+---
+
+## Repository layout
+
+```text
+cmd/dohcord-relay/      management console entry point (runs the console script)
+cmd/dohcord-relayd/     server entry point (flags and startup only)
+internal/app/           startup wiring and the -policy-check/-policy-apply commands
+internal/api/           /network-config, /turn-credentials, ACME responder, limits
+internal/config/        config.env parsing, validation, effective-config output
+internal/credentials/   coturn TURN REST credentials
+internal/policy/        policy files, ports, routing contract, Squid ACL, applied state
+internal/ratelimit/     bounded token bucket for the public endpoints
+deploy/install.sh       the installer the one-line bootstrap runs
+deploy/scripts/         management console, verification suite, TLS deploy hook
+deploy/systemd/         units and timer installed to /etc/systemd/system
+deploy/templates/       config.env, Squid, coturn and policy templates
+docs/                   installation, configuration, API, operations documentation
+.github/workflows/     CI and tag-triggered release builds
+internal/buildinfo/     version, commit and build date injected with -ldflags
+scripts/check.sh        formatting, vet, tests and shell syntax in one command
+scripts/test-release.sh release packaging, installer and updater tests
+```
+
+The tests for a package live beside it (`internal/policy/policy_test.go`); the
+routing contract tests in `internal/api/routing_test.go` compare the published
+document with the generated Squid ACLs. [docs/architecture.md](docs/architecture.md)
+describes the layout and the install destinations in more detail.
 
 ---
 
 ## Development
 
+Developers compile from source; the one-line installer does not. GitHub Actions
+builds and publishes the official binaries on `vX.Y.Z` tags, so normal users
+never need Go.
+
 ```bash
-go test ./...                                  # policy, credentials, endpoint
-gofmt -l . && go vet ./...
-bash -n install.sh uninstall.sh deploy/*.sh    # shell syntax
-sudo bash deploy/verify.sh                     # end-to-end checks on a live relay
+./scripts/check.sh                            # gofmt, go vet, build, tests, shell and integration tests
+make build                                    # dohcord-relayd and dohcord-relay
+go test ./...                                 # policy, routing, API, credentials
+bash -n install.sh uninstall.sh deploy/install.sh deploy/scripts/*.sh
+sudo bash deploy/scripts/verify.sh            # end-to-end checks on a live relay
 ```
 
-`deploy/verify.sh` verifies the services, listeners, certificate chain, the
+A local `make build` reports itself as `dev`; only the release workflow stamps a
+version tag. See [docs/development.md](docs/development.md) for the full source
+workflow, release process and local release testing.
+
+`deploy/scripts/verify.sh` verifies the services, listeners, certificate chain, the
 generated ACLs against the policy files, real CONNECT allow/deny behaviour, the
 API document, TURN credentials and media, and renewal. It is read-only apart from
 a certbot dry run (skip it with `DOHCORD_RELAY_SKIP_RENEW=1`).
@@ -416,10 +481,12 @@ a certbot dry run (skip it with `DOHCORD_RELAY_SKIP_RENEW=1`).
 |---|---|
 | [Installation](docs/installation.md) | Requirements, one-line install, all installer options, non-interactive use, what the installer does |
 | [Configuration](docs/configuration.md) | `config.env`, Squid, coturn, file locations and permissions, tuning |
-| [Network Configuration API](docs/network-config-api.md) | Schema, fields, matching, errors, caching, custom profiles |
-| [Domain policy](docs/domain-policy.md) | File format, exact vs suffix, ports, validation and apply workflow |
-| [Troubleshooting](docs/troubleshooting.md) | Symptom → cause → command |
-| [Security](docs/security.md) | Threat model, protections, non-goals |
+| [Network Configuration API](docs/api/network-config.md) | Schema, fields, matching, errors, caching, custom profiles |
+| [Domain policy](docs/api/domain-policy.md) | File format, exact vs suffix, ports, validation and apply workflow |
+| [Troubleshooting](docs/operations/troubleshooting.md) | Symptom → cause → command |
+| [Security](docs/operations/security.md) | Threat model, protections, non-goals |
+| [Architecture](docs/architecture.md) | Repository layout, package responsibilities, install destinations |
+| [Development](docs/development.md) | Source builds, tests, CI and the release process |
 
 No other language variants are maintained.
 

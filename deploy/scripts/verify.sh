@@ -8,7 +8,7 @@
 #
 # Run as root (or as a user that can read /etc/dohcord-relay):
 #
-#   sudo deploy/verify.sh
+#   sudo deploy/scripts/verify.sh
 #
 # Environment overrides (used by the installer and by local testing):
 #   DOHCORD_RELAY_CONFIG        config.env path
@@ -41,7 +41,7 @@ PROXY_CA="${DOHCORD_RELAY_PROXY_CA:-}"
 ENDPOINT_OVERRIDE="${DOHCORD_RELAY_ENDPOINT:-}"
 API_URL_OVERRIDE="${DOHCORD_RELAY_API_URL:-}"
 PROXY_URL_OVERRIDE="${DOHCORD_RELAY_PROXY_URL:-}"
-BINARY="${DOHCORD_RELAY_BINARY:-/usr/local/bin/dohcord-relay}"
+BINARY="${DOHCORD_RELAY_BINARY:-/usr/local/bin/dohcord-relayd}"
 
 passed=0
 failed=0
@@ -112,6 +112,32 @@ PROXY_HOST="${URL_HOST}"
 PROXY_PORT="${URL_PORT:-443}"
 split_url "${API_URL}"
 API_PORT="${URL_PORT:-8443}"
+# NETWORK_CONFIG_PORT is authoritative. HTTPS_LISTEN and the public URL must
+# name the same port; a disagreement is a configuration error, not something to
+# guess around at verification time.
+CONFIGURED_API_PORT="$(cfg NETWORK_CONFIG_PORT)"
+API_LISTEN="$(cfg HTTPS_LISTEN)"
+if [[ -n "${CONFIGURED_API_PORT}" ]]; then
+	if [[ ! "${CONFIGURED_API_PORT}" =~ ^[0-9]+$ ]] ||
+		((10#${CONFIGURED_API_PORT} < 1 || 10#${CONFIGURED_API_PORT} > 65535)); then
+		printf 'error: NETWORK_CONFIG_PORT=%s is not a valid TCP port\n' "${CONFIGURED_API_PORT}" >&2
+		exit 2
+	fi
+	if [[ -n "${URL_PORT}" && "${URL_PORT}" != "${CONFIGURED_API_PORT}" ]]; then
+		printf 'error: NETWORK_CONFIG_URL uses port %s but NETWORK_CONFIG_PORT is %s\n' \
+			"${URL_PORT}" "${CONFIGURED_API_PORT}" >&2
+		exit 2
+	fi
+	API_PORT="${CONFIGURED_API_PORT}"
+fi
+if [[ -n "${API_LISTEN}" ]]; then
+	API_LISTEN_PORT="${API_LISTEN##*:}"
+	if [[ "${API_LISTEN_PORT}" != "${API_PORT}" ]]; then
+		printf 'error: HTTPS_LISTEN (%s) does not use NETWORK_CONFIG_PORT (%s)\n' \
+			"${API_LISTEN}" "${API_PORT}" >&2
+		exit 2
+	fi
+fi
 
 UDP_URL=""
 TLS_URL=""
@@ -192,7 +218,7 @@ PEER_BIN=""
 
 printf 'Dohcord Relay verification\n'
 printf '  proxy      %s\n' "${PROXY_URL}"
-printf '  api        %s\n' "${API_URL}"
+printf '  api        %s (configured port %s)\n' "${API_URL}" "${API_PORT}"
 printf '  turn url   %s\n' "${UDP_URL}"
 printf '  tls url    %s\n' "${TLS_URL:-<not configured>}"
 printf '  identity   %s\n' "${IDENTITY}"
@@ -222,9 +248,26 @@ else
 		fail "TCP ${PROXY_PORT} is not listening"
 	fi
 	if ss -Hltn "sport = :${API_PORT}" 2>/dev/null | grep -q .; then
-		pass "TCP ${API_PORT} is listening (network configuration endpoint)"
+		pass "TCP ${API_PORT} is listening (network configuration endpoint, configured port)"
 	else
-		fail "TCP ${API_PORT} is not listening"
+		fail "TCP ${API_PORT} is not listening (the configured Network Configuration API port)"
+		# Tell a port conflict apart from an API that never bound its port.
+		if command -v python3 >/dev/null 2>&1 && python3 - "${API_PORT}" <<'PY' >/dev/null 2>&1
+try:
+    import socket, sys
+    s = socket.socket()
+    try:
+        s.bind(("0.0.0.0", int(sys.argv[1])))
+    finally:
+        s.close()
+except OSError:
+    sys.exit(1)
+PY
+		then
+			note "the port is free: the service did not start on it (check ${API_UNIT})"
+		else
+			note "the port is in use by another process: port conflict"
+		fi
 	fi
 	if ss -Hlun "sport = :${UDP_PORT}" 2>/dev/null | grep -q .; then
 		pass "UDP ${UDP_PORT} is listening (TURN)"
@@ -247,6 +290,32 @@ elif [[ -n "${min_port}" && -n "${max_port}" ]]; then
 	pass "relay allocation range configured"
 else
 	fail "relay allocation range not found in ${TURN_CONF}"
+fi
+
+# --- API firewall -----------------------------------------------------------
+section "Network configuration API firewall"
+if [[ "${SKIP_UNITS}" == "1" ]]; then
+	skip "firewall checks disabled"
+elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+	if ufw status | grep -qE "^${API_PORT}/tcp[[:space:]]+ALLOW"; then
+		pass "ufw allows the configured API port ${API_PORT}/tcp"
+	else
+		fail "ufw does not allow the configured API port ${API_PORT}/tcp"
+	fi
+	if [[ "${API_PORT}" != "8443" ]] &&
+		ufw status | grep -qE '^8443/tcp[[:space:]]+ALLOW.*dohcord-relay network config'; then
+		warn "an obsolete ufw rule still opens 8443/tcp for Dohcord-relay"
+	else
+		pass "no obsolete Dohcord-relay API rule for 8443/tcp is open"
+	fi
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+	if firewall-cmd --query-port="${API_PORT}/tcp" >/dev/null 2>&1; then
+		pass "firewalld allows the configured API port ${API_PORT}/tcp"
+	else
+		fail "firewalld does not allow the configured API port ${API_PORT}/tcp"
+	fi
+else
+	skip "no active ufw/firewalld; check the provider firewall for TCP ${API_PORT}"
 fi
 
 # --- TURN limits and peer filtering -----------------------------------------

@@ -80,7 +80,7 @@ domains opens the proxy for no benefit.
 ### With the management console
 
 ```bash
-sudo dohcord-relay-manager
+sudo dohcord-relay
 # 4. Domain policy → 1. Add a destination
 ```
 
@@ -94,8 +94,8 @@ restores the backup if the result is rejected. It then offers to apply.
 sudoedit /etc/dohcord-relay/allowed-domains.txt
 sudoedit /etc/dohcord-relay/destination-policy.conf
 
-sudo dohcord-relay -config /etc/dohcord-relay/config.env -policy-check   # validate
-sudo dohcord-relay -config /etc/dohcord-relay/config.env -policy-apply   # validate + apply
+sudo dohcord-relayd -config /etc/dohcord-relay/config.env -policy-check   # validate
+sudo dohcord-relayd -config /etc/dohcord-relay/config.env -policy-apply   # validate + apply
 ```
 
 To remove a destination, delete its line from both files. To change ports, edit
@@ -143,8 +143,8 @@ acl dohcord_ports_6 port 443
 ## Verifying the result
 
 ```bash
-sudo dohcord-relay-manager policy show          # matches the files
-sudo dohcord-relay-manager network              # policy valid + document
+sudo dohcord-relay policy show          # matches the files
+sudo dohcord-relay network              # policy valid + document
 sudo bash /usr/local/lib/dohcord-relay/verify.sh
 ```
 

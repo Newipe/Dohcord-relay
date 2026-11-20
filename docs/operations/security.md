@@ -100,5 +100,5 @@ A cloud security group is outside its reach and must be configured separately.
 
 ## Reporting a problem
 
-Include the output of `dohcord-relay-manager diagnostics` and `verify.sh`.
+Include the output of `dohcord-relay diagnostics` and `verify.sh`.
 Never include `turn-secret`, `privkey.pem`, or issued TURN credentials.
