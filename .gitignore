@@ -13,3 +13,4 @@ squid-allow.conf
 *.pem
 *.key
 /Dohcord-relay
+/dohcord-relayd

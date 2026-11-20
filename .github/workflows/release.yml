@@ -1,0 +1,186 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # Any v-prefixed tag triggers the workflow; the build job rejects anything
+      # that is not strict vX.Y.Z before producing assets.
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify the tagged source
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          set -Eeuo pipefail
+          unformatted="$(gofmt -l cmd internal)"
+          if [[ -n "${unformatted}" ]]; then
+            while IFS= read -r file; do
+              echo "::error file=${file}::gofmt required"
+            done <<<"${unformatted}"
+            exit 1
+          fi
+
+      - name: Vet and test
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Validate shell scripts
+        run: |
+          set -Eeuo pipefail
+          bash -n install.sh uninstall.sh deploy/install.sh deploy/scripts/*.sh scripts/*.sh
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq shellcheck
+          fi
+          shellcheck -S warning install.sh uninstall.sh deploy/install.sh deploy/scripts/*.sh scripts/*.sh
+
+      - name: API port integration tests
+        run: bash scripts/test-api-port.sh
+
+  build:
+    name: Build linux/${{ matrix.arch }}
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build and package
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ ! "${VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::${VERSION} is not a semantic version tag (vX.Y.Z)"
+            exit 1
+          fi
+
+          # The commit date makes the build reproducible and is not wall-clock
+          # time; rebuilding the same tag yields the same metadata.
+          build_date="$(git log -1 --format=%cI "${COMMIT}")"
+          ldflags="-s -w \
+            -X github.com/Newipe/Dohcord-relay/internal/buildinfo.Version=${VERSION} \
+            -X github.com/Newipe/Dohcord-relay/internal/buildinfo.Commit=${COMMIT} \
+            -X github.com/Newipe/Dohcord-relay/internal/buildinfo.Date=${build_date}"
+
+          mkdir -p "dist/stage"
+          CGO_ENABLED=0 GOOS=linux GOARCH="${{ matrix.arch }}" \
+            go build -trimpath -buildvcs=false -ldflags="${ldflags}" \
+            -o "dist/stage/dohcord-relayd" ./cmd/dohcord-relayd
+          CGO_ENABLED=0 GOOS=linux GOARCH="${{ matrix.arch }}" \
+            go build -trimpath -buildvcs=false -ldflags="${ldflags}" \
+            -o "dist/stage/dohcord-relay" ./cmd/dohcord-relay
+
+          # Fail loudly if either executable is missing or not executable.
+          test -x "dist/stage/dohcord-relayd"
+          test -x "dist/stage/dohcord-relay"
+          cp README.md "dist/stage/README.md"
+
+          archive="dohcord-relay_linux_${{ matrix.arch }}.tar.gz"
+          # gzip -n keeps the archive reproducible: no timestamp or file name is
+          # written into the gzip header, and tar metadata is fixed as well.
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+            --mtime="@$(git log -1 --format=%ct "${COMMIT}")" \
+            -C "dist/stage" -cf - \
+            dohcord-relay dohcord-relayd README.md |
+            gzip -n -9 >"dist/${archive}"
+
+          # The archive must contain both executables before it is uploaded.
+          listing="$(tar -tzf "dist/${archive}")"
+          grep -qx 'dohcord-relay' <<<"${listing}"
+          grep -qx 'dohcord-relayd' <<<"${listing}"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: dist/dohcord-relay_linux_${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Verify every asset and generate checksums
+        run: |
+          set -Eeuo pipefail
+          cd dist
+          expected=(dohcord-relay_linux_amd64.tar.gz dohcord-relay_linux_arm64.tar.gz)
+          for archive in "${expected[@]}"; do
+            if [[ ! -s "${archive}" ]]; then
+              echo "::error::missing release asset ${archive}"
+              exit 1
+            fi
+            listing="$(tar -tzf "${archive}")"
+            grep -qx 'dohcord-relay' <<<"${listing}"
+            grep -qx 'dohcord-relayd' <<<"${listing}"
+          done
+          sha256sum "${expected[@]}" | sort -k2 > checksums.txt
+          cat checksums.txt
+          sha256sum -c checksums.txt
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          assets=(
+            dist/dohcord-relay_linux_amd64.tar.gz
+            dist/dohcord-relay_linux_arm64.tar.gz
+            dist/checksums.txt
+          )
+          if gh release view "${VERSION}" >/dev/null 2>&1; then
+            # Complete a release left partially uploaded by an earlier run.
+            gh release upload "${VERSION}" "${assets[@]}" --clobber
+          else
+            gh release create "${VERSION}" "${assets[@]}" \
+              --verify-tag \
+              --title "Dohcord-relay ${VERSION}" \
+              --generate-notes
+          fi

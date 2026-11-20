@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test, build and validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          set -Eeuo pipefail
+          unformatted="$(gofmt -l cmd internal)"
+          if [[ -n "${unformatted}" ]]; then
+            while IFS= read -r file; do
+              echo "::error file=${file}::gofmt required"
+            done <<<"${unformatted}"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test ./...
+
+      - name: Build both executables for every supported target
+        run: |
+          set -Eeuo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            echo "building linux/${arch}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" \
+              go build -trimpath -buildvcs=false \
+              -o "dist/dohcord-relayd_linux_${arch}" ./cmd/dohcord-relayd
+            CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" \
+              go build -trimpath -buildvcs=false \
+              -o "dist/dohcord-relay_linux_${arch}" ./cmd/dohcord-relay
+          done
+          # Both programs must actually be Linux binaries for the target.
+          file dist/*
+
+      - name: Validate shell scripts
+        run: |
+          set -Eeuo pipefail
+          bash -n install.sh uninstall.sh deploy/install.sh deploy/scripts/*.sh scripts/*.sh
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq shellcheck
+          fi
+          shellcheck -S warning install.sh uninstall.sh deploy/install.sh deploy/scripts/*.sh scripts/*.sh
+
+      - name: API port integration tests
+        run: bash scripts/test-api-port.sh
+
+      - name: Release pipeline tests
+        run: bash scripts/test-release.sh
