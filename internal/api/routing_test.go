@@ -1,4 +1,4 @@
-package main
+package api
 
 import (
 	"encoding/json"
@@ -11,11 +11,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Newipe/Dohcord-relay/internal/config"
+	"github.com/Newipe/Dohcord-relay/internal/policy"
 )
 
 // serverWithPolicy builds a server whose policy comes from the given file
 // contents, so a test can change the canonical policy and re-read it.
-func serverWithPolicy(t *testing.T, domains, ports string) (*server, string, string) {
+func serverWithPolicy(t *testing.T, domains, ports string) (*Server, string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	domainsPath := filepath.Join(dir, "allowed-domains.txt")
@@ -25,21 +28,21 @@ func serverWithPolicy(t *testing.T, domains, ports string) (*server, string, str
 	secretPath := filepath.Join(dir, "turn-secret")
 	writeFile(t, secretPath, "dohcord-test-secret\n")
 
-	cfg := defaultConfig()
-	cfg.secretFile = secretPath
-	cfg.ttl = 24 * time.Hour
-	cfg.httpsListen = ""
-	cfg.httpListen = ""
-	cfg.proxyURL = "https://relay.example.test:443"
-	cfg.apiURL = "https://relay.example.test:8443/network-config"
-	cfg.turnURLs = []string{
+	cfg := config.Default()
+	cfg.SecretFile = secretPath
+	cfg.TTL = 24 * time.Hour
+	cfg.HTTPSListen = ""
+	cfg.HTTPListen = ""
+	cfg.ProxyURL = "https://relay.example.test:443"
+	cfg.APIURL = "https://relay.example.test:8443/network-config"
+	cfg.TurnURLs = []string{
 		"turn:relay.example.test:3478?transport=udp",
 		"turns:relay.example.test:5349?transport=tcp",
 	}
-	cfg.allowedDomainsFile = domainsPath
-	cfg.destinationPolicyFile = policyPath
-	cfg.policyStateFile = filepath.Join(dir, "policy.json")
-	return newServer(cfg, log.New(io.Discard, "", 0)), domainsPath, policyPath
+	cfg.AllowedDomainsFile = domainsPath
+	cfg.DestinationPolicyFile = policyPath
+	cfg.PolicyStateFile = filepath.Join(dir, "policy.json")
+	return New(cfg, log.New(io.Discard, "", 0)), domainsPath, policyPath
 }
 
 func writeFile(t *testing.T, path, content string) {
@@ -60,11 +63,11 @@ type networkConfigDocument struct {
 		Port   int    `json:"port"`
 	} `json:"proxy"`
 	HTTPSProxy struct {
-		URL                 string        `json:"url"`
-		AllowedDestinations []Destination `json:"allowedDestinations"`
+		URL                 string               `json:"url"`
+		AllowedDestinations []policy.Destination `json:"allowedDestinations"`
 	} `json:"httpsProxy"`
 	Routing struct {
-		Domains []RoutingRule `json:"domains"`
+		Domains []policy.RoutingRule `json:"domains"`
 	} `json:"routing"`
 	RTCRelay struct {
 		ExpiresAt  int64       `json:"expiresAt"`
@@ -72,24 +75,39 @@ type networkConfigDocument struct {
 	} `json:"rtcRelay"`
 }
 
-func fetchNetworkConfig(t *testing.T, srv *server) (*httptest.ResponseRecorder, networkConfigDocument) {
+func fetchNetworkConfig(t *testing.T, srv *Server) (*httptest.ResponseRecorder, networkConfigDocument) {
 	t.Helper()
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/network-config", nil)
 	req.RemoteAddr = "203.0.113.9:4444"
-	srv.routes().ServeHTTP(rec, req)
+	srv.Routes().ServeHTTP(rec, req)
 
 	var doc networkConfigDocument
 	if rec.Code == http.StatusOK {
 		if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
 			t.Fatalf("decode body: %v (%s)", err, rec.Body.String())
 		}
+		// Decoding is case-insensitive, so check the published key spelling too:
+		// clients read "scheme"/"host"/"port" exactly.
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+			t.Fatalf("decode body as a map: %v", err)
+		}
+		var proxy map[string]any
+		if err := json.Unmarshal(raw["proxy"], &proxy); err != nil {
+			t.Fatalf("decode proxy: %v", err)
+		}
+		for _, key := range []string{"scheme", "host", "port"} {
+			if _, ok := proxy[key]; !ok {
+				t.Errorf("proxy document is missing the lowercase key %q: %s", key, rec.Body.String())
+			}
+		}
 	}
 	return rec, doc
 }
 
 // ruleFor returns the routing rule for host.
-func ruleFor(t *testing.T, rules []RoutingRule, host string) RoutingRule {
+func ruleFor(t *testing.T, rules []policy.RoutingRule, host string) policy.RoutingRule {
 	t.Helper()
 	for _, r := range rules {
 		if r.Host == host {
@@ -97,7 +115,7 @@ func ruleFor(t *testing.T, rules []RoutingRule, host string) RoutingRule {
 		}
 	}
 	t.Fatalf("no routing rule for %q in %+v", host, rules)
-	return RoutingRule{}
+	return policy.RoutingRule{}
 }
 
 // TestRoutingContract checks the documented response: schema version, the proxy
@@ -117,11 +135,11 @@ func TestRoutingContract(t *testing.T) {
 		t.Errorf("Cache-Control = %q, want no-store so policy changes are not cached", cc)
 	}
 
-	if doc.SchemaVersion != schemaVersion {
-		t.Errorf("schemaVersion = %d, want %d", doc.SchemaVersion, schemaVersion)
+	if doc.SchemaVersion != policy.SchemaVersion {
+		t.Errorf("policy.SchemaVersion = %d, want %d", doc.SchemaVersion, policy.SchemaVersion)
 	}
-	if doc.Version != schemaVersion {
-		t.Errorf("version = %d, want %d (older clients read this field)", doc.Version, schemaVersion)
+	if doc.Version != policy.SchemaVersion {
+		t.Errorf("version = %d, want %d (older clients read this field)", doc.Version, policy.SchemaVersion)
 	}
 
 	// The proxy endpoint and the configuration endpoint are different things.
@@ -142,7 +160,7 @@ func TestRoutingContract(t *testing.T) {
 		t.Fatalf("routing.domains = %d, want %d", got, want)
 	}
 	for _, r := range doc.Routing.Domains {
-		if r.Match != matchSuffix && r.Match != matchExact {
+		if r.Match != policy.MatchSuffix && r.Match != policy.MatchExact {
 			t.Errorf("%s has unknown match mode %q", r.Host, r.Match)
 		}
 		if len(r.Ports) == 0 {
@@ -152,14 +170,14 @@ func TestRoutingContract(t *testing.T) {
 
 	// A single port is from == to; a range keeps its real boundaries.
 	discord := ruleFor(t, doc.Routing.Domains, "discord.com")
-	if discord.Match != matchSuffix {
+	if discord.Match != policy.MatchSuffix {
 		t.Errorf("discord.com match = %q, want suffix", discord.Match)
 	}
-	if len(discord.Ports) != 1 || discord.Ports[0] != (PortRange{From: 443, To: 443}) {
+	if len(discord.Ports) != 1 || discord.Ports[0] != (policy.PortRange{From: 443, To: 443}) {
 		t.Errorf("discord.com ports = %+v, want [{443 443}]", discord.Ports)
 	}
 	media := ruleFor(t, doc.Routing.Domains, "discord.media")
-	want := []PortRange{{From: 443, To: 443}, {From: 1024, To: 65535}}
+	want := []policy.PortRange{{From: 443, To: 443}, {From: 1024, To: 65535}}
 	if len(media.Ports) != len(want) {
 		t.Fatalf("discord.media ports = %+v, want %+v", media.Ports, want)
 	}
@@ -194,12 +212,12 @@ func TestRoutingMatchingSemantics(t *testing.T) {
 	srv, domainsPath, policyPath := serverWithPolicy(t, domains, ports)
 
 	_, doc := fetchNetworkConfig(t, srv)
-	if got := ruleFor(t, doc.Routing.Domains, uploads).Match; got != matchExact {
-		t.Errorf("exact entry match = %q, want %q", got, matchExact)
+	if got := ruleFor(t, doc.Routing.Domains, uploads).Match; got != policy.MatchExact {
+		t.Errorf("exact entry match = %q, want %q", got, policy.MatchExact)
 	}
 	suffix := ruleFor(t, doc.Routing.Domains, "discord.com")
-	if suffix.Match != matchSuffix {
-		t.Errorf("plain entry match = %q, want %q", suffix.Match, matchSuffix)
+	if suffix.Match != policy.MatchSuffix {
+		t.Errorf("plain entry match = %q, want %q", suffix.Match, policy.MatchSuffix)
 	}
 
 	if !suffix.Matches("discord.com") || !suffix.Matches("gateway.discord.com") {
@@ -218,11 +236,11 @@ func TestRoutingMatchingSemantics(t *testing.T) {
 		t.Error("exact rule matched a subdomain")
 	}
 
-	policy, err := LoadPolicy(domainsPath, policyPath)
+	pol, err := policy.LoadPolicy(domainsPath, policyPath)
 	if err != nil {
-		t.Fatalf("LoadPolicy: %v", err)
+		t.Fatalf("policy.LoadPolicy: %v", err)
 	}
-	acl := policy.SquidACL()
+	acl := pol.SquidACL()
 	if !strings.Contains(acl, "dstdomain "+uploads+"\n") {
 		t.Errorf("exact host is not an exact dstdomain:\n%s", acl)
 	}
@@ -234,8 +252,8 @@ func TestRoutingMatchingSemantics(t *testing.T) {
 	}
 	// Routing and ACL must agree for every host/mode pair tested above.
 	for _, host := range []string{"discord.com", "gateway.discord.com", uploads, "sub." + uploads} {
-		if policy.Allows(host, 443) != (suffix.Matches(host) || exact.Matches(host)) {
-			t.Errorf("policy.Allows(%q) disagrees with the published routing rules", host)
+		if pol.Allows(host, 443) != (suffix.Matches(host) || exact.Matches(host)) {
+			t.Errorf("pol.Allows(%q) disagrees with the published routing rules", host)
 		}
 	}
 }
@@ -247,19 +265,19 @@ func TestRoutingMatchesSquidACL(t *testing.T) {
 	ports := "discord.com 443\ndiscord.media 443,1024-65535\n=uploads.example.com 443\n"
 	_, domainsPath, policyPath := serverWithPolicy(t, domains, ports)
 
-	policy, err := LoadPolicy(domainsPath, policyPath)
+	pol, err := policy.LoadPolicy(domainsPath, policyPath)
 	if err != nil {
-		t.Fatalf("LoadPolicy: %v", err)
+		t.Fatalf("policy.LoadPolicy: %v", err)
 	}
-	rules := policy.RoutingRules()
-	acl := policy.SquidACL()
+	rules := pol.RoutingRules()
+	acl := pol.SquidACL()
 
 	if got := strings.Count(acl, "http_access allow CONNECT"); got != len(rules) {
 		t.Errorf("%d allow rules in the ACL but %d routing rules published", got, len(rules))
 	}
 	for _, r := range rules {
 		scope := r.Host
-		if r.Match == matchSuffix {
+		if r.Match == policy.MatchSuffix {
 			scope = "." + r.Host
 		}
 		if !strings.Contains(acl, "dstdomain "+scope+"\n") {
@@ -313,7 +331,7 @@ func TestRoutingTracksPolicyChanges(t *testing.T) {
 		t.Fatalf("after adding: routing rules = %d, want 2", len(added.Routing.Domains))
 	}
 	rule := ruleFor(t, added.Routing.Domains, "example.com")
-	wantPorts := []PortRange{{From: 443, To: 443}, {From: 2053, To: 2053}}
+	wantPorts := []policy.PortRange{{From: 443, To: 443}, {From: 2053, To: 2053}}
 	if len(rule.Ports) != 2 || rule.Ports[0] != wantPorts[0] || rule.Ports[1] != wantPorts[1] {
 		t.Errorf("example.com ports = %+v, want %+v", rule.Ports, wantPorts)
 	}
@@ -362,7 +380,7 @@ func TestRoutingRefusesBrokenConfiguration(t *testing.T) {
 func TestRoutingRefusesUnsupportedState(t *testing.T) {
 	srv, _, _ := serverWithPolicy(t, "discord.com\n", "discord.com 443\n")
 	state := `{"version": 99, "destinations": [{"domain": "discord.com", "ports": [443]}]}`
-	writeFile(t, srv.cfg.policyStateFile, state)
+	writeFile(t, srv.cfg.PolicyStateFile, state)
 
 	rec, _ := fetchNetworkConfig(t, srv)
 	if rec.Code != http.StatusServiceUnavailable {
@@ -373,21 +391,21 @@ func TestRoutingRefusesUnsupportedState(t *testing.T) {
 // TestProxyEndpointValidation keeps an unusable proxy URL from being published.
 func TestProxyEndpointValidation(t *testing.T) {
 	for _, raw := range []string{"https://relay.example.test:0", "https://relay.example.test:70000"} {
-		if _, err := endpointFromURL(raw); err == nil {
-			t.Errorf("endpointFromURL(%q) succeeded, want an error", raw)
+		if _, err := config.ParseEndpoint(raw); err == nil {
+			t.Errorf("config.ParseEndpoint(%q) succeeded, want an error", raw)
 		}
 	}
 
-	cfg := defaultConfig()
-	cfg.proxyURL = "https://relay.example.test:70000"
-	if err := cfg.validate(); err == nil {
+	cfg := config.Default()
+	cfg.ProxyURL = "https://relay.example.test:70000"
+	if err := cfg.Validate(); err == nil {
 		t.Error("validate() accepted a proxy URL with an invalid port")
 	}
 
 	// Even if validation were bypassed, the handler must not publish routing data
 	// with a missing proxy endpoint.
 	srv, _, _ := serverWithPolicy(t, "discord.com\n", "discord.com 443\n")
-	srv.cfg.proxyURL = "not a url"
+	srv.cfg.ProxyURL = "not a url"
 	rec, _ := fetchNetworkConfig(t, srv)
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503 for an unusable proxy URL", rec.Code)
@@ -397,9 +415,9 @@ func TestProxyEndpointValidation(t *testing.T) {
 	}
 
 	// A URL without an explicit port is the normal 443 case.
-	ep, err := endpointFromURL("https://relay.example.test")
+	ep, err := config.ParseEndpoint("https://relay.example.test")
 	if err != nil || ep.Port != 443 || ep.Scheme != "https" {
-		t.Errorf("endpointFromURL without a port = %+v, %v", ep, err)
+		t.Errorf("config.ParseEndpoint without a port = %+v, %v", ep, err)
 	}
 }
 
@@ -410,14 +428,14 @@ func TestRoutingFromAppliedState(t *testing.T) {
 	ports := "discord.com 443\n=uploads.example.com 443\n"
 	srv, domainsPath, policyPath := serverWithPolicy(t, domains, ports)
 
-	policy, err := LoadPolicy(domainsPath, policyPath)
+	pol, err := policy.LoadPolicy(domainsPath, policyPath)
 	if err != nil {
-		t.Fatalf("LoadPolicy: %v", err)
+		t.Fatalf("policy.LoadPolicy: %v", err)
 	}
 	// What -policy-apply does: render the ACL include and save the state.
-	acl := policy.SquidACL()
-	if err := SavePolicyState(srv.cfg.policyStateFile, policy); err != nil {
-		t.Fatalf("SavePolicyState: %v", err)
+	acl := pol.SquidACL()
+	if err := policy.SavePolicyState(srv.cfg.PolicyStateFile, pol); err != nil {
+		t.Fatalf("policy.SavePolicyState: %v", err)
 	}
 
 	_, doc := fetchNetworkConfig(t, srv)
@@ -426,7 +444,7 @@ func TestRoutingFromAppliedState(t *testing.T) {
 	}
 	for _, r := range doc.Routing.Domains {
 		scope := r.Host
-		if r.Match == matchSuffix {
+		if r.Match == policy.MatchSuffix {
 			scope = "." + r.Host
 		}
 		if !strings.Contains(acl, "dstdomain "+scope+"\n") {
@@ -434,7 +452,7 @@ func TestRoutingFromAppliedState(t *testing.T) {
 		}
 	}
 	// And the endpoint must not advertise anything Squid does not allow.
-	rules := policy.RoutingRules()
+	rules := pol.RoutingRules()
 	if len(rules) != strings.Count(acl, "http_access allow CONNECT") {
 		t.Errorf("published %d rules, Squid allows %d destinations", len(rules), strings.Count(acl, "http_access allow CONNECT"))
 	}

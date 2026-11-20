@@ -1,4 +1,4 @@
-package main
+package policy
 
 import (
 	"encoding/json"
@@ -197,15 +197,15 @@ func TestPolicyCachePrefersStateFile(t *testing.T) {
 	d, p := writeFiles(t, "discord.com\n", "discord.com 443\n")
 	state := filepath.Join(t.TempDir(), "policy.json")
 
-	applied := &Policy{Version: schemaVersion, Destinations: []Destination{
+	applied := &Policy{Version: SchemaVersion, Destinations: []Destination{
 		{Domain: "discord.com", Ports: []int{443}},
 	}}
 	if err := SavePolicyState(state, applied); err != nil {
 		t.Fatalf("SavePolicyState: %v", err)
 	}
-	cache := &policyCache{domainsPath: d, policyPath: p, statePath: state}
+	cache := &Cache{DomainsPath: d, PolicyPath: p, StatePath: state}
 
-	got, err := cache.get()
+	got, err := cache.Get()
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestPolicyCachePrefersStateFile(t *testing.T) {
 	if err := os.Remove(state); err != nil {
 		t.Fatalf("remove state: %v", err)
 	}
-	got, err = cache.get()
+	got, err = cache.Get()
 	if err != nil {
 		t.Fatalf("get after removing state: %v", err)
 	}

@@ -1,16 +1,18 @@
-package main
+// Package ratelimit implements the bounded token bucket used to limit API
+// requests globally and per client address.
+package ratelimit
 
 import (
 	"sync"
 	"time"
 )
 
-// limiter is a token-bucket rate limiter. A limiter with an empty key set acts as
-// a single global bucket; the per-address limiter keys buckets by client address.
+// Limiter is a token-bucket rate Limiter. A Limiter with an empty key set acts as
+// a single global bucket; the per-address Limiter keys buckets by client address.
 //
 // Memory is bounded: idle buckets are swept periodically and a hard cap on the
 // number of tracked keys is enforced.
-type limiter struct {
+type Limiter struct {
 	mu      sync.Mutex
 	buckets map[string]*bucket
 	rate    float64 // tokens added per second
@@ -27,14 +29,14 @@ type bucket struct {
 // idleTTL is how long a bucket may sit unused before it is dropped.
 const idleTTL = 10 * time.Minute
 
-func newLimiter(perMinute, burst int) *limiter {
+func New(perMinute, burst int) *Limiter {
 	if perMinute < 1 {
 		perMinute = 1
 	}
 	if burst < 1 {
 		burst = 1
 	}
-	return &limiter{
+	return &Limiter{
 		buckets: make(map[string]*bucket),
 		rate:    float64(perMinute) / 60,
 		burst:   float64(burst),
@@ -44,7 +46,7 @@ func newLimiter(perMinute, burst int) *limiter {
 
 // allow consumes one token for key. When the request is refused it also reports
 // how long the caller should wait before retrying.
-func (l *limiter) allow(key string, now time.Time) (bool, time.Duration) {
+func (l *Limiter) Allow(key string, now time.Time) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -84,7 +86,7 @@ func (l *limiter) allow(key string, now time.Time) (bool, time.Duration) {
 
 // sweep drops buckets that have been idle for a while. It runs at most once a
 // minute and must be called with l.mu held.
-func (l *limiter) sweep(now time.Time) {
+func (l *Limiter) sweep(now time.Time) {
 	if !l.lastGC.IsZero() && now.Sub(l.lastGC) < time.Minute {
 		return
 	}
@@ -97,7 +99,7 @@ func (l *limiter) sweep(now time.Time) {
 }
 
 // size reports the number of tracked keys (used by tests).
-func (l *limiter) size() int {
+func (l *Limiter) Size() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.buckets)

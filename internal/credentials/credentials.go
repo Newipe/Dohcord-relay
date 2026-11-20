@@ -1,4 +1,6 @@
-package main
+// Package credentials issues and validates the time-limited TURN REST
+// credentials described by coturn.
+package credentials
 
 import (
 	"crypto/hmac"
@@ -14,9 +16,9 @@ import (
 // authentication (turnserver.conf: rest-api-separator, default ':').
 const restSeparator = ":"
 
-// validateIdentity rejects identities that would break the "<timestamp>:<identity>"
+// ValidateIdentity rejects identities that would break the "<timestamp>:<identity>"
 // username format or the TURN username grammar.
-func validateIdentity(identity string) error {
+func ValidateIdentity(identity string) error {
 	switch {
 	case identity == "":
 		return fmt.Errorf("turn identity must not be empty")
@@ -30,14 +32,14 @@ func validateIdentity(identity string) error {
 	return nil
 }
 
-// issueCredential computes the time-limited TURN credential described by coturn:
+// Issue computes the time-limited TURN credential described by coturn:
 //
 //	temporary-username = "<unix-expiration-timestamp>" + ":" + identity
 //	temporary-password = base64(hmac-sha1(key = shared secret, input = temporary-username))
 //
 // The password is the standard base64 encoding of the raw HMAC-SHA1 digest, with
 // padding, which is what coturn itself computes for --use-auth-secret.
-func issueCredential(secret []byte, identity string, ttl time.Duration, now time.Time) (username, password string, expiresAt int64) {
+func Issue(secret []byte, identity string, ttl time.Duration, now time.Time) (username, password string, expiresAt int64) {
 	expiresAt = now.Add(ttl).Unix()
 	username = strconv.FormatInt(expiresAt, 10) + restSeparator + identity
 
@@ -47,10 +49,10 @@ func issueCredential(secret []byte, identity string, ttl time.Duration, now time
 	return username, password, expiresAt
 }
 
-// parseTURNUsername splits a REST username back into its expiration timestamp and
+// ParseUsername splits a REST username back into its expiration timestamp and
 // identity. It is used by the self-tests so a generated username can be checked
 // against the format coturn expects.
-func parseTURNUsername(username string) (expiresAt int64, identity string, err error) {
+func ParseUsername(username string) (expiresAt int64, identity string, err error) {
 	ts, id, ok := strings.Cut(username, restSeparator)
 	if !ok {
 		return 0, "", fmt.Errorf("username %q has no %q separator", username, restSeparator)
