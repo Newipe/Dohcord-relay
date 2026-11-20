@@ -178,7 +178,7 @@ HTTPS_LISTEN=127.0.0.1:9443
 TURN_URLS=turn:relay.example.test:3478
 EOF
 cat >"${TMP}/mgr/etc/install-info" <<'EOF'
-INSTALLER_VERSION=2.0.2
+INSTALLER_VERSION=1.0.0
 MODE=domain
 PUBLIC_HOST=relay.example.test
 PUBLIC_IP=203.0.113.10

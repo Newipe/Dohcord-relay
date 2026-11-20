@@ -23,7 +23,7 @@
 # valid certificate, and only rewrites files it owns.
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="2.0.2"
+readonly INSTALLER_VERSION="1.0.0"
 
 # --- Defaults ---------------------------------------------------------------
 MODE=""            # "domain" or "ip"; asked interactively when empty
@@ -1646,6 +1646,12 @@ obtain_certificate() {
 		die "certificate issuance failed; port 80 must be reachable from the internet for ${PUBLIC_HOST}"
 	fi
 	stop_acme_bootstrap
+
+	# certbot does not run its deploy hook when the existing lineage is not due
+	# for renewal. Run the hook explicitly so a reinstall publishes the current
+	# certificate, including after an earlier run stopped before this step.
+	info "publishing the certificate for ${PUBLIC_HOST} to ${TLS_DIR}"
+	"${HOOK}" || die "the deploy hook failed to install the certificate into ${TLS_DIR}"
 
 	[[ -r "${TLS_DIR}/fullchain.pem" ]] || die "the deploy hook did not install the certificate into ${TLS_DIR}"
 	if [[ "${MODE}" == "domain" ]]; then

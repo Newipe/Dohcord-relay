@@ -219,7 +219,7 @@ fi
 
 # --- management console helpers --------------------------------------------
 cat >"${TMP}/etc/install-info" <<'EOF'
-INSTALLER_VERSION=2.0.2
+INSTALLER_VERSION=1.0.0
 RELEASE_VERSION=v1.0.0
 RELEASE_ARCH=amd64
 MODE=domain
@@ -276,7 +276,7 @@ HTTPS_LISTEN=:8443
 TURN_URLS=turn:relay.example.test:3478
 EOF
 cat >"${MGR}/etc/install-info" <<'EOF'
-INSTALLER_VERSION=2.0.2
+INSTALLER_VERSION=1.0.0
 RELEASE_VERSION=v1.2.3
 RELEASE_ARCH=amd64
 MODE=domain
