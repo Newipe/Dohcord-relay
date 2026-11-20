@@ -165,23 +165,44 @@ die() {
 	exit 1
 }
 
+# repeat_char prints $2 $1 times, so rules are drawn from a width instead of a
+# hand-counted run of box characters.
+repeat_char() {
+	local n=$1 ch=$2 out=""
+	while ((n-- > 0)); do
+		out+=$ch
+	done
+	printf '%s' "${out}"
+}
+
 # print_progress draws the stage list. A stage is shown as OK only when the
 # script actually reached the next one; a failure exits before this runs, so a
 # failed installation can never print a success list.
+#
+# The box is sized from the longest stage name, so adding or renaming a step can
+# never push a border out of line: 54 is the inner width that lines the box up
+# with the banner, and a longer name widens every line together.
 print_progress() {
 	if ((step > 0)); then
 		stage_done[step - 1]=1
 	fi
-	local i
-	printf '\n  %s╭─ Installation progress ──────────────────────────────╮%s\n' "${C_CYAN}" "${C_RESET}"
+	local i name inner=54 label_width title="Installation progress" pad
+	for name in "${stage_names[@]}"; do
+		(( ${#name} + 7 > inner )) && inner=$(( ${#name} + 7 ))
+	done
+	# Inner width is " [OK] " (6) plus the padded name (label_width) plus " ".
+	label_width=$((inner - 7))
+	pad=$((inner - ${#title} - 3))
+	((pad < 1)) && pad=1
+	printf '\n  %s╭─ %s %s╮%s\n' "${C_CYAN}" "${title}" "$(repeat_char "${pad}" '─')" "${C_RESET}"
 	for i in "${!stage_names[@]}"; do
 		if [[ "${stage_done[i]:-0}" == "1" ]]; then
-			printf '  │ %s[OK]%s %-46s │\n' "${C_GREEN}" "${C_RESET}" "${stage_names[i]}"
+			printf '  │ %s[OK]%s %-*s │\n' "${C_GREEN}" "${C_RESET}" "${label_width}" "${stage_names[i]}"
 		else
-			printf '  │ %s[--]%s %-46s │\n' "${C_DIM}" "${C_RESET}" "${stage_names[i]}"
+			printf '  │ %s[--]%s %-*s │\n' "${C_DIM}" "${C_RESET}" "${label_width}" "${stage_names[i]}"
 		fi
 	done
-	printf '  %s╰──────────────────────────────────────────────────────╯%s\n' "${C_CYAN}" "${C_RESET}"
+	printf '  %s╰%s╯%s\n' "${C_CYAN}" "$(repeat_char "${inner}" '─')" "${C_RESET}"
 }
 on_error() {
 	local rc=$?
@@ -1939,7 +1960,7 @@ main() {
 	step_msg "Checking name resolution"
 	verify_dns
 
-	step_msg "Retiring an earlier Dohcord-relay service, if present"
+	step_msg "Retiring an earlier relay service, if present"
 	retire_legacy_units
 
 	step_msg "Checking the ports this relay needs"
