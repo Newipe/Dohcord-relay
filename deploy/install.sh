@@ -43,8 +43,8 @@ TOTAL_QUOTA=1200
 MAX_BPS=2000000
 BPS_CAPACITY=250000000
 PROXY_PORT=443
-# Port of the Network Configuration API. 8443 is the default; a fresh
-# interactive installation may choose another one (--api-port for automation).
+# Port of the Network Configuration API. 8443 is the default; an interactive
+# installation shows it and may choose another one (--api-port for automation).
 API_PORT=8443
 API_PORT_EXPLICIT=0
 # Port used before this run, so its firewall rule can be retired safely.
@@ -139,9 +139,9 @@ ${C_CYAN}${C_BOLD}  ╭───────────────────
     · a TURN relay on 3478/udp and 5349/tcp for voice and video
 
   plus a small HTTPS endpoint that tells Dohcord how to reach them. It
-  listens on port 8443 unless you choose another port below. Nothing on
-  this server is decrypted; the proxy forwards encrypted connections and
-  only decides where they may go.
+  listens on port 8443 by default; the settings below show the port and let
+  you change it. Nothing on this server is decrypted; the proxy forwards
+  encrypted connections and only decides where they may go.
 
   Nothing has been changed yet. The steps below are shown as they run,
   and the summary at the end lists what is reachable and how to manage it.
@@ -231,9 +231,9 @@ Service sizes:
 
 Network Configuration API:
   --api-port N             Port for the Network Configuration API (default: 8443).
-                           Fresh interactive installs ask; upgrades keep the port
-                           already configured. Use this option with --yes for
-                           automated deployments.
+                           Interactive installs always show the port and let you
+                           change it (Enter keeps the configured one). Use this
+                           option with --yes for automated deployments.
   --version VERSION        Release tag to install, for example v1.1.0
                            (default: the latest stable GitHub Release).
 
@@ -426,49 +426,23 @@ api_port_problem() {
 	return 1
 }
 
-# select_api_port settles the Network Configuration API port before anything is
-# written. Existing installations keep their port without being asked; only a
-# fresh installation prompts (or takes --api-port).
-select_api_port() {
-	local existing reason answer
-	existing="$(existing_api_port)"
-	if [[ -n "${existing}" && ${API_PORT_EXPLICIT} -eq 1 && "${API_PORT}" != "${existing}" ]]; then
-		# An explicitly requested port is an intentional change, not a prompt.
-		PREVIOUS_API_PORT="${existing}"
-		reason="$(api_port_problem "${API_PORT}")" || true
-		[[ -z "${reason}" ]] || die "--api-port ${API_PORT}: ${reason}"
-		info "changing the Network Configuration API port from ${existing} to ${API_PORT}"
-		return 0
-	fi
-	if [[ -n "${existing}" ]]; then
-		PREVIOUS_API_PORT="${existing}"
-		API_PORT="${existing}"
-		info "Network Configuration API port ${API_PORT} is already configured; keeping it"
-		return 0
-	fi
-	if [[ ${API_PORT_EXPLICIT} -eq 1 ]]; then
-		reason="$(api_port_problem "${API_PORT}")" || true
-		[[ -z "${reason}" ]] || die "--api-port ${API_PORT}: ${reason}"
-		info "Network Configuration API port: ${API_PORT}"
-		return 0
-	fi
-	if [[ ${ASSUME_YES} -eq 1 || ! -t 0 ]]; then
-		reason="$(api_port_problem "${API_PORT}")" || true
-		[[ -z "${reason}" ]] ||
-			die "the default Network Configuration API port ${API_PORT} cannot be used (${reason}); pass --api-port PORT"
-		info "Network Configuration API port: ${API_PORT} (default; --api-port changes it)"
-		return 0
-	fi
-
+# prompt_api_port asks for the Network Configuration API port, starting from the
+# value currently selected (8443 on a fresh install, the recorded port when
+# re-running over an existing installation).
+prompt_api_port() {
+	local answer reason
 	cat <<EOF
 
-  Network Configuration API
+  Network Configuration API port
 
-  Choose the port used by the Network Configuration API.
+  Dohcord fetches its configuration from this small HTTPS endpoint. Its port is
+  independent of the proxy (${PROXY_PORT}/tcp) and the TURN relay (3478/udp,
+  5349/tcp), so any free port between 1024 and 65535 works. Press Enter to keep
+  the port shown in brackets.
 
 EOF
 	while true; do
-		read -r -p "  Port [${API_PORT}]: " answer || die "cancelled"
+		read -r -p "  Network Configuration API port [${API_PORT}]: " answer || die "cancelled"
 		answer="${answer:-${API_PORT}}"
 		answer="${answer//[[:space:]]/}"
 		if reason="$(api_port_problem "${answer}")"; then
@@ -479,6 +453,43 @@ EOF
 		ok "the Network Configuration API will listen on ${API_PORT}/tcp"
 		return 0
 	done
+}
+
+# select_api_port settles the Network Configuration API port before anything is
+# written. An interactive run always shows the port and lets it be changed, with
+# the recorded port (or 8443) as the default. --api-port changes it without
+# asking, and --yes or a non-interactive run keeps whatever is configured.
+select_api_port() {
+	local existing reason
+	existing="$(existing_api_port)"
+	if [[ -n "${existing}" ]]; then
+		# Remember it so a changed port retires the old firewall rule.
+		PREVIOUS_API_PORT="${existing}"
+		# A non-explicit run starts from the recorded port; --api-port wins.
+		[[ ${API_PORT_EXPLICIT} -eq 1 ]] || API_PORT="${existing}"
+	fi
+	if [[ ${API_PORT_EXPLICIT} -eq 1 ]]; then
+		reason="$(api_port_problem "${API_PORT}")" || true
+		[[ -z "${reason}" ]] || die "--api-port ${API_PORT}: ${reason}"
+		if [[ -n "${existing}" && "${API_PORT}" != "${existing}" ]]; then
+			info "changing the Network Configuration API port from ${existing} to ${API_PORT}"
+		else
+			info "Network Configuration API port: ${API_PORT}"
+		fi
+		return 0
+	fi
+	if [[ ${ASSUME_YES} -eq 1 || ! -t 0 ]]; then
+		if [[ -n "${existing}" ]]; then
+			info "Network Configuration API port ${API_PORT} is already configured; keeping it"
+			return 0
+		fi
+		reason="$(api_port_problem "${API_PORT}")" || true
+		[[ -z "${reason}" ]] ||
+			die "the default Network Configuration API port ${API_PORT} cannot be used (${reason}); pass --api-port PORT"
+		info "Network Configuration API port: ${API_PORT} (default; --api-port changes it)"
+		return 0
+	fi
+	prompt_api_port
 }
 
 # --- Address and domain validation ------------------------------------------

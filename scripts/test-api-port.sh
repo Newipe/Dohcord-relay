@@ -85,6 +85,32 @@ else
 	bad "upgrade preserve: ${out}"
 fi
 
+# --- installer: interactive re-run shows and can change the port -------------
+if command -v script >/dev/null 2>&1; then
+	cat >"${TMP}/prompt-existing.sh" <<EOF
+set -Eeuo pipefail
+source "${TMP}/install-lib.sh"
+select_api_port
+printf 'PORT=%s PREV=%s\\n' "\${API_PORT}" "\${PREVIOUS_API_PORT}"
+EOF
+	out="$(printf '\n' | script -qec "bash '${TMP}/prompt-existing.sh'" /dev/null 2>&1 | tr -d '\r')"
+	if grep -q '^PORT=9443 PREV=9443$' <<<"${out}" &&
+		grep -q 'Network Configuration API port \[9443\]' <<<"${out}"; then
+		ok "interactive re-run asks for the port, keeping the configured one on Enter"
+	else
+		bad "interactive prompt (keep): ${out}"
+	fi
+	out="$(printf '9666\n' | script -qec "bash '${TMP}/prompt-existing.sh'" /dev/null 2>&1 | tr -d '\r')"
+	if grep -q '^PORT=9666 PREV=9443$' <<<"${out}" &&
+		grep -q 'will listen on 9666/tcp' <<<"${out}"; then
+		ok "interactive re-run can move the API to a custom port and records the old one"
+	else
+		bad "interactive prompt (change): ${out}"
+	fi
+else
+	printf 'SKIP  script(1) is required for the interactive prompt tests\n'
+fi
+
 # --- installer: explicit --api-port changes an existing install --------------
 out="$(bash -c '
 set -Eeuo pipefail

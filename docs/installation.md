@@ -98,7 +98,7 @@ downloading anything, so local changes are what gets installed.
 | `--max-bps N` | Per-session bandwidth ceiling, bytes/s (default 2000000). |
 | `--bps-capacity N` | Total relay bandwidth reservation (default 250000000). |
 | `--max-connections N` | Concurrent proxy connections per client IP (default 40). |
-| `--api-port N` | Network Configuration API port (default 8443). Fresh interactive installs ask; upgrades keep the configured port. Use this with `--yes` for automation. |
+| `--api-port N` | Network Configuration API port (default 8443). Interactive installs always show the port and let you change it (Enter keeps the configured one on a re-run). Use this with `--yes` for automation. |
 | `--version vX.Y.Z` | Release to install. Defaults to the latest stable GitHub Release. `1.1.0` is accepted and normalised to `v1.1.0`. |
 | `--skip-renew-test` | Skip the certbot renewal dry run at the end. |
 | `--skip-verify` | Skip the verification suite at the end. |
@@ -112,8 +112,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Newipe/Dohcord-relay/main/in
   --api-port 8443 --version v1.1.0 --yes
 ```
 
-Omitting `--api-port` uses `8443`; pass another free port (1024-65535) for a
-custom endpoint. The selection is asked only during a fresh interactive install.
+Omitting `--api-port` uses `8443` on a fresh install and keeps the port already
+configured when re-running over an existing installation; pass another free
+port (1024-65535) for a custom endpoint. Interactive installs always ask, with
+the current value as the default, and `--yes` or a non-interactive run keeps the
+configured port without asking.
 
 ## What the installer changes
 

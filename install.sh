@@ -79,7 +79,8 @@ it. Installer options are passed through unchanged:
   --ip ADDRESS            Public IPv4 of this relay (detected when omitted).
   --email ADDRESS         Let's Encrypt contact address (optional).
   --staging               Use the Let's Encrypt staging CA (test installs).
-  --api-port N            Network Configuration API port (default 8443).
+  --api-port N            Network Configuration API port (default 8443);
+                          interactive runs also ask, Enter keeps the current one.
   --version vX.Y.Z        Release to install (default: the latest stable one).
   --yes                   Do not ask for confirmation.
   --skip-verify           Do not run the verification suite at the end.
