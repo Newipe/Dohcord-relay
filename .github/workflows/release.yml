@@ -139,6 +139,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      # gh release create --verify-tag --generate-notes needs the repository and
+      # its tags; without a checkout it fails with "not a git repository".
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download built archives
         uses: actions/download-artifact@v4
         with:
