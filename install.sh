@@ -81,6 +81,9 @@ it. Installer options are passed through unchanged:
   --staging               Use the Let's Encrypt staging CA (test installs).
   --api-port N            Network Configuration API port (default 8443);
                           interactive runs also ask, Enter keeps the current one.
+  --max-connections N     Concurrent proxy connections per client IP (default
+                          100); interactive runs also ask, Enter keeps the
+                          current one.
   --version vX.Y.Z        Release to install (default: the latest stable one).
   --yes                   Do not ask for confirmation.
   --skip-verify           Do not run the verification suite at the end.

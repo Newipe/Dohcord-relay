@@ -81,8 +81,9 @@ That single command:
 2. downloads this repository's archive over HTTPS into a private temporary
    directory — the archive is extracted, never piped into a shell;
 3. asks how clients should reach the server (a domain name, recommended, or the
-   public IPv4 address) and, on a fresh install, the Network Configuration API
-   port (8443 by default), then shows every setting before changing anything;
+   public IPv4 address) and the Network Configuration API port (8443 by default)
+   and per-client connection limit (100 by default), then shows every setting
+   before changing anything;
 4. installs Squid, coturn and a pinned certbot, then downloads the verified
    precompiled relay binaries for this server's architecture;
 5. obtains a TLS certificate, opens the required firewall ports, installs the

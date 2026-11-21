@@ -49,7 +49,12 @@ API_PORT=8443
 API_PORT_EXPLICIT=0
 # Port used before this run, so its firewall rule can be retired safely.
 PREVIOUS_API_PORT=""
-MAX_CONN_PER_IP=40
+# Concurrent proxy connections per client IP. 100 leaves headroom for a busy
+# client (Discord opens a handful: HTTPS API, two WebSocket gateways, voice
+# signalling) while still bounding a single source. An interactive installation
+# always shows it and lets it be changed (--max-connections for automation).
+MAX_CONN_PER_IP=100
+MAX_CONN_PER_IP_EXPLICIT=0
 MAX_FDS=8192
 READ_TIMEOUT="10 minutes"
 CLIENT_LIFETIME="4 hours"
@@ -248,7 +253,10 @@ Service sizes:
   --max-bps N              Per-session bandwidth ceiling, bytes/s (default: 2000000).
   --bps-capacity N         Total relay bandwidth reservation, bytes/s
                            (default: 250000000).
-  --max-connections N      Concurrent proxy connections per client IP (default: 40).
+  --max-connections N      Concurrent proxy connections per client IP (default: 100).
+                           Interactive installs always show it and let you change
+                           it (Enter keeps the configured value). Use this option
+                           with --yes for automated deployments.
 
 Network Configuration API:
   --api-port N             Port for the Network Configuration API (default: 8443).
@@ -329,6 +337,7 @@ parse_args() {
 			;;
 		--max-connections)
 			MAX_CONN_PER_IP="${2:-}"
+			MAX_CONN_PER_IP_EXPLICIT=1
 			shift 2
 			;;
 		--api-port)
@@ -370,7 +379,7 @@ parse_args() {
 	fi
 
 	local o
-	for o in USER_QUOTA TOTAL_QUOTA MAX_BPS BPS_CAPACITY MAX_CONN_PER_IP PROXY_PORT API_PORT MAX_FDS; do
+	for o in USER_QUOTA TOTAL_QUOTA MAX_BPS BPS_CAPACITY PROXY_PORT API_PORT MAX_FDS; do
 		[[ "${!o}" =~ ^[0-9]+$ ]] || die "--${o,,} must be numeric"
 	done
 	if [[ ${API_PORT_EXPLICIT} -eq 1 ]]; then
@@ -513,6 +522,103 @@ select_api_port() {
 	prompt_api_port
 }
 
+# existing_max_connections prints the per-client connection ceiling recorded in a
+# previous installation's Squid configuration, or nothing on a fresh machine.
+existing_max_connections() {
+	local conf="${ETC_DIR}/squid.conf" value=""
+	if [[ -r "${conf}" ]]; then
+		value="$(sed -n 's/^[[:space:]]*client_ip_max_connections[[:space:]]\{1,\}\([0-9][0-9]*\)[[:space:]]*$/\1/p' "${conf}" | tail -1)"
+	fi
+	if [[ "${value}" =~ ^[0-9]{1,6}$ ]]; then
+		printf '%s' "$((10#${value}))"
+	fi
+	return 0
+}
+
+# max_connections_problem prints why VALUE cannot be the per-client connection
+# ceiling and returns 0. It returns 1 (with no output) when the value is usable.
+max_connections_problem() {
+	local value="$1" n
+	if [[ ! "${value}" =~ ^[0-9]{1,6}$ ]]; then
+		printf '%s is not a whole number of connections (1-%d)' "${value}" "${MAX_FDS}"
+		return 0
+	fi
+	n=$((10#${value}))
+	if ((n < 1)); then
+		printf '0 would let no client connect; choose at least 1'
+		return 0
+	fi
+	if ((n > MAX_FDS)); then
+		printf '%d is above the global descriptor ceiling (%d) set in the Squid configuration' "${n}" "${MAX_FDS}"
+		return 0
+	fi
+	return 1
+}
+
+# prompt_max_connections asks for the per-client connection ceiling, starting from
+# the value currently selected (100 on a fresh install, the limit recorded in
+# squid.conf when re-running over an existing installation).
+prompt_max_connections() {
+	local answer reason
+	cat <<EOF
+
+  Concurrent connections per client
+
+  This caps how many proxy connections one client IP may hold at the same time.
+  Discord opens a few per client (HTTPS API, two WebSocket gateways, voice
+  signalling) and more windows or accounts need more, so the limit is generous
+  by default instead of tight. Press Enter to keep the value in brackets.
+
+EOF
+	while true; do
+		read -r -p "  Concurrent connections per client [${MAX_CONN_PER_IP}]: " answer || die "cancelled"
+		answer="${answer:-${MAX_CONN_PER_IP}}"
+		answer="${answer//[[:space:]]/}"
+		if reason="$(max_connections_problem "${answer}")"; then
+			warn "${reason}"
+			continue
+		fi
+		MAX_CONN_PER_IP="${answer}"
+		ok "each client IP may hold ${MAX_CONN_PER_IP} concurrent proxy connections"
+		return 0
+	done
+}
+
+# select_max_connections settles the per-client connection ceiling before
+# anything is written. An interactive run always shows it and lets it be changed,
+# with the limit already in squid.conf (or 100) as the default. --max-connections
+# changes it without asking, and --yes or a non-interactive run keeps whatever is
+# configured.
+select_max_connections() {
+	local existing reason
+	existing="$(existing_max_connections)"
+	if [[ ${MAX_CONN_PER_IP_EXPLICIT} -eq 0 && -n "${existing}" ]]; then
+		MAX_CONN_PER_IP="${existing}"
+	fi
+	if [[ ${MAX_CONN_PER_IP_EXPLICIT} -eq 1 ]]; then
+		reason="$(max_connections_problem "${MAX_CONN_PER_IP}")" || true
+		[[ -z "${reason}" ]] || die "--max-connections ${MAX_CONN_PER_IP}: ${reason}"
+		if [[ -n "${existing}" && "${MAX_CONN_PER_IP}" != "${existing}" ]]; then
+			info "changing the per-client connection limit from ${existing} to ${MAX_CONN_PER_IP}"
+		else
+			info "per-client connection limit: ${MAX_CONN_PER_IP}"
+		fi
+		return 0
+	fi
+	if [[ ${ASSUME_YES} -eq 1 || ! -t 0 ]]; then
+		reason="$(max_connections_problem "${MAX_CONN_PER_IP}")" || true
+		[[ -z "${reason}" ]] ||
+			die "the per-client connection limit ${MAX_CONN_PER_IP} cannot be used (${reason}); pass --max-connections N"
+		if [[ -n "${existing}" ]]; then
+			info "per-client connection limit ${MAX_CONN_PER_IP} is already configured; keeping it"
+		else
+			info "per-client connection limit: ${MAX_CONN_PER_IP} (default; --max-connections changes it)"
+		fi
+		return 0
+	fi
+	prompt_max_connections
+}
+
 # --- Address and domain validation ------------------------------------------
 # is_public_ipv4 accepts only globally routable, unicast IPv4 addresses. Every
 # special-purpose range from the IANA registry that must never be advertised as
@@ -648,6 +754,9 @@ EOF
 
 	# Upgrades keep the recorded port; fresh installations choose one here.
 	select_api_port
+	# The per-client connection ceiling is asked in the same place, so every
+	# setting a user may want to change is settled before anything is written.
+	select_max_connections
 
 	cat <<EOF
 
@@ -657,6 +766,7 @@ EOF
     mode             ${MODE}
     HTTPS proxy      https://${PUBLIC_HOST}:${PROXY_PORT}
     network config   https://${PUBLIC_HOST}:${API_PORT}/network-config
+    per-client limit ${MAX_CONN_PER_IP} proxy connections
     TURN (UDP)       turn:${PUBLIC_HOST}:3478?transport=udp
     TURN (TLS)       turns:${PUBLIC_HOST}:5349?transport=tcp
 

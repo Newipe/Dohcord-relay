@@ -118,7 +118,7 @@ rotate it, see [../README.md#security](../README.md#security) and
 
 | Goal | Change |
 |---|---|
-| More concurrent connections per client | `--max-connections N` (default 40) |
+| More concurrent connections per client | `--max-connections N` (default 100; asked during install) |
 | More concurrent TURN allocations | `--total-quota N`, `--user-quota N` |
 | More bandwidth | `--max-bps N`, `--bps-capacity N` |
 | Longer credential lifetime | `CREDENTIAL_TTL` in `config.env`, then reload the API |

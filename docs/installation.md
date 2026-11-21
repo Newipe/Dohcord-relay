@@ -97,7 +97,7 @@ downloading anything, so local changes are what gets installed.
 | `--total-quota N` | Allocations for the relay (default 1200). |
 | `--max-bps N` | Per-session bandwidth ceiling, bytes/s (default 2000000). |
 | `--bps-capacity N` | Total relay bandwidth reservation (default 250000000). |
-| `--max-connections N` | Concurrent proxy connections per client IP (default 40). |
+| `--max-connections N` | Concurrent proxy connections per client IP (default 100). Interactive installs always show it and let you change it (Enter keeps the configured value on a re-run). Use this with `--yes` for automation. |
 | `--api-port N` | Network Configuration API port (default 8443). Interactive installs always show the port and let you change it (Enter keeps the configured one on a re-run). Use this with `--yes` for automation. |
 | `--version vX.Y.Z` | Release to install. Defaults to the latest stable GitHub Release. `1.1.0` is accepted and normalised to `v1.1.0`. |
 | `--skip-renew-test` | Skip the certbot renewal dry run at the end. |
@@ -117,6 +117,11 @@ configured when re-running over an existing installation; pass another free
 port (1024-65535) for a custom endpoint. Interactive installs always ask, with
 the current value as the default, and `--yes` or a non-interactive run keeps the
 configured port without asking.
+
+Omitting `--max-connections` uses `100` on a fresh install and keeps the limit
+recorded in `/etc/dohcord-relay/squid.conf` when re-running. Interactive
+installs always ask for it too, with the current value as the default, so the
+per-client connection ceiling can be changed without editing the template.
 
 ## What the installer changes
 

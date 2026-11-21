@@ -55,7 +55,7 @@ network by controlling DNS.
 
 | Limit | Purpose |
 |---|---|
-| `client_ip_max_connections` (default 40) | One client cannot exhaust the proxy |
+| `client_ip_max_connections` (default 100, asked during install) | One client cannot exhaust the proxy |
 | `client_lifetime` (4 h) | Stale tunnels are reaped |
 | `read_timeout`, header limits | Slowloris-style abuse |
 | `LimitNOFILE`, descriptor ceiling | Global bound |

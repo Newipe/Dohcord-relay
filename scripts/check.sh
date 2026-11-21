@@ -23,6 +23,7 @@ fi
 bash -n install.sh uninstall.sh deploy/install.sh deploy/scripts/*.sh scripts/*.sh || fail=1
 
 bash scripts/test-api-port.sh || fail=1
+bash scripts/test-max-connections.sh || fail=1
 bash scripts/test-release.sh || fail=1
 
 if command -v shellcheck >/dev/null 2>&1; then
