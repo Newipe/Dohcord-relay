@@ -120,7 +120,15 @@ type Cache struct {
 	StatePath   string
 
 	mu  sync.Mutex
-	cur atomic.Pointer[cacheEntry]
+	cur atomic.Value // *cacheEntry; interface-based so the code still builds with Go 1.18
+}
+
+// current returns the cached entry, or nil when nothing has been cached yet.
+func (c *Cache) current() *cacheEntry {
+	if v := c.cur.Load(); v != nil {
+		return v.(*cacheEntry)
+	}
+	return nil
 }
 
 type cacheEntry struct {
@@ -156,7 +164,7 @@ func (c *Cache) sourceKey() fileKey {
 
 func (c *Cache) Get() (*Policy, error) {
 	stateKey := statKey(c.StatePath)
-	if e := c.cur.Load(); e != nil && e.stateKey == stateKey {
+	if e := c.current(); e != nil && e.stateKey == stateKey {
 		// With a state file its timestamp alone decides: the source files only
 		// matter while no policy has been applied yet.
 		if stateKey.exists || e.sourceKey == c.sourceKey() {
@@ -171,7 +179,7 @@ func (c *Cache) refresh(stateKey fileKey) (*Policy, error) {
 	defer c.mu.Unlock()
 
 	// Another request may have refreshed while this one waited for the lock.
-	if e := c.cur.Load(); e != nil && e.stateKey == stateKey {
+	if e := c.current(); e != nil && e.stateKey == stateKey {
 		src := c.sourceKey()
 		if stateKey.exists || e.sourceKey == src {
 			return e.policy, nil

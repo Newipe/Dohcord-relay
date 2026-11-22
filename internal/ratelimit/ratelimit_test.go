@@ -28,7 +28,7 @@ func TestLimiterRefills(t *testing.T) {
 func TestLimiterConcurrentBurstIsExact(t *testing.T) {
 	l := New(60, 100)
 	now := time.Unix(0, 0)
-	var allowed atomic.Int32
+	var allowed int32
 	var wg sync.WaitGroup
 	start := make(chan struct{})
 	for i := 0; i < 400; i++ {
@@ -41,13 +41,13 @@ func TestLimiterConcurrentBurstIsExact(t *testing.T) {
 				key = "203.0.113.10"
 			}
 			if ok, _ := l.Allow(key, now); ok {
-				allowed.Add(1)
+				atomic.AddInt32(&allowed, 1)
 			}
 		}(i)
 	}
 	close(start)
 	wg.Wait()
-	if got := allowed.Load(); got != 200 {
+	if got := atomic.LoadInt32(&allowed); got != 200 {
 		t.Fatalf("allowed = %d, want 200 (100 per address, two addresses)", got)
 	}
 }

@@ -34,7 +34,7 @@ func TestSimultaneousProfileLoadsFromOneAddress(t *testing.T) {
 
 	const loads = 25
 	var wg sync.WaitGroup
-	var limited atomic.Int32
+	var limited int32
 	start := make(chan struct{})
 	for i := 0; i < loads; i++ {
 		wg.Add(1)
@@ -43,7 +43,7 @@ func TestSimultaneousProfileLoadsFromOneAddress(t *testing.T) {
 			<-start
 			if code := profileLoad(srv, "198.51.100.20:4000"); code != http.StatusOK {
 				if code == http.StatusTooManyRequests {
-					limited.Add(1)
+					atomic.AddInt32(&limited, 1)
 					return
 				}
 				t.Errorf("status = %d, want 200", code)
@@ -53,7 +53,7 @@ func TestSimultaneousProfileLoadsFromOneAddress(t *testing.T) {
 	close(start)
 	wg.Wait()
 
-	if n := limited.Load(); n != 0 {
+	if n := atomic.LoadInt32(&limited); n != 0 {
 		t.Fatalf("%d of %d simultaneous profile loads were rate limited; the default burst must cover them", n, loads)
 	}
 }

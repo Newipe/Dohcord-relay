@@ -46,12 +46,12 @@ type Server struct {
 	// proxy caches the parsed form of HTTPS_PROXY_URL. The endpoint does not
 	// change while the process runs, so every profile load reuses it; the raw
 	// string is compared so a replaced value is still parsed (and rejected).
-	proxy atomic.Pointer[proxyEndpoint]
+	proxy atomic.Value // *proxyEndpoint; interface-based so the code still builds with Go 1.18
 
 	// snapshot holds the JSON encoding of the policy-derived parts of the
 	// document, rebuilt only when the policy itself changes. Two profile loads
 	// that see the same policy share it without locking.
-	snapshot atomic.Pointer[policySnapshot]
+	snapshot atomic.Value // *policySnapshot
 
 	// Encoded once: the document's static fields. Writing them directly avoids
 	// re-encoding (and re-compacting) kilobytes on every profile load.
@@ -72,7 +72,7 @@ type proxyEndpoint struct {
 // endpoint returns the published proxy descriptor, parsing HTTPS_PROXY_URL only
 // when it is not the value already parsed.
 func (s *Server) endpoint() (config.Endpoint, bool) {
-	if cached := s.proxy.Load(); cached != nil && cached.raw == s.cfg.ProxyURL {
+	if cached, _ := s.proxy.Load().(*proxyEndpoint); cached != nil && cached.raw == s.cfg.ProxyURL {
 		return cached.desc, true
 	}
 	desc, err := config.ParseEndpoint(s.cfg.ProxyURL)
@@ -166,7 +166,7 @@ func (s *Server) writeNetworkConfig(w http.ResponseWriter, snap *policySnapshot,
 // snapshotFor returns the encoded policy fragments for pol, rebuilding them only
 // when the cache handed back a different policy.
 func (s *Server) snapshotFor(pol *policy.Policy) (*policySnapshot, error) {
-	if snap := s.snapshot.Load(); snap != nil && snap.policy == pol {
+	if snap, _ := s.snapshot.Load().(*policySnapshot); snap != nil && snap.policy == pol {
 		return snap, nil
 	}
 	destinations, err := json.Marshal(pol.Destinations)
