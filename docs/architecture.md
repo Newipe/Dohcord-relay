@@ -99,6 +99,9 @@ client IP --(relay ports)--> ingress mirror --> IFB --> HTB (upload)
 
 `dohcord-relay-tc` (a small systemd service, no packet-path component) refreshes
 the class table from live connections and is the only thing that touches
-traffic-control state. Proxy and TURN are classified by port, so their allowances
+traffic-control state. The refresh is built to stay cheap under load: one socket
+scan per service (shared by both directions), parsing in `awk` rather than a
+shell loop over every socket, and an address that appears only adds its own rules
+instead of rebuilding the whole filter chain. Proxy and TURN are classified by port, so their allowances
 are independent, and the API's control traffic is never shaped. See
 [configuration.md](configuration.md#per-client-ip-bandwidth-limits).

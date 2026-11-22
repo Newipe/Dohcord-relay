@@ -24,7 +24,10 @@
 # Linux tc cannot key a shaper by "any source address": HTB has no per-IP hash
 # table. This script therefore refreshes its class table from the connections that
 # actually exist (ss), every few seconds, from a small systemd service. The
-# consequences are stated plainly:
+# refresh is deliberately cheap: the socket table is read once per service (not
+# once per direction) and parsed by awk, so the shell never walks it line by line,
+# and an address that appears only adds its own rules instead of rebuilding the
+# whole filter chain. The consequences are stated plainly:
 #
 #   * every service also has one fallback class, at exactly the per-IP rate, that
 #     carries its traffic when the client address has no class yet. A limit is
@@ -62,6 +65,11 @@ TC_REFRESH_SECONDS=5
 
 IFACE=""
 IFB="dohcord-ifb"
+# How often the TURN socket table is read. A UDP socket dump has to walk every
+# relay socket coturn holds (thousands on a busy relay), so it is the one part of
+# a refresh whose cost grows with load; in between scans the previous list is
+# reused and the fallback class keeps the limit in force.
+readonly TURN_SCAN_SECONDS=30
 readonly EGRESS_HANDLE=1
 readonly INGRESS_HANDLE=2
 readonly DEFAULT_CLASS=999
@@ -82,6 +90,8 @@ VERBOSE=0
 ONCE=0
 COMMAND=""
 FILTERS_READY=0
+declare -A DISCOVER_AT=()
+declare -A DISCOVER_LIST=()
 
 # --- Output -----------------------------------------------------------------
 if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
@@ -292,6 +302,7 @@ ensure_state_dir() {
 declare -A ALLOC_MINOR=() # "dir|service|ip" -> minor
 declare -A ALLOC_SEEN=()  # "dir|service|ip" -> last seen
 declare -A USED_MINOR=()  # "dir|minor" -> "service|ip"
+declare -A TRACKED=()     # dir -> number of tracked addresses
 
 load_state() {
 	local file dir service minor ip seen
@@ -302,6 +313,7 @@ load_state() {
 		ALLOC_MINOR["${dir}|${service}|${ip}"]="${minor}"
 		ALLOC_SEEN["${dir}|${service}|${ip}"]="${seen:-0}"
 		USED_MINOR["${dir}|${minor}"]="${service}|${ip}"
+		TRACKED["${dir}"]=$((${TRACKED["${dir}"]:-0} + 1))
 	done <"${file}"
 }
 
@@ -318,13 +330,14 @@ save_state() {
 	mv "${tmp}" "${file}"
 }
 
-# next_minor allocates the lowest free class id for direction DIR.
+# next_minor allocates the lowest free class id for direction DIR and leaves it
+# in NEXT_MINOR.
 next_minor() {
 	local dir="$1" n
 	for ((n = 1; n <= MINOR_MAX; n++)); do
 		((n == DEFAULT_CLASS || n == HOLD_MINOR_PROXY || n == HOLD_MINOR_TURN)) && continue
 		[[ -z "${USED_MINOR["${dir}|${n}"]:-}" ]] || continue
-		printf '%s' "${n}"
+		NEXT_MINOR="${n}"
 		return 0
 	done
 	return 1
@@ -380,12 +393,15 @@ service_ports() {
 	esac
 }
 
-class_rate() {
+# rate_of SERVICE DIR sets CRATE to the configured limit. It is a function that
+# leaves its answer in a variable instead of printing it, because the refresh runs
+# in a loop and a command substitution would fork a subshell for every lookup.
+rate_of() {
 	case "$1:$2" in
-	proxy:upload) printf '%s' "${PROXY_UPLOAD_LIMIT_MBIT}" ;;
-	proxy:download) printf '%s' "${PROXY_DOWNLOAD_LIMIT_MBIT}" ;;
-	turn:upload) printf '%s' "${TURN_UPLOAD_LIMIT_MBIT}" ;;
-	turn:download) printf '%s' "${TURN_DOWNLOAD_LIMIT_MBIT}" ;;
+	proxy:upload) CRATE="${PROXY_UPLOAD_LIMIT_MBIT}" ;;
+	proxy:download) CRATE="${PROXY_DOWNLOAD_LIMIT_MBIT}" ;;
+	turn:upload) CRATE="${TURN_UPLOAD_LIMIT_MBIT}" ;;
+	turn:download) CRATE="${TURN_DOWNLOAD_LIMIT_MBIT}" ;;
 	esac
 }
 
@@ -393,7 +409,8 @@ class_rate() {
 shaping_directions() {
 	local dir out=""
 	for dir in upload download; do
-		if (($(class_rate "$1" "${dir}") > 0)); then
+		rate_of "$1" "${dir}"
+		if ((CRATE > 0)); then
 			out+="${dir} "
 		fi
 	done
@@ -404,8 +421,8 @@ all_limits_disabled() {
 	[[ -z "$(shaping_directions proxy)$(shaping_directions turn)" ]]
 }
 
-any_upload() { (($(class_rate proxy upload) + $(class_rate turn upload) > 0)); }
-any_download() { (($(class_rate proxy download) + $(class_rate turn download) > 0)); }
+any_upload() { ((${PROXY_UPLOAD_LIMIT_MBIT} + ${TURN_UPLOAD_LIMIT_MBIT} > 0)); }
+any_download() { ((${PROXY_DOWNLOAD_LIMIT_MBIT} + ${TURN_DOWNLOAD_LIMIT_MBIT} > 0)); }
 any_limits() { any_upload || any_download; }
 
 # hold_minor SERVICE is the reserved class id that carries that service's
@@ -457,7 +474,8 @@ ensure_device() {
 	# instead of after the next refresh.
 	local service rate
 	for service in proxy turn; do
-		rate="$(class_rate "${service}" download)"
+		rate_of "${service}" download
+		rate="${CRATE}"
 		((rate > 0)) || continue
 		add_class download "${service}" "$(hold_minor "${service}")" "${rate}"
 	done
@@ -483,7 +501,8 @@ ensure_device() {
 			htb rate "${link}mbit" ceil "${link}mbit"
 
 		for service in proxy turn; do
-			rate="$(class_rate "${service}" upload)"
+			rate_of "${service}" upload
+			rate="${CRATE}"
 			((rate > 0)) || continue
 			add_class upload "${service}" "$(hold_minor "${service}")" "${rate}"
 		done
@@ -496,7 +515,8 @@ ensure_device() {
 			tc filter del dev "${IFACE}" parent ffff: 2>/dev/null || true
 		fi
 		for service in proxy turn; do
-			rate="$(class_rate "${service}" upload)"
+			rate_of "${service}" upload
+			rate="${CRATE}"
 			((rate > 0)) || continue
 			add_ingress_mirror "${service}"
 		done
@@ -638,59 +658,72 @@ add_hold_filters() {
 }
 
 # --- Client discovery -------------------------------------------------------
-# peer_ip extracts the address from an ss endpoint ("1.2.3.4:5678",
-# "[2001:db8::1]:443", "1.2.3.4%eth0:5678").
-peer_ip() {
-	local value="$1"
-	case "${value}" in
-	\[*\]:*) value="${value#[}"; value="${value%%]*}" ;;
-	*) value="${value%:*}" ;;
-	esac
-	value="${value%%\%*}"
-	printf '%s' "${value}"
-}
-
-# discover_clients SERVICE DIR prints the client addresses currently using it.
-# No packet contents are read; only socket endpoints.
+# The socket table is parsed by awk and only the client addresses reach the
+# shell. Walking every line in bash instead forked a subshell per socket, which
+# is what made a refresh on a busy relay expensive.
+#
+# discover_clients SERVICE prints the distinct client addresses using it. No
+# packet contents are read; only socket endpoints. It runs once per service per
+# refresh (both directions use the same list).
 discover_clients() {
-	local service="$1" ip line lport peer
+	local service="$1"
 	if [[ -n "${DOHCORD_RELAY_TC_FAKE_CLIENTS:-}" ]]; then
 		# Test hook: a comma separated list stands in for live connections.
 		printf '%s\n' "${DOHCORD_RELAY_TC_FAKE_CLIENTS}" | tr ',' '\n'
 		return 0
 	fi
 
-	local -A seen=()
-
 	if [[ "${service}" == "proxy" ]]; then
-		while read -r line; do
-			ip="$(peer_ip "${line##* }")"
-			[[ "${ip}" =~ ^[0-9a-fA-F:.]+$ ]] || continue
-			[[ -n "${seen["${ip}"]:-}" ]] && continue
-			seen["${ip}"]=1
-			printf '%s\n' "${ip}"
-		done < <(ss -Htn state established "( sport = :${PROXY_PORT} )" 2>/dev/null || true)
+		ss -Htn state established "( sport = :${PROXY_PORT} )" 2>/dev/null |
+			awk '
+			{
+				ip = $5
+				sub(/:[^:]*$/, "", ip)
+				gsub(/^\[|\]$/, "", ip)
+				sub(/%.*$/, "", ip)
+				if (ip == "" || ip in seen) next
+				seen[ip] = 1
+				print ip
+			}'
 		return 0
 	fi
 
-	while read -r lport peer; do
-		lport="${lport##*:}"
-		[[ "${lport}" =~ ^[0-9]+$ ]] || continue
-		local local_port=$((10#${lport})) relevant=0 p
-		for p in "${TURN_PORTS[@]}"; do
-			((local_port == p)) && relevant=1
-		done
-		if ((RELAY_RANGE && local_port >= RELAY_MIN && local_port <= RELAY_MAX)); then
-			relevant=1
-		fi
-		((relevant)) || continue
-		ip="$(peer_ip "${peer}")"
-		[[ "${ip}" =~ ^[0-9a-fA-F:.]+$ ]] || continue
-		[[ "${ip}" == "0.0.0.0" || "${ip}" == "*" || "${ip}" == "::" ]] && continue
-		[[ -n "${seen["${ip}"]:-}" ]] && continue
-		seen["${ip}"]=1
-		printf '%s\n' "${ip}"
-	done < <(ss -Huan 2>/dev/null | awk '{print $4, $5}')
+	ss -Huan 2>/dev/null |
+		awk -v p1="${TURN_PORTS[0]}" -v p2="${TURN_PORTS[1]}" \
+			-v relay="${RELAY_RANGE}" -v lo="${RELAY_MIN}" -v hi="${RELAY_MAX}" '
+		{
+			lport = $4
+			sub(/^.*:/, "", lport)
+			if (lport !~ /^[0-9]+$/) next
+			if (!(lport == p1 || lport == p2 || (relay && lport + 0 >= lo && lport + 0 <= hi))) next
+			ip = $5
+			sub(/:[^:]*$/, "", ip)
+			gsub(/^\[|\]$/, "", ip)
+			sub(/%.*$/, "", ip)
+			if (ip == "" || ip in seen) next
+			if (ip == "0.0.0.0" || ip == "*" || ip == "::") next
+			seen[ip] = 1
+			print ip
+		}'
+}
+
+# clients_for SERVICE NOW sets CLIENTS_OUT to that service's client addresses.
+# The proxy table is read on every refresh (its filtered scan is a few
+# milliseconds); the TURN table is read at most every TURN_SCAN_SECONDS. The
+# answer is left in a variable rather than printed, so the scan times are
+# remembered by the long-running process and not by a throwaway subshell.
+clients_for() {
+	local service="$1" now="$2" last
+	if [[ -n "${DOHCORD_RELAY_TC_FAKE_CLIENTS:-}" ]]; then
+		CLIENTS_OUT="$(discover_clients "${service}")"
+		return 0
+	fi
+	last="${DISCOVER_AT["${service}"]:-}"
+	if [[ "${service}" == "proxy" ]] || [[ -z "${last}" ]] || ((last + TURN_SCAN_SECONDS <= now)); then
+		DISCOVER_LIST["${service}"]="$(discover_clients "${service}")"
+		DISCOVER_AT["${service}"]="${now}"
+	fi
+	CLIENTS_OUT="${DISCOVER_LIST["${service}"]:-}"
 }
 
 # --- Apply and refresh ------------------------------------------------------
@@ -700,13 +733,27 @@ apply_rules() {
 }
 
 refresh_rules() {
-	local now key dir service ip minor rate rebuild=0 k
-	now="$(date +%s)"
+	local now="${EPOCHSECONDS:-0}"
+	((now > 0)) || now="$(date +%s)"
+	local key dir service ip minor rate clients wanted seen_any
+	local changed=0 rebuild=0
 	local -A current=()
 
 	for service in proxy turn; do
+		# One socket scan per service: the two directions shape the same
+		# client addresses.
+		wanted=0
 		for dir in upload download; do
-			rate="$(class_rate "${service}" "${dir}")"
+			rate_of "${service}" "${dir}"
+			((CRATE > 0)) && wanted=1
+		done
+		((wanted)) || continue
+		clients_for "${service}" "${now}"
+		clients="${CLIENTS_OUT}"
+
+		for dir in upload download; do
+			rate_of "${service}" "${dir}"
+			rate="${CRATE}"
 			((rate > 0)) || continue
 
 			while read -r ip; do
@@ -716,55 +763,62 @@ refresh_rules() {
 
 				if [[ -z "${ALLOC_MINOR["${key}"]:-}" ]]; then
 					# A new address is only tracked while the table has room.
-					local tracked=0
-					for k in "${!ALLOC_MINOR[@]}"; do
-						[[ "${k%%|*}" == "${dir}" ]] && tracked=$((tracked + 1))
-					done
-					if ((tracked >= TC_MAX_CLIENTS)); then
+					if ((${TRACKED["${dir}"]:-0} >= TC_MAX_CLIENTS)); then
 						warn "${service} ${dir}: ${TC_MAX_CLIENTS} client addresses are already tracked; ${ip} is not limited. Raise TC_MAX_CLIENTS or reduce the number of active addresses."
 						continue
 					fi
-					minor="$(next_minor "${dir}")" || {
+					if ! next_minor "${dir}"; then
 						warn "no free class left for ${service} ${dir}; ${ip} is not limited"
 						continue
-					}
+					fi
+					minor="${NEXT_MINOR}"
 					ALLOC_MINOR["${key}"]="${minor}"
 					USED_MINOR["${dir}|${minor}"]="${service}|${ip}"
+					TRACKED["${dir}"]=$((${TRACKED["${dir}"]:-0} + 1))
 					add_class "${dir}" "${service}" "${minor}" "${rate}"
-					rebuild=1
+					# An address that appears only gets its own rules; the filter
+					# chain is not rebuilt for it.
+					if ((FILTERS_READY)); then
+						add_filters "${dir}" "${service}" "${minor}" "${ip}"
+					fi
+					changed=1
 				fi
 				current["${key}"]=1
 				ALLOC_SEEN["${key}"]="${now}"
-			done < <(discover_clients "${service}" "${dir}")
+			done <<<"${clients}"
 		done
 	done
 
-	# Forget addresses that have been gone longer than TC_IDLE_SECONDS.
+	# Forget addresses that have been gone longer than TC_IDLE_SECONDS. Their
+	# filters cannot be removed one by one reliably, so a removal rebuilds the
+	# chain once; that is rare compared with addresses appearing.
 	for key in "${!ALLOC_MINOR[@]}"; do
 		[[ -n "${current["${key}"]:-}" ]] && continue
 		IFS='|' read -r dir service ip <<<"${key}"
 		minor="${ALLOC_MINOR["${key}"]}"
-		local last_seen="${ALLOC_SEEN["${key}"]:-0}"
-		((now - last_seen < TC_IDLE_SECONDS)) && continue
+		seen_any="${ALLOC_SEEN["${key}"]:-0}"
+		((now - seen_any < TC_IDLE_SECONDS)) && continue
 		if [[ "${dir}" == "download" ]]; then
 			run_tc_try class del dev "${IFACE}" classid "${EGRESS_HANDLE}:${minor}"
 		else
 			run_tc_try class del dev "${IFB}" classid "${INGRESS_HANDLE}:${minor}"
 		fi
 		unset "ALLOC_MINOR[${key}]" "ALLOC_SEEN[${key}]" "USED_MINOR[\"${dir}|${minor}\"]"
+		TRACKED["${dir}"]=$((${TRACKED["${dir}"]:-1} - 1))
+		changed=1
 		rebuild=1
 	done
 
-	# Filters are cheap and fully derived from the class table: rebuild them
-	# whenever that table changed, or the first time this process runs. That
-	# keeps a restarted service from stacking duplicate filters.
+	# Filters are fully derived from the class table: rebuild them after a
+	# removal or the first time this process runs (which also clears duplicates
+	# left by an earlier run). Additions were installed as they happened.
 	if ((rebuild || !FILTERS_READY)); then
 		reset_filters
-		local hold_service hold_dir hold_rate
+		local hold_service hold_dir
 		for hold_service in proxy turn; do
 			for hold_dir in upload download; do
-				hold_rate="$(class_rate "${hold_service}" "${hold_dir}")"
-				((hold_rate > 0)) || continue
+				rate_of "${hold_service}" "${hold_dir}"
+				((CRATE > 0)) || continue
 				add_hold_filters "${hold_dir}" "${hold_service}"
 			done
 		done
@@ -773,6 +827,9 @@ refresh_rules() {
 			add_filters "${dir}" "${service}" "${ALLOC_MINOR["${key}"]}" "${ip}"
 		done
 		FILTERS_READY=1
+		changed=1
+	fi
+	if ((changed)); then
 		save_state
 	fi
 	return 0
@@ -870,7 +927,8 @@ status() {
 	local service dir rate minor line classid classes filters parent active_rate
 	for service in proxy turn; do
 		for dir in upload download; do
-			rate="$(class_rate "${service}" "${dir}")"
+			rate_of "${service}" "${dir}"
+			rate="${CRATE}"
 			((rate > 0)) || continue
 			minor="$(hold_minor "${service}")"
 			if [[ "${dir}" == "download" ]]; then
@@ -906,7 +964,8 @@ status() {
 	local -A reported=()
 	for key in "${!ALLOC_MINOR[@]}"; do
 		IFS='|' read -r dir service ip <<<"${key}"
-		rate="$(class_rate "${service}" "${dir}")"
+		rate_of "${service}" "${dir}"
+		rate="${CRATE}"
 		((rate > 0)) || continue
 		minor="${ALLOC_MINOR[${key}]}"
 		if [[ "${dir}" == "download" ]]; then

@@ -380,6 +380,55 @@ else
 	bad "stop restore: ${out}"
 fi
 
+# --- 8c. traffic shaping: the refresh stays cheap ----------------------------
+# The refresh used to fork a subshell for every socket line and rebuild the whole
+# filter chain whenever the address table changed, which cost seconds on a relay
+# with a few thousand sockets. It now reads one socket table per service, parses
+# it in awk, and touches only the rules of addresses that appeared.
+mkdir -p "${TMP}/fakess"
+cat >"${TMP}/fakess/ss" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FAKE_SS_LOG}"
+case "$*" in
+*-Htn*)
+	printf 'ESTAB 0 0 10.0.0.1:443 198.51.100.7:51234\n'
+	printf 'ESTAB 0 0 10.0.0.1:443 198.51.100.7:51235\n'
+	printf 'ESTAB 0 0 10.0.0.1:443 198.51.100.9:40000\n'
+	;;
+*-Huan*)
+	printf 'UNCONN 0 0 0.0.0.0:3478 0.0.0.0:*\n'
+	printf 'ESTAB 0 0 10.0.0.1:49160 198.51.100.8:5555\n'
+	printf 'UNCONN 0 0 10.0.0.1:42111 203.0.113.77:9999\n'
+	;;
+esac
+EOF
+chmod +x "${TMP}/fakess/ss"
+: >"${TMP}/ss.log"
+out="$(PATH="${TMP}/fakess:${PATH}" FAKE_SS_LOG="${TMP}/ss.log" \
+	DOHCORD_RELAY_TC_STATE="${TMP}/tcstate-scan" \
+	bash "${TC}" refresh --dry-run --interface eth0 --config "${TMP}/tc.env" 2>&1)"
+scans="$(wc -l <"${TMP}/ss.log")"
+if [[ "${scans}" == "2" ]]; then
+	ok "one socket scan per service per refresh (both directions share it)"
+else
+	bad "socket scans per refresh: ${scans}"
+fi
+
+if grep -q 'match ip dst 198.51.100.7/32 match ip sport 443 0xffff flowid 1:' <<<"${out}" &&
+	grep -q 'match ip src 198.51.100.7/32 match ip dport 443 0xffff flowid 2:' <<<"${out}" &&
+	grep -q 'match ip dst 198.51.100.8/32 match ip sport 0xc000 0xc000 flowid 1:' <<<"${out}" &&
+	[[ "$(grep -c 'match ip dst 198.51.100.7/32' <<<"${out}")" == "1" ]]; then
+	ok "the socket scan is parsed into per-client classes, with duplicates removed"
+else
+	bad "scan parsing: ${out}"
+fi
+
+if ! grep -q '203.0.113.77' <<<"${out}" && ! grep -q 'match ip dst 0.0.0.0' <<<"${out}"; then
+	ok "sockets outside the relay ports and wildcard peers are ignored"
+else
+	bad "scan filtering: ${out}"
+fi
+
 # --- 9. traffic shaping: validation -----------------------------------------
 for value in abc -1 100001 1.5; do
 	sed -e "s/^PROXY_UPLOAD_LIMIT_MBIT=.*/PROXY_UPLOAD_LIMIT_MBIT=${value}/" "${TMP}/tc.env" >"${TMP}/tc-bad.env"

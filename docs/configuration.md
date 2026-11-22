@@ -49,7 +49,7 @@ parsed, not sourced.
 | `TURN_UPLOAD_LIMIT_MBIT`, `TURN_DOWNLOAD_LIMIT_MBIT` | Per-client TURN bandwidth in Mbit/s, `0` disables (default `16`/`16`). |
 | `TC_INTERFACE` | Interface to shape. Empty detects it from the default route. |
 | `TC_MAX_CLIENTS` | Client addresses tracked per service and direction (default `512`, range 1-2047). |
-| `TC_REFRESH_SECONDS` | How often active client addresses are re-read (default `5`). |
+| `TC_REFRESH_SECONDS` | How often the proxy's client addresses are re-read (default `5`). The TURN socket table is much larger on a busy relay, so it is re-read at most every 30 s. |
 | `TRUST_PROXY_HEADER` | Set `true` **only** behind a reverse proxy that overwrites `X-Forwarded-For`. |
 
 The API reloads this file on `SIGHUP` (the unit's `ExecReload`) and picks up
@@ -163,16 +163,24 @@ micro-bursts.
 ### Limitations, stated plainly
 
 Linux `tc` has no per-IP hash table for HTB, so the per-address class table is
-refreshed from the connections that actually exist, every `TC_REFRESH_SECONDS`:
+refreshed from the connections that actually exist. That refresh is cheap: one
+filtered `ss` scan per service (both directions share it, and the parsing happens
+in `awk`, not in a shell loop over every socket), and an address that appears
+only adds its own class and filters — so a refresh costs the same whether five
+or five hundred addresses are shaped. The chain is rebuilt once when an address
+leaves or the service starts, which keeps departed addresses from leaving stale
+filters behind. The proxy's table is re-read every `TC_REFRESH_SECONDS`;
+coturn's is re-read at most every 30 s, because a UDP socket dump has to walk
+every relay socket coturn holds.
 
 - a new client address is limited immediately, by its service's fallback class,
   which carries exactly the configured per-IP rate. Within one refresh interval
-  (5 s by default) the address moves to a class of its own. While several new
-  addresses are in the fallback class they share that one allowance, so a burst
-  of new clients can be slower than configured for a few seconds, but never
-  faster. Coturn relay-range traffic is the exception: it gets its per-address
-  class on the next refresh, so up to one interval of a brand-new allocation's
-  media can go unshaped;
+  (5 s by default, up to 30 s for TURN) the address moves to a class of its own.
+  While several new addresses are in the fallback class they share that one
+  allowance, so a burst of new clients can be slower than configured for a few
+  seconds, but never faster. Coturn relay-range traffic is the exception: it gets
+  its per-address class on the next TURN refresh, so up to 30 s of a brand-new
+  allocation's media can go unshaped;
 - at most `TC_MAX_CLIENTS` addresses are tracked per service and direction
   (`512` by default, 1-2047). Beyond that, extra addresses are logged as not
   limited and reported by diagnostics; raise the value or lower the number of
