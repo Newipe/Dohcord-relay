@@ -144,8 +144,14 @@ rules and does nothing.
 - **download** (server to client) on the WAN interface: one class per client IP
   per service, and a `u32` filter that matches the client address together with
   the service's source port (`443`, `3478`, `5349`, and the coturn relay range
-  `49152-65535`). Anything that matches no class uses the default class, which is
-  unlimited, so unrelated traffic on the server is untouched.
+  `49152-65535`). Each service also has one **fallback class** at exactly its
+  per-IP rate: relay traffic from an address that has no class yet lands there,
+  so the limit is enforced from the very first packet. The fallback matches the
+  service's listener ports only. The coturn relay range is covered per address
+  instead, because on the WAN interface a source port in `49152-65535` is also
+  what the host's own outbound connections look like, and the server's own
+  traffic must never be limited as TURN. Traffic that matches no relay filter at
+  all (the API, SSH, anything else) uses the default class, which is unlimited.
 - **upload** (client to server) on an IFB device: only packets addressed to
   those relay ports are mirrored there (unrelated traffic never leaves the normal
   path), and the same per-address classification happens on the IFB.
@@ -156,11 +162,17 @@ micro-bursts.
 
 ### Limitations, stated plainly
 
-Linux `tc` has no per-IP hash table for HTB, so the class table is refreshed from
-the connections that actually exist, every `TC_REFRESH_SECONDS`:
+Linux `tc` has no per-IP hash table for HTB, so the per-address class table is
+refreshed from the connections that actually exist, every `TC_REFRESH_SECONDS`:
 
-- a client that starts its first connection is shaped within one refresh
-  interval (5 s by default); until then its traffic uses the unlimited class;
+- a new client address is limited immediately, by its service's fallback class,
+  which carries exactly the configured per-IP rate. Within one refresh interval
+  (5 s by default) the address moves to a class of its own. While several new
+  addresses are in the fallback class they share that one allowance, so a burst
+  of new clients can be slower than configured for a few seconds, but never
+  faster. Coturn relay-range traffic is the exception: it gets its per-address
+  class on the next refresh, so up to one interval of a brand-new allocation's
+  media can go unshaped;
 - at most `TC_MAX_CLIENTS` addresses are tracked per service and direction
   (`512` by default, 1-2047). Beyond that, extra addresses are logged as not
   limited and reported by diagnostics; raise the value or lower the number of
@@ -176,8 +188,12 @@ the connections that actually exist, every `TC_REFRESH_SECONDS`:
 - upload shaping needs the `ifb` kernel module. The service runs with
   `ProtectKernelModules=yes`, so the installer loads the module and records it in
   `/etc/modules-load.d/dohcord-relay-ifb.conf` for the next boot;
-- IPv6 clients are shaped with their own filters; if a kernel rejects them the
-  `status` command reports the missing classes rather than claiming success.
+- IPv6 clients are shaped with their own filters. Every `tc` command is
+  checked: a rule the kernel refuses aborts `apply` instead of leaving a
+  half-installed tree, and `status` requires each class *and* the filter that
+  steers traffic into it (`missing_class`, `missing_filter`,
+  `missing_fallback_class`, `missing_fallback_filter`), so a tree that shapes
+  nothing is never reported as active.
 
 ### Changing and checking limits
 

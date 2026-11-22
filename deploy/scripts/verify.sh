@@ -979,6 +979,9 @@ else
 		*)
 			if ((shaping_configured)); then
 				fail "bandwidth limits are configured (proxy ${PROXY_DOWN_V}/${PROXY_UP_V} Mbps, TURN ${TURN_DOWN_V}/${TURN_UP_V} Mbps) but NOT enforced"
+				if printf '%s\n' "${tc_status}" | grep -q '^missing_filter=\|^missing_fallback_filter='; then
+					note "the classification filters are missing, so the classes shape nothing; the shaper's journal says why a rule was refused"
+				fi
 				note "run: sudo systemctl status dohcord-relay-tc.service; sudo journalctl -u dohcord-relay-tc -n 30"
 				note "then: sudo ${TC_SCRIPT} apply"
 			else
@@ -988,8 +991,8 @@ else
 		esac
 		if ((shaping_configured)) && [[ "${shaping_state}" == "active" ]]; then
 			# The kernel's own class rate must equal the configured limit.
-			if printf '%s\n' "${tc_status}" | grep -q '^rate_mismatch='; then
-				fail "the active shaper does not match the configured limits: $(printf '%s\n' "${tc_status}" | sed -n 's/^rate_mismatch=//p' | tr '\n' ' ')"
+			if printf '%s\n' "${tc_status}" | grep -q '^rate_mismatch=\|^fallback_rate_mismatch='; then
+				fail "the active shaper does not match the configured limits: $(printf '%s\n' "${tc_status}" | sed -n 's/^rate_mismatch=//p;s/^fallback_rate_mismatch=//p' | tr '\n' ' ')"
 				note "re-apply with: sudo ${TC_SCRIPT} apply"
 			elif printf '%s\n' "${tc_status}" | grep -q '^active_rate='; then
 				pass "the active classes carry the configured rates ($(printf '%s\n' "${tc_status}" | sed -n 's/^active_rate=//p' | tr '\n' ' '))"

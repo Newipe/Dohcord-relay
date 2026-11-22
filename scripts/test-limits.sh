@@ -21,6 +21,7 @@ bad() {
 	printf 'FAIL  %s\n' "$*"
 	fail=1
 }
+skip() { printf 'SKIP  %s\n' "$*"; }
 
 # --- installer harness --------------------------------------------------------
 sed -e "s|readonly ETC_DIR=\"/etc/dohcord-relay\"|readonly ETC_DIR=\"${TMP}/etc\"|" \
@@ -236,13 +237,51 @@ else
 	bad "shaping roots: ${out}"
 fi
 
-if grep -q 'classid 1:.*htb rate 8mbit ceil 8mbit' <<<"${out}" &&
-	grep -q 'classid .* htb rate 16mbit ceil 16mbit' <<<"${out}" &&
-	[[ "$(grep -c 'htb rate 8mbit' <<<"${out}")" == "2" ]] &&
-	[[ "$(grep -c 'htb rate 16mbit' <<<"${out}")" == "2" ]]; then
+if grep -q 'classid 1:1 htb rate 8mbit ceil 8mbit' <<<"${out}" &&
+	grep -q 'classid 2:2 htb rate 16mbit ceil 16mbit' <<<"${out}"; then
 	ok "each client IP gets one proxy class (8 Mbps) and one TURN class (16 Mbps) per direction"
 else
 	bad "shaping class rates: ${out}"
+fi
+
+# Regression: a limit used to start only after the next refresh, so a download
+# that began and ended inside one refresh interval was not limited at all. Each
+# service now has a fallback class at the configured rate and port filters that
+# steer unclassified relay traffic into it.
+if grep -q 'classid 1:2040 htb rate 8mbit ceil 8mbit' <<<"${out}" &&
+	grep -q 'classid 1:2041 htb rate 16mbit ceil 16mbit' <<<"${out}" &&
+	grep -q 'classid 2:2040 htb rate 8mbit ceil 8mbit' <<<"${out}" &&
+	grep -q 'classid 2:2041 htb rate 16mbit ceil 16mbit' <<<"${out}"; then
+	ok "every service has a fallback class at its per-IP rate in both directions"
+else
+	bad "fallback classes: ${out}"
+fi
+
+if grep -q 'parent 1: protocol ip prio 2 u32 match ip sport 443 0xffff flowid 1:2040' <<<"${out}" &&
+	grep -q 'parent 1: protocol ip prio 2 u32 match ip sport 5349 0xffff flowid 1:2041' <<<"${out}" &&
+	grep -q 'parent 2: protocol ip prio 2 u32 match ip dport 443 0xffff flowid 2:2040' <<<"${out}" &&
+	grep -q 'parent 2: protocol ip prio 2 u32 match ip dport 3478 0xffff flowid 2:2041' <<<"${out}"; then
+	ok "relay traffic with no client class yet lands in the service's fallback class"
+else
+	bad "fallback filters: ${out}"
+fi
+
+# The fallback must not match the coturn relay port range on the WAN interface:
+# a source port in that range is also how the host's own outbound connections
+# look, and limiting the server's own traffic as TURN would slow it down.
+if ! grep -q 'parent 1: protocol ip prio 2 u32 match ip sport 0xc000 0xc000' <<<"${out}" &&
+	grep -q 'parent 1: protocol ip prio 1 u32 match ip dst 203.0.113.5/32 match ip sport 0xc000 0xc000' <<<"${out}"; then
+	ok "the fallback ignores the relay port range, keeping the host's own traffic unshaped"
+else
+	bad "fallback relay range: ${out}"
+fi
+
+# A fallback class must never take precedence over a client's own class.
+if grep -q 'parent 1: protocol ip prio 1 u32 match ip dst 203.0.113.5/32 match ip sport 443 0xffff flowid 1:1' <<<"${out}" &&
+	[[ "$(grep -c 'prio 1 u32 match ip dst 203.0.113.5/32' <<<"${out}")" == "4" ]]; then
+	ok "per-address filters are evaluated before the fallback class"
+else
+	bad "fallback precedence: ${out}"
 fi
 
 if grep -q 'filter add dev eth0 parent 1: protocol ip prio 1 u32 match ip dst 203.0.113.5/32 match ip sport 443 0xffff flowid 1:' <<<"${out}" &&
@@ -391,6 +430,139 @@ if grep -q '^shaping=disabled' <<<"${out}"; then
 	ok "status reports shaping as disabled when every limit is 0"
 else
 	bad "status (disabled): ${out}"
+fi
+
+# --- 11b. traffic shaping: a limit applies from the first packet --------------
+# Regression: a 153 MB download that finished inside one refresh interval was
+# not limited at all, because the client's class did not exist yet.
+sed -e 's/^PROXY_UPLOAD_LIMIT_MBIT=.*/PROXY_UPLOAD_LIMIT_MBIT=0/' \
+	-e 's/^TURN_UPLOAD_LIMIT_MBIT=.*/TURN_UPLOAD_LIMIT_MBIT=0/' \
+	-e 's/^TURN_DOWNLOAD_LIMIT_MBIT=.*/TURN_DOWNLOAD_LIMIT_MBIT=0/' "${TMP}/tc.env" >"${TMP}/tc-download-only.env"
+out="$(tc_render 203.0.113.5 "${TMP}/tc-download-only.env")"
+if ! grep -q 'dohcord-ifb\|parent ffff:' <<<"${out}" &&
+	grep -q 'classid 1:2040 htb rate 8mbit' <<<"${out}" &&
+	grep -q 'flowid 1:2040' <<<"${out}"; then
+	ok "download-only limits add no IFB device and still install the fallback class"
+else
+	bad "download-only shaping: ${out}"
+fi
+
+# --- 11c. traffic shaping: a refused rule aborts the apply -------------------
+# Regression: apply_rules ran inside a "||" list, which switches off errexit, so
+# a rejected tc command was ignored and apply reported success.
+mkdir -p "${TMP}/faketc-fail"
+cat >"${TMP}/faketc-fail/tc" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+"qdisc show") printf 'qdisc pfifo_fast 0: root\n' ;;
+"filter add")
+	printf 'Error: TC classifier not found.\n' >&2
+	exit 2
+	;;
+esac
+exit 0
+EOF
+chmod +x "${TMP}/faketc-fail/tc"
+
+if command -v unshare >/dev/null 2>&1 && unshare -Ur true 2>/dev/null; then
+	rc=0
+	out="$(unshare -Ur env PATH="${TMP}/faketc-fail:${PATH}" \
+		DOHCORD_RELAY_TC_STATE="${TMP}/tcstate-fail" \
+		bash "${TC}" apply --interface eth0 --config "${TMP}/tc-download-only.env" 2>&1)" || rc=$?
+	if ((rc != 0)) && grep -q 'tc filter add .* failed' <<<"${out}" &&
+		! grep -q 'bandwidth limits are installed' <<<"${out}"; then
+		ok "a tc command the kernel refuses aborts the apply instead of reporting success"
+	else
+		bad "refused tc command: rc=${rc} ${out}"
+	fi
+else
+	skip "a refused tc command aborts the apply (needs unshare -Ur)"
+fi
+
+# --- 11d. traffic shaping: status requires the classification filters --------
+# Regression: status only looked at classes, so a tree whose filters were never
+# installed (a kernel without cls_u32, a rejected rule) reported "active" while
+# all traffic used the unlimited default class.
+mkdir -p "${TMP}/faketc-status" "${TMP}/fakeip" "${TMP}/tcstate-status"
+cat >"${TMP}/fakeip/ip" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "${TMP}/fakeip/ip"
+cat >"${TMP}/faketc-status/tc" <<'EOF'
+#!/usr/bin/env bash
+dev=""
+prev=""
+for a in "$@"; do
+	[[ "${prev}" == "dev" ]] && dev="$a"
+	prev="$a"
+done
+case "${1:-} ${2:-}" in
+"qdisc show")
+	if [[ "${dev}" == "dohcord-ifb" ]]; then
+		printf 'qdisc htb 2: root refcnt 2 r2q 10 default 999 direct_packets_stat 0\n'
+	else
+		printf 'qdisc htb 1: root refcnt 2 r2q 10 default 999 direct_packets_stat 0\n'
+	fi
+	;;
+"class show")
+	if [[ "${dev}" == "dohcord-ifb" ]]; then
+		cat <<'CL'
+class htb 2:999 root prio 0 rate 10Gbit ceil 10Gbit burst 1680b cburst 1680b
+class htb 2:2040 root prio 0 rate 8Mbit ceil 8Mbit burst 50000b cburst 50000b
+class htb 2:2041 root prio 0 rate 16Mbit ceil 16Mbit burst 100000b cburst 100000b
+class htb 2:7 root prio 0 rate 8Mbit ceil 8Mbit burst 50000b cburst 50000b
+CL
+	else
+		cat <<'CL'
+class htb 1:999 root prio 0 rate 10Gbit ceil 10Gbit burst 1680b cburst 1680b
+class htb 1:2040 root prio 0 rate 8Mbit ceil 8Mbit burst 50000b cburst 50000b
+class htb 1:2041 root prio 0 rate 16Mbit ceil 16Mbit burst 100000b cburst 100000b
+class htb 1:7 root prio 0 rate 8Mbit ceil 8Mbit burst 50000b cburst 50000b
+CL
+	fi
+	;;
+"filter show")
+	if [[ "${FAKE_FILTERS:-yes}" == "yes" ]]; then
+		printf 'filter parent 1: protocol ip pref 1 u32 fh 800::800 order 2048 key ht 800 bkt 0 flowid 1:7\n'
+		printf 'filter parent 1: protocol ip pref 2 u32 fh 801::800 order 2048 key ht 801 bkt 0 flowid 1:2040\n'
+		printf 'filter parent 1: protocol ip pref 2 u32 fh 802::800 order 2048 key ht 802 bkt 0 flowid 1:2041\n'
+		printf 'filter parent 2: protocol ip pref 1 u32 fh 800::800 order 2048 key ht 800 bkt 0 flowid 2:7\n'
+		printf 'filter parent 2: protocol ip pref 2 u32 fh 801::800 order 2048 key ht 801 bkt 0 flowid 2:2040\n'
+		printf 'filter parent 2: protocol ip pref 2 u32 fh 802::800 order 2048 key ht 802 bkt 0 flowid 2:2041\n'
+		printf 'filter parent ffff: protocol ip pref 1 u32 ht 800: action order 1: mirred (Egress Redirect to device dohcord-ifb) stolen\n'
+	fi
+	;;
+esac
+exit 0
+EOF
+chmod +x "${TMP}/faketc-status/tc"
+printf 'download proxy 7 203.0.113.5 %s\nupload proxy 7 203.0.113.5 %s\n' \
+	"$(date +%s)" "$(date +%s)" >"${TMP}/tcstate-status/classes"
+
+status_render() { # filters-present(yes|no)
+	PATH="${TMP}/faketc-status:${TMP}/fakeip:${PATH}" FAKE_FILTERS="$1" \
+		DOHCORD_RELAY_TC_STATE="${TMP}/tcstate-status" \
+		bash "${TC}" status --interface eth0 --config "${TMP}/tc.env" 2>&1
+}
+
+rc=0
+out="$(status_render no)" || rc=$?
+if ((rc != 0)) && grep -q '^missing_filter=download,proxy,203.0.113.5' <<<"${out}" &&
+	grep -q '^missing_fallback_filter=download,proxy' <<<"${out}" &&
+	grep -q '^shaping=inactive' <<<"${out}"; then
+	ok "status reports classes whose classification filters are missing as not enforced"
+else
+	bad "missing filters: rc=${rc} ${out}"
+fi
+
+rc=0
+out="$(status_render yes)" || rc=$?
+if ((rc == 0)) && grep -q '^shaping=active' <<<"${out}" &&
+	grep -q '^ingress_redirect=dohcord-ifb' <<<"${out}"; then
+	ok "status reports shaping as active only when the classes and their filters are both installed"
+else
+	bad "active tree: rc=${rc} ${out}"
 fi
 
 # --- 12. manager console: limits validation ----------------------------------

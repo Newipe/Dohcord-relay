@@ -228,6 +228,9 @@ Two independent groups of limits keep one client from affecting everyone else:
 - Limits are **per client IP, not per connection**: ten proxy connections from one
   address share one 8 Mbps allowance, and several TURN allocations from one
   address share one 16 Mbps allowance.
+- A limit applies from the first packet: relay traffic from an address that has
+  no class yet uses its service's fallback class, which carries exactly the
+  configured rate.
 - Upload and download are limited separately, and proxy and TURN are accounted
   separately. The API's control traffic is never shaped.
 - `0` disables one individual limit; with all four at `0` the shaping rules are

@@ -26,11 +26,18 @@
 # actually exist (ss), every few seconds, from a small systemd service. The
 # consequences are stated plainly:
 #
-#   * a client that starts a new connection is shaped within one refresh interval
-#     (default 5s); until then its traffic uses the default class;
+#   * every service also has one fallback class, at exactly the per-IP rate, that
+#     carries its traffic when the client address has no class yet. A limit is
+#     therefore enforced from the first packet; within one refresh interval
+#     (default 5s) the address moves to a class of its own. While several new
+#     addresses are in the fallback class they share that one allowance;
 #   * the number of tracked addresses is bounded (TC_MAX_CLIENTS), so a flood of
 #     unique addresses cannot grow kernel state without limit;
 #   * an address with no connection for TC_IDLE_SECONDS is forgotten.
+#
+# Every tc command is checked: a rule that the kernel refuses aborts the apply
+# instead of leaving a half-installed tree that looks active. `status` re-reads
+# the kernel and requires the class *and* its classification filter to exist.
 #
 # Nothing here is per connection or per session, and no protocol is modified.
 set -Eeuo pipefail
@@ -59,6 +66,10 @@ readonly EGRESS_HANDLE=1
 readonly INGRESS_HANDLE=2
 readonly DEFAULT_CLASS=999
 readonly MINOR_MAX=2047
+# Reserved class ids for the fallback classes (see the header). They are never
+# handed out by next_minor.
+readonly HOLD_MINOR_PROXY=2040
+readonly HOLD_MINOR_TURN=2041
 
 PROXY_PORT=443
 TURN_PORTS=(3478 5349)
@@ -311,7 +322,7 @@ save_state() {
 next_minor() {
 	local dir="$1" n
 	for ((n = 1; n <= MINOR_MAX; n++)); do
-		((n == DEFAULT_CLASS)) && continue
+		((n == DEFAULT_CLASS || n == HOLD_MINOR_PROXY || n == HOLD_MINOR_TURN)) && continue
 		[[ -z "${USED_MINOR["${dir}|${n}"]:-}" ]] || continue
 		printf '%s' "${n}"
 		return 0
@@ -326,7 +337,23 @@ run_tc() {
 		return 0
 	fi
 	log "tc $*"
-	tc "$@"
+	if ! tc "$@"; then
+		fail "tc $* failed"
+		# A refused rule must never be skipped silently: the remaining traffic
+		# would flow unshaped while the tool claims the limits are installed.
+		exit 1
+	fi
+}
+
+# run_tc_try is for commands whose failure is harmless (removing a class or
+# filter that a previous apply already removed).
+run_tc_try() {
+	if ((DRY_RUN)); then
+		printf 'tc %s\n' "$*"
+		return 0
+	fi
+	log "tc $*"
+	tc "$@" 2>/dev/null || true
 }
 
 have_ifb() { ip link show "${IFB}" >/dev/null 2>&1; }
@@ -377,6 +404,19 @@ all_limits_disabled() {
 	[[ -z "$(shaping_directions proxy)$(shaping_directions turn)" ]]
 }
 
+any_upload() { (($(class_rate proxy upload) + $(class_rate turn upload) > 0)); }
+any_download() { (($(class_rate proxy download) + $(class_rate turn download) > 0)); }
+any_limits() { any_upload || any_download; }
+
+# hold_minor SERVICE is the reserved class id that carries that service's
+# traffic until its client address has a class of its own.
+hold_minor() {
+	case "$1" in
+	proxy) printf '%s' "${HOLD_MINOR_PROXY}" ;;
+	turn) printf '%s' "${HOLD_MINOR_TURN}" ;;
+	esac
+}
+
 # --- Device setup -----------------------------------------------------------
 ensure_device() {
 	local link previous
@@ -409,43 +449,57 @@ ensure_device() {
 	run_tc class replace dev "${IFACE}" parent "${EGRESS_HANDLE}:" classid "${EGRESS_HANDLE}:${DEFAULT_CLASS}" \
 		htb rate "${link}mbit" ceil "${link}mbit"
 
-	[[ -n "$(shaping_directions proxy)$(shaping_directions turn)" ]] || return 0
+	any_limits || return 0
 
-	# Upload shaping: mirror only relay traffic to an IFB device.
-	if ! have_ifb; then
-		if ((DRY_RUN)); then
-			printf 'ip link add %s type ifb\n' "${IFB}"
-			printf 'ip link set %s up\n' "${IFB}"
-		else
-			log "ip link add ${IFB} type ifb"
-			ip link add "${IFB}" type ifb 2>/dev/null || true
-			if ! have_ifb; then
-				fail "could not create ${IFB}: upload shaping needs the ifb kernel module (modprobe ifb)"
-				return 1
-			fi
-			ip link set "${IFB}" up
-		fi
-	fi
-	run_tc qdisc replace dev "${IFB}" root handle "${INGRESS_HANDLE}:" htb default "${DEFAULT_CLASS}"
-	run_tc class replace dev "${IFB}" parent "${INGRESS_HANDLE}:" classid "${INGRESS_HANDLE}:${DEFAULT_CLASS}" \
-		htb rate "${link}mbit" ceil "${link}mbit"
-
-	if ((DRY_RUN)); then
-		printf 'tc filter del dev %s parent ffff:\n' "${IFACE}"
-	else
-		tc qdisc replace dev "${IFACE}" handle ffff: ingress 2>/dev/null || true
-		tc filter del dev "${IFACE}" parent ffff: 2>/dev/null || true
-	fi
-	run_tc filter add dev "${IFACE}" parent ffff: protocol ip prio 1 u32 \
-		match ip dport "${PROXY_PORT}" 0xffff action mirred egress redirect dev "${IFB}"
-	local p
-	for p in "${TURN_PORTS[@]}"; do
-		run_tc filter add dev "${IFACE}" parent ffff: protocol ip prio 1 u32 \
-			match ip dport "${p}" 0xffff action mirred egress redirect dev "${IFB}"
+	# Fallback classes: relay traffic from an address that has no class yet is
+	# still limited, because it lands in a class that carries exactly the
+	# per-IP rate. That is what makes the limit apply from the first packet
+	# instead of after the next refresh.
+	local service rate
+	for service in proxy turn; do
+		rate="$(class_rate "${service}" download)"
+		((rate > 0)) || continue
+		add_class download "${service}" "$(hold_minor "${service}")" "${rate}"
 	done
-	if ((RELAY_RANGE)); then
-		run_tc filter add dev "${IFACE}" parent ffff: protocol ip prio 2 u32 \
-			match ip dport 0xc000 0xc000 action mirred egress redirect dev "${IFB}"
+
+	if any_upload; then
+		# Upload shaping: mirror only relay traffic to an IFB device.
+		if ! have_ifb; then
+			if ((DRY_RUN)); then
+				printf 'ip link add %s type ifb\n' "${IFB}"
+				printf 'ip link set %s up\n' "${IFB}"
+			else
+				log "ip link add ${IFB} type ifb"
+				ip link add "${IFB}" type ifb 2>/dev/null || true
+				if ! have_ifb; then
+					fail "could not create ${IFB}: upload shaping needs the ifb kernel module (modprobe ifb)"
+					return 1
+				fi
+				ip link set "${IFB}" up
+			fi
+		fi
+		run_tc qdisc replace dev "${IFB}" root handle "${INGRESS_HANDLE}:" htb default "${DEFAULT_CLASS}"
+		run_tc class replace dev "${IFB}" parent "${INGRESS_HANDLE}:" classid "${INGRESS_HANDLE}:${DEFAULT_CLASS}" \
+			htb rate "${link}mbit" ceil "${link}mbit"
+
+		for service in proxy turn; do
+			rate="$(class_rate "${service}" upload)"
+			((rate > 0)) || continue
+			add_class upload "${service}" "$(hold_minor "${service}")" "${rate}"
+		done
+
+		if ((DRY_RUN)); then
+			printf 'tc qdisc replace dev %s handle ffff: ingress\n' "${IFACE}"
+			printf 'tc filter del dev %s parent ffff:\n' "${IFACE}"
+		else
+			tc qdisc replace dev "${IFACE}" handle ffff: ingress 2>/dev/null || true
+			tc filter del dev "${IFACE}" parent ffff: 2>/dev/null || true
+		fi
+		for service in proxy turn; do
+			rate="$(class_rate "${service}" upload)"
+			((rate > 0)) || continue
+			add_ingress_mirror "${service}"
+		done
 	fi
 	return 0
 }
@@ -455,6 +509,24 @@ reset_filters() {
 	tc filter del dev "${IFACE}" parent "${EGRESS_HANDLE}:" 2>/dev/null || true
 	if have_ifb; then
 		tc filter del dev "${IFB}" parent "${INGRESS_HANDLE}:" 2>/dev/null || true
+	fi
+}
+
+# add_ingress_mirror SERVICE copies that service's upload packets to the IFB
+# device. Only the relay's own ports are mirrored; the rest of the traffic keeps
+# its normal path.
+add_ingress_mirror() {
+	local service="$1" p
+	local -a ports
+	service_ports "${service}"
+	ports=("${SERVICE_PORTS[@]}")
+	for p in "${ports[@]}"; do
+		run_tc filter add dev "${IFACE}" parent ffff: protocol ip prio 1 u32 \
+			match ip dport "${p}" 0xffff action mirred egress redirect dev "${IFB}"
+	done
+	if ((RELAY_RANGE)) && [[ "${service}" == "turn" ]]; then
+		run_tc filter add dev "${IFACE}" parent ffff: protocol ip prio 2 u32 \
+			match ip dport 0xc000 0xc000 action mirred egress redirect dev "${IFB}"
 	fi
 }
 
@@ -521,15 +593,48 @@ add_filters() {
 	done
 	if ((RELAY_RANGE)) && [[ "${service}" == "turn" ]]; then
 		if ((is6)); then
-			run_tc filter add dev "${dev}" parent "${parent}" protocol ipv6 prio 4 u32 \
+			run_tc filter add dev "${dev}" parent "${parent}" protocol ipv6 prio 3 u32 \
 				match ip6 "${key}" "${ip}/128" match ip6 "${port_field}" 0xc000 0xc000 \
 				flowid "${parent}${minor}"
 		else
-			run_tc filter add dev "${dev}" parent "${parent}" protocol ip prio 2 u32 \
+			run_tc filter add dev "${dev}" parent "${parent}" protocol ip prio 1 u32 \
 				match ip "${key}" "${ip}/32" match ip "${port_field}" 0xc000 0xc000 \
 				flowid "${parent}${minor}"
 		fi
 	fi
+}
+
+# add_hold_filters DIR SERVICE sends the service's relay traffic that matches no
+# client address into its fallback class. Per-address filters run first
+# (prio 1 for IPv4, 3 for IPv6), so an address with its own class, and therefore
+# its own rate, is never affected by the fallback.
+add_hold_filters() {
+	local dir="$1" service="$2" p port_field dev parent classid
+	local -a ports
+	service_ports "${service}"
+	ports=("${SERVICE_PORTS[@]}")
+	if [[ "${dir}" == "download" ]]; then
+		dev="${IFACE}"
+		parent="${EGRESS_HANDLE}:"
+		port_field="sport"
+	else
+		dev="${IFB}"
+		parent="${INGRESS_HANDLE}:"
+		port_field="dport"
+	fi
+	classid="${parent}$(hold_minor "${service}")"
+	for p in "${ports[@]}"; do
+		run_tc filter add dev "${dev}" parent "${parent}" protocol ip prio 2 u32 \
+			match ip "${port_field}" "${p}" 0xffff flowid "${classid}"
+		run_tc filter add dev "${dev}" parent "${parent}" protocol ipv6 prio 4 u32 \
+			match ip6 "${port_field}" "${p}" 0xffff flowid "${classid}"
+	done
+	# The coturn relay range is deliberately not part of the fallback: on the
+	# WAN interface a source port in 49152-65535 is also how the host's own
+	# outbound connections look, and without a client address to match, the
+	# server's own traffic (update downloads, profile fetches) would be limited
+	# as TURN traffic. Those packets get their per-address class on the next
+	# refresh instead.
 }
 
 # --- Client discovery -------------------------------------------------------
@@ -642,9 +747,9 @@ refresh_rules() {
 		local last_seen="${ALLOC_SEEN["${key}"]:-0}"
 		((now - last_seen < TC_IDLE_SECONDS)) && continue
 		if [[ "${dir}" == "download" ]]; then
-			run_tc class del dev "${IFACE}" classid "${EGRESS_HANDLE}:${minor}" 2>/dev/null || true
+			run_tc_try class del dev "${IFACE}" classid "${EGRESS_HANDLE}:${minor}"
 		else
-			run_tc class del dev "${IFB}" classid "${INGRESS_HANDLE}:${minor}" 2>/dev/null || true
+			run_tc_try class del dev "${IFB}" classid "${INGRESS_HANDLE}:${minor}"
 		fi
 		unset "ALLOC_MINOR[${key}]" "ALLOC_SEEN[${key}]" "USED_MINOR[\"${dir}|${minor}\"]"
 		rebuild=1
@@ -655,6 +760,14 @@ refresh_rules() {
 	# keeps a restarted service from stacking duplicate filters.
 	if ((rebuild || !FILTERS_READY)); then
 		reset_filters
+		local hold_service hold_dir hold_rate
+		for hold_service in proxy turn; do
+			for hold_dir in upload download; do
+				hold_rate="$(class_rate "${hold_service}" "${hold_dir}")"
+				((hold_rate > 0)) || continue
+				add_hold_filters "${hold_dir}" "${hold_service}"
+			done
+		done
 		for key in "${!ALLOC_MINOR[@]}"; do
 			IFS='|' read -r dir service ip <<<"${key}"
 			add_filters "${dir}" "${service}" "${ALLOC_MINOR["${key}"]}" "${ip}"
@@ -668,15 +781,38 @@ refresh_rules() {
 # --- Status -----------------------------------------------------------------
 # status prints key=value lines and exits 0 only when every configured limit is
 # actually installed on the interface.
+filter_has() { # filter-text classid
+	grep -Eq "flowid ${2}([[:space:]]|$)" <<<"$1"
+}
+
+class_line() { # class-text parent minor
+	grep -E "class htb ${2}${3}([[:space:]]|$)" <<<"$1" | head -1 || true
+}
+
+rate_mbit_of() { # class line -> rate in Mbit/s
+	local value unit v
+	v="$(sed -n 's/.*rate \([0-9][0-9]*\)\([KMGT]\?\)bit.*/\1 \2/p' <<<"$1" | head -1)"
+	[[ -n "${v}" ]] || return 0
+	value="${v%% *}"
+	unit="${v##* }"
+	case "${unit}" in
+	M | "") ;;
+	K) value=$((value / 1000)) ;;
+	G) value=$((value * 1000)) ;;
+	*) value=0 ;;
+	esac
+	printf '%s' "${value}"
+}
+
 status() {
-	local problems=0 egress_ok=0 ingress_ok=0 needed=0
+	local problems=0 egress_ok=0 ingress_ok=0 mirror_ok=0 needed=0 need_up=0
 	printf 'interface=%s\n' "${IFACE:-unknown}"
 	printf 'proxy_upload_mbit=%s\n' "${PROXY_UPLOAD_LIMIT_MBIT}"
 	printf 'proxy_download_mbit=%s\n' "${PROXY_DOWNLOAD_LIMIT_MBIT}"
 	printf 'turn_upload_mbit=%s\n' "${TURN_UPLOAD_LIMIT_MBIT}"
 	printf 'turn_download_mbit=%s\n' "${TURN_DOWNLOAD_LIMIT_MBIT}"
 	printf 'max_clients=%s\n' "${TC_MAX_CLIENTS}"
-	[[ -n "$(shaping_directions proxy)$(shaping_directions turn)" ]] && needed=1
+	any_limits && needed=1
 	printf 'limits_configured=%s\n' "${needed}"
 
 	if ! command -v tc >/dev/null 2>&1; then
@@ -694,6 +830,8 @@ status() {
 		return 0
 	fi
 
+	any_upload && need_up=1
+
 	if own_qdisc; then
 		egress_ok=1
 		printf 'egress_qdisc=htb %s:\n' "${EGRESS_HANDLE}"
@@ -707,42 +845,100 @@ status() {
 		printf 'ingress_qdisc=missing\n'
 	fi
 
+	# Read the kernel once and answer every question from that snapshot.
+	local egress_classes="" ingress_classes="" egress_filters="" ingress_filters="" ingress_mirror=""
+	egress_classes="$(tc class show dev "${IFACE}" 2>/dev/null || true)"
+	egress_filters="$(tc filter show dev "${IFACE}" parent "${EGRESS_HANDLE}:" 2>/dev/null || true)"
+	if ((ingress_ok)); then
+		ingress_classes="$(tc class show dev "${IFB}" 2>/dev/null || true)"
+		ingress_filters="$(tc filter show dev "${IFB}" parent "${INGRESS_HANDLE}:" 2>/dev/null || true)"
+	fi
+	ingress_mirror="$(tc filter show dev "${IFACE}" parent ffff: 2>/dev/null || true)"
+
+	if ((need_up)); then
+		# tc prints the action as "mirred (Egress Redirect to device <dev>)".
+		if ((ingress_ok)) && grep -qi "redirect to device ${IFB}\|mirror to device ${IFB}" <<<"${ingress_mirror}"; then
+			mirror_ok=1
+			printf 'ingress_redirect=%s\n' "${IFB}"
+		else
+			printf 'ingress_redirect=missing\n'
+		fi
+	fi
+
+	# Every configured limit must be backed by a class *and* the filter that
+	# steers traffic into it. A class alone shapes nothing.
+	local service dir rate minor line classid classes filters parent active_rate
+	for service in proxy turn; do
+		for dir in upload download; do
+			rate="$(class_rate "${service}" "${dir}")"
+			((rate > 0)) || continue
+			minor="$(hold_minor "${service}")"
+			if [[ "${dir}" == "download" ]]; then
+				classes="${egress_classes}"
+				filters="${egress_filters}"
+				parent="${EGRESS_HANDLE}:"
+			else
+				classes="${ingress_classes}"
+				filters="${ingress_filters}"
+				parent="${INGRESS_HANDLE}:"
+			fi
+			classid="${parent}${minor}"
+			line="$(class_line "${classes}" "${parent}" "${minor}")"
+			if [[ -z "${line}" ]]; then
+				printf 'missing_fallback_class=%s,%s\n' "${dir}" "${service}"
+				problems=$((problems + 1))
+			else
+				active_rate="$(rate_mbit_of "${line}")"
+				if [[ -n "${active_rate}" ]] && ((active_rate != rate)); then
+					printf 'fallback_rate_mismatch=%s,%s,%s,%s\n' "${dir}" "${service}" "${rate}" "${active_rate}"
+					problems=$((problems + 1))
+				fi
+			fi
+			if ! filter_has "${filters}" "${classid}"; then
+				printf 'missing_fallback_filter=%s,%s\n' "${dir}" "${service}"
+				problems=$((problems + 1))
+			fi
+		done
+	done
+
 	load_state
-	local key dir service ip minor rate line active_rate unit checked
+	local key ip checked
 	local -A reported=()
 	for key in "${!ALLOC_MINOR[@]}"; do
 		IFS='|' read -r dir service ip <<<"${key}"
 		rate="$(class_rate "${service}" "${dir}")"
 		((rate > 0)) || continue
-		minor="${ALLOC_MINOR["${key}"]}"
+		minor="${ALLOC_MINOR[${key}]}"
 		if [[ "${dir}" == "download" ]]; then
-			line="$(tc class show dev "${IFACE}" 2>/dev/null | grep "class htb ${EGRESS_HANDLE}:${minor} " || true)"
+			classes="${egress_classes}"
+			filters="${egress_filters}"
+			parent="${EGRESS_HANDLE}:"
 		else
-			line="$(tc class show dev "${IFB}" 2>/dev/null | grep "class htb ${INGRESS_HANDLE}:${minor} " || true)"
+			classes="${ingress_classes}"
+			filters="${ingress_filters}"
+			parent="${INGRESS_HANDLE}:"
 		fi
+		line="$(class_line "${classes}" "${parent}" "${minor}")"
 		if [[ -z "${line}" ]]; then
 			printf 'missing_class=%s,%s,%s\n' "${dir}" "${service}" "${ip}"
 			problems=$((problems + 1))
 			continue
 		fi
+		if ! filter_has "${filters}" "${parent}${minor}"; then
+			printf 'missing_filter=%s,%s,%s\n' "${dir}" "${service}" "${ip}"
+			problems=$((problems + 1))
+			continue
+		fi
+		checked="${dir},${service}"
+		[[ -n "${reported[${checked}]:-}" ]] && continue
 		# The rate the kernel actually holds for this class, in Mbit/s, so a
 		# configuration change that was never applied is visible.
-		active_rate="$(sed -n 's/.*rate \([0-9][0-9]*\)\([KMGT]\?\)bit.*/\1 \2/p' <<<"${line}" | head -1)"
-		checked="${dir},${service}"
-		[[ -n "${reported["${checked}"]:-}" ]] && continue
+		active_rate="$(rate_mbit_of "${line}")"
 		if [[ -z "${active_rate}" ]]; then
 			printf 'rate_unreadable=%s,%s\n' "${dir}" "${service}"
 			continue
 		fi
-		unit="${active_rate##* }"
-		active_rate="${active_rate%% *}"
-		case "${unit}" in
-		M | "") ;;
-		K) active_rate=$((active_rate / 1000)) ;;
-		G) active_rate=$((active_rate * 1000)) ;;
-		*) active_rate=0 ;;
-		esac
-		reported["${checked}"]=1
+		reported[${checked}]=1
 		printf 'active_rate=%s,%s,%s\n' "${dir}" "${service}" "${active_rate}"
 		if ((active_rate != rate)); then
 			printf 'rate_mismatch=%s,%s,%s,%s\n' "${dir}" "${service}" "${rate}" "${active_rate}"
@@ -751,7 +947,7 @@ status() {
 	done
 
 	if ((problems == 0 && egress_ok == 1)); then
-		if [[ -n "$(shaping_directions proxy)$(shaping_directions turn)" ]] && ((ingress_ok == 0)); then
+		if ((need_up)) && ((ingress_ok == 0 || mirror_ok == 0)); then
 			printf 'shaping=partial\n'
 			fail "upload limits are configured but the ingress shaper is not active"
 			return 1
@@ -763,8 +959,10 @@ status() {
 	printf 'shaping=inactive\n'
 	if ((egress_ok == 0)); then
 		fail "the root qdisc on ${IFACE} is $(current_root_qdisc); this relay's shaping tree is not installed, so no bandwidth limit is enforced"
+	elif ((problems > 0)); then
+		fail "bandwidth limits are configured but are not fully enforced on ${IFACE} (${problems} missing or wrong rules); see the lines above"
 	else
-		fail "bandwidth limits are configured but are not enforced on ${IFACE} (${problems} missing classes)"
+		fail "upload limits are configured but relay upload traffic is not reaching the shaper on ${IFACE}"
 	fi
 	return 1
 }
