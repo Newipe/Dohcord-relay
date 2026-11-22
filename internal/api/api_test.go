@@ -19,7 +19,7 @@ import (
 	"github.com/Newipe/Dohcord-relay/internal/ratelimit"
 )
 
-func testPolicyFiles(t *testing.T) (domainsPath, policyPath string) {
+func testPolicyFiles(t testing.TB) (domainsPath, policyPath string) {
 	t.Helper()
 	dir := t.TempDir()
 	domainsPath = filepath.Join(dir, "allowed-domains.txt")

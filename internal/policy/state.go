@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -108,14 +110,23 @@ func loadPolicyState(path string) (*Policy, error) {
 // by the policy command wins, so the endpoint can never advertise a policy that
 // Squid has not been reloaded with. Without a state file the source files are
 // parsed directly (the case in tests and on a fresh checkout).
+//
+// The common case is a read: one stat of the state file and an atomic load, so
+// concurrent profile loads never queue on a lock. Only a change (or the first
+// call) takes the write lock and re-parses.
 type Cache struct {
 	DomainsPath string
 	PolicyPath  string
 	StatePath   string
 
-	cached    *Policy
+	mu  sync.Mutex
+	cur atomic.Pointer[cacheEntry]
+}
+
+type cacheEntry struct {
 	stateKey  fileKey
 	sourceKey fileKey
+	policy    *Policy
 }
 
 type fileKey struct {
@@ -132,16 +143,42 @@ func statKey(path string) fileKey {
 	return fileKey{modTime: fi.ModTime(), size: fi.Size(), exists: true}
 }
 
+// sourceKey fingerprints the two source files as one value.
+func (c *Cache) sourceKey() fileKey {
+	domains := statKey(c.DomainsPath)
+	ports := statKey(c.PolicyPath)
+	return fileKey{
+		modTime: domains.modTime,
+		size:    domains.size + 7919*ports.size,
+		exists:  domains.exists && ports.exists,
+	}
+}
+
 func (c *Cache) Get() (*Policy, error) {
 	stateKey := statKey(c.StatePath)
-	sourceKey := statKey(c.DomainsPath)
-	portsKey := statKey(c.PolicyPath)
-	sourceKey = fileKey{modTime: sourceKey.modTime, size: sourceKey.size + 7919*portsKey.size, exists: sourceKey.exists && portsKey.exists}
+	if e := c.cur.Load(); e != nil && e.stateKey == stateKey {
+		// With a state file its timestamp alone decides: the source files only
+		// matter while no policy has been applied yet.
+		if stateKey.exists || e.sourceKey == c.sourceKey() {
+			return e.policy, nil
+		}
+	}
+	return c.refresh(stateKey)
+}
 
-	if c.cached != nil && stateKey == c.stateKey && sourceKey == c.sourceKey {
-		return c.cached, nil
+func (c *Cache) refresh(stateKey fileKey) (*Policy, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Another request may have refreshed while this one waited for the lock.
+	if e := c.cur.Load(); e != nil && e.stateKey == stateKey {
+		src := c.sourceKey()
+		if stateKey.exists || e.sourceKey == src {
+			return e.policy, nil
+		}
 	}
 
+	src := c.sourceKey()
 	var (
 		p   *Policy
 		err error
@@ -158,8 +195,6 @@ func (c *Cache) Get() (*Policy, error) {
 		}
 	}
 
-	c.cached = p
-	c.stateKey = stateKey
-	c.sourceKey = sourceKey
+	c.cur.Store(&cacheEntry{stateKey: stateKey, sourceKey: src, policy: p})
 	return p, nil
 }

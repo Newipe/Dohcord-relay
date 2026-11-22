@@ -60,7 +60,14 @@ network by controlling DNS.
 | `read_timeout`, header limits | Slowloris-style abuse |
 | `LimitNOFILE`, descriptor ceiling | Global bound |
 | API per-IP and global rate limits | Credential issuance abuse |
+| Per-client-IP proxy/TURN bandwidth (8/8 and 16/16 Mbps by default) | One address cannot saturate the uplink, and more connections or allocations do not bypass the limit (`0` disables one limit) |
 | coturn `user-quota`, `total-quota`, `max-bps`, `bps-capacity` | Allocation and bandwidth abuse |
+| `TC_MAX_CLIENTS` (512), forget after 60 s idle | A flood of unique addresses cannot grow kernel state without bound |
+
+The bandwidth shaper only creates and deletes its own qdisc handles and the
+`dohcord-ifb` device; it never flushes the firewall or an administrator's
+traffic-control rules, and it refuses to replace a root qdisc it does not
+manage.
 
 ## Credentials and secrets
 

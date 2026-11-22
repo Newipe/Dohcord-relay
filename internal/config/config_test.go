@@ -175,3 +175,48 @@ func TestListenPort(t *testing.T) {
 		}
 	}
 }
+
+// TestDefaultRequestLimits pins the shipped defaults: several profiles loading at
+// once must fit inside one client's burst.
+func TestDefaultRequestLimits(t *testing.T) {
+	cfg := Default()
+	if cfg.PerIPRate != 60 || cfg.PerIPBurst != 30 {
+		t.Errorf("per-IP limits = %d/%d, want 60/minute and a burst of 30", cfg.PerIPRate, cfg.PerIPBurst)
+	}
+	if cfg.GlobalRate != 1200 || cfg.GlobalBurst != 300 {
+		t.Errorf("global limits = %d/%d, want 1200/minute and a burst of 300", cfg.GlobalRate, cfg.GlobalBurst)
+	}
+	if cfg.PerIPBurst < 10 {
+		t.Errorf("per-IP burst %d is below the 10 simultaneous profile loads the defaults must cover", cfg.PerIPBurst)
+	}
+}
+
+// TestRequestLimitBounds rejects values that would disable the limiter or make
+// it reject everything, from the file as well as from an in-memory config.
+func TestRequestLimitBounds(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.env")
+	base := "HTTPS_PROXY_URL=https://relay.example.test:443\nTURN_URLS=turn:relay.example.test:3478\n"
+
+	for key, values := range map[string][]string{
+		"PER_IP_RATE_PER_MINUTE": {"0", "-1", "1000001", "fast"},
+		"PER_IP_BURST":           {"0", "-5", "1000001", "big"},
+		"GLOBAL_RATE_PER_MINUTE": {"0", "1000001"},
+		"GLOBAL_BURST":           {"0", "1000001"},
+	} {
+		for _, v := range values {
+			if err := os.WriteFile(path, []byte(base+key+"="+v+"\n"), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Errorf("%s=%s was accepted, want an error", key, v)
+			}
+		}
+	}
+
+	cfg := Default()
+	cfg.PerIPBurst = 0
+	if err := cfg.Validate(); err == nil {
+		t.Error("Validate accepted a zero burst")
+	}
+}

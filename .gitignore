@@ -14,3 +14,4 @@ squid-allow.conf
 *.key
 /Dohcord-relay
 /dohcord-relayd
+*.test

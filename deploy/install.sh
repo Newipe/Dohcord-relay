@@ -56,6 +56,30 @@ PREVIOUS_API_PORT=""
 MAX_CONN_PER_IP=100
 MAX_CONN_PER_IP_EXPLICIT=0
 MAX_FDS=8192
+
+# --- Performance and limits -------------------------------------------------
+# Per-client-IP bandwidth limits in Mbit/s, enforced with tc by
+# dohcord-relay-tc. 0 disables that direction. Proxy and TURN are accounted
+# separately, and every value is aggregate per client IP, not per connection.
+PROXY_UPLOAD_LIMIT_MBIT=8
+PROXY_DOWNLOAD_LIMIT_MBIT=8
+TURN_UPLOAD_LIMIT_MBIT=16
+TURN_DOWNLOAD_LIMIT_MBIT=16
+# API request limits. One profile load is one request, so the per-IP allowance
+# has to cover several profiles opening at once without answering 429.
+PER_IP_RATE_PER_MINUTE=60
+PER_IP_BURST=30
+GLOBAL_RATE_PER_MINUTE=1200
+GLOBAL_BURST=300
+# Traffic-shaping housekeeping: how often the active client addresses are
+# re-read, and how many addresses are tracked per service and direction.
+TC_REFRESH_SECONDS=5
+TC_MAX_CLIENTS=512
+# Settings that may be given on the command line and are asked for interactively.
+PERF_KEYS=(PROXY_UPLOAD_LIMIT_MBIT PROXY_DOWNLOAD_LIMIT_MBIT TURN_UPLOAD_LIMIT_MBIT TURN_DOWNLOAD_LIMIT_MBIT PER_IP_RATE_PER_MINUTE PER_IP_BURST GLOBAL_RATE_PER_MINUTE GLOBAL_BURST TC_REFRESH_SECONDS TC_MAX_CLIENTS)
+declare -A PERF_EXPLICIT=()
+SHAPING_RC=0
+
 READ_TIMEOUT="10 minutes"
 CLIENT_LIFETIME="4 hours"
 SKIP_RENEW_TEST=0
@@ -84,6 +108,8 @@ readonly SQUID_UNIT="dohcord-relay-squid.service"
 readonly COTURN_UNIT="dohcord-relay-coturn.service"
 readonly RENEW_SERVICE="dohcord-relay-certbot-renew.service"
 readonly RENEW_TIMER="dohcord-relay-certbot-renew.timer"
+readonly TC_SCRIPT="${LIB_DIR}/dohcord-relay-tc"
+readonly TC_UNIT="dohcord-relay-tc.service"
 
 REPO_DIR=""
 # Release selection. An explicit tag (or DOHCORD_RELAY_VERSION) wins; otherwise
@@ -258,6 +284,24 @@ Service sizes:
                            it (Enter keeps the configured value). Use this option
                            with --yes for automated deployments.
 
+Network and performance settings (asked during an interactive install; Enter
+keeps the value shown in brackets, and an existing installation keeps its
+configured values unless the option is given):
+  --proxy-upload-limit MBIT    Proxy upload per client IP (default: 8, 0 disables)
+  --proxy-download-limit MBIT  Proxy download per client IP (default: 8, 0 disables)
+  --turn-upload-limit MBIT     TURN upload per client IP (default: 16, 0 disables)
+  --turn-download-limit MBIT   TURN download per client IP (default: 16, 0 disables)
+  --api-per-ip-rate N          API requests per client IP per minute (default: 60)
+  --api-per-ip-burst N         API request burst per client IP (default: 30)
+  --api-global-rate N          API requests per minute for the relay (default: 1200)
+  --api-global-burst N         API request burst for the relay (default: 300)
+  --tc-max-clients N           Client addresses shaped per service (default: 512)
+  --tc-refresh SECONDS         How often active addresses are re-read (default: 5)
+
+Bandwidth limits are enforced with Linux tc (HTB plus an IFB device for upload)
+separately for the proxy and the TURN relay. Limits apply per client IP: extra
+connections share the same allowance. The control-plane API is not shaped.
+
 Network Configuration API:
   --api-port N             Port for the Network Configuration API (default: 8443).
                            Interactive installs always show the port and let you
@@ -285,6 +329,7 @@ version_ge() { # version_ge HAVE WANT
 
 # --- Arguments --------------------------------------------------------------
 parse_args() {
+	local key=""
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
 		--mode)
@@ -345,6 +390,23 @@ parse_args() {
 			API_PORT_EXPLICIT=1
 			shift 2
 			;;
+		--proxy-upload-limit | --proxy-download-limit | --turn-upload-limit | --turn-download-limit | --api-per-ip-rate | --api-per-ip-burst | --api-global-rate | --api-global-burst | --tc-max-clients | --tc-refresh)
+			case "$1" in
+			--proxy-upload-limit) key=PROXY_UPLOAD_LIMIT_MBIT ;;
+			--proxy-download-limit) key=PROXY_DOWNLOAD_LIMIT_MBIT ;;
+			--turn-upload-limit) key=TURN_UPLOAD_LIMIT_MBIT ;;
+			--turn-download-limit) key=TURN_DOWNLOAD_LIMIT_MBIT ;;
+			--api-per-ip-rate) key=PER_IP_RATE_PER_MINUTE ;;
+			--api-per-ip-burst) key=PER_IP_BURST ;;
+			--api-global-rate) key=GLOBAL_RATE_PER_MINUTE ;;
+			--api-global-burst) key=GLOBAL_BURST ;;
+			--tc-max-clients) key=TC_MAX_CLIENTS ;;
+			--tc-refresh) key=TC_REFRESH_SECONDS ;;
+			esac
+			printf -v "${key}" '%s' "${2:-}"
+			PERF_EXPLICIT["${key}"]=1
+			shift 2
+			;;
 		--version)
 			RELEASE_REQUEST="${2:-}"
 			shift 2
@@ -379,8 +441,8 @@ parse_args() {
 	fi
 
 	local o
-	for o in USER_QUOTA TOTAL_QUOTA MAX_BPS BPS_CAPACITY PROXY_PORT API_PORT MAX_FDS; do
-		[[ "${!o}" =~ ^[0-9]+$ ]] || die "--${o,,} must be numeric"
+	for o in USER_QUOTA TOTAL_QUOTA MAX_BPS BPS_CAPACITY PROXY_PORT API_PORT MAX_FDS "${PERF_KEYS[@]}"; do
+		[[ "${!o}" =~ ^[0-9]+$ ]] || die "$(printf '%s' "${o}" | tr 'A-Z_' 'a-z-') must be numeric"
 	done
 	if [[ ${API_PORT_EXPLICIT} -eq 1 ]]; then
 		((API_PORT >= 1024 && API_PORT <= 65535)) ||
@@ -619,6 +681,179 @@ select_max_connections() {
 	prompt_max_connections
 }
 
+# --- Network and performance settings ---------------------------------------
+# One table drives the prompts, the flags and the validation, so a setting can
+# never exist in the installer help but not in the prompt (or the reverse).
+perf_label() {
+	case "$1" in
+	PROXY_UPLOAD_LIMIT_MBIT) printf 'Proxy upload limit per client IP' ;;
+	PROXY_DOWNLOAD_LIMIT_MBIT) printf 'Proxy download limit per client IP' ;;
+	TURN_UPLOAD_LIMIT_MBIT) printf 'TURN upload limit per client IP' ;;
+	TURN_DOWNLOAD_LIMIT_MBIT) printf 'TURN download limit per client IP' ;;
+	PER_IP_RATE_PER_MINUTE) printf 'API requests per client IP' ;;
+	PER_IP_BURST) printf 'API request burst per client IP' ;;
+	GLOBAL_RATE_PER_MINUTE) printf 'API requests for the whole relay' ;;
+	GLOBAL_BURST) printf 'API request burst for the whole relay' ;;
+	TC_MAX_CLIENTS) printf 'Client addresses shaped per service' ;;
+	TC_REFRESH_SECONDS) printf 'Traffic-shaping refresh interval' ;;
+	esac
+}
+
+perf_unit() {
+	case "$1" in
+	*_MBIT) printf ' Mbps' ;;
+	*_RATE_PER_MINUTE) printf '/minute' ;;
+	TC_REFRESH_SECONDS) printf 's' ;;
+	esac
+}
+
+perf_flag() {
+	case "$1" in
+	PROXY_UPLOAD_LIMIT_MBIT) printf '%s' '--proxy-upload-limit' ;;
+	PROXY_DOWNLOAD_LIMIT_MBIT) printf '%s' '--proxy-download-limit' ;;
+	TURN_UPLOAD_LIMIT_MBIT) printf '%s' '--turn-upload-limit' ;;
+	TURN_DOWNLOAD_LIMIT_MBIT) printf '%s' '--turn-download-limit' ;;
+	PER_IP_RATE_PER_MINUTE) printf '%s' '--api-per-ip-rate' ;;
+	PER_IP_BURST) printf '%s' '--api-per-ip-burst' ;;
+	GLOBAL_RATE_PER_MINUTE) printf '%s' '--api-global-rate' ;;
+	GLOBAL_BURST) printf '%s' '--api-global-burst' ;;
+	TC_MAX_CLIENTS) printf '%s' '--tc-max-clients' ;;
+	TC_REFRESH_SECONDS) printf '%s' '--tc-refresh' ;;
+	esac
+}
+
+perf_hint() {
+	case "$1" in
+	PROXY_UPLOAD_LIMIT_MBIT | PROXY_DOWNLOAD_LIMIT_MBIT)
+		printf 'Each client IP gets this much proxy bandwidth in total, however many connections it opens. 0 disables the limit.'
+		;;
+	TURN_UPLOAD_LIMIT_MBIT | TURN_DOWNLOAD_LIMIT_MBIT)
+		printf 'Each client IP gets this much TURN bandwidth in total across all of its allocations. 0 disables the limit.'
+		;;
+	PER_IP_RATE_PER_MINUTE | PER_IP_BURST)
+		printf 'One profile load is one request. The burst is how many may arrive at once (for several profiles); the rate is the steady allowance.'
+		;;
+	GLOBAL_RATE_PER_MINUTE | GLOBAL_BURST)
+		printf 'The ceiling for the whole relay, above the per-client allowance. It exists to bound abuse, not normal use.'
+		;;
+	TC_MAX_CLIENTS)
+		printf 'Bounds how many client addresses the shaper tracks, so a flood of unique addresses cannot grow kernel state. 1-2047.'
+		;;
+	TC_REFRESH_SECONDS)
+		printf 'How quickly a newly seen client address starts being shaped. 1-60.'
+		;;
+	esac
+}
+
+# perf_problem prints why VALUE is not usable for KEY and returns 0; it returns 1
+# when the value is fine. The bounds match what the server and the shaper accept.
+perf_problem() {
+	local key="$1" value="$2" n limit label
+	label="$(perf_label "${key}")"
+	if [[ ! "${value}" =~ ^[0-9]{1,7}$ ]]; then
+		printf '%s must be a whole number, got %q' "${label}" "${value}"
+		return 0
+	fi
+	n=$((10#${value}))
+	case "${key}" in
+	*_MBIT)
+		# 0 is a valid value here: it disables that one limit.
+		if ((n > 100000)); then
+			printf '%s must be at most 100000 Mbps, got %d' "${label}" "${n}"
+			return 0
+		fi
+		return 1
+		;;
+	TC_MAX_CLIENTS) limit=2047 ;;
+	TC_REFRESH_SECONDS) limit=60 ;;
+	*) limit=1000000 ;;
+	esac
+	if ((n < 1 || n > limit)); then
+		printf '%s must be between 1 and %d, got %d' "${label}" "${limit}" "${n}"
+		return 0
+	fi
+	return 1
+}
+
+# existing_perf prints a setting recorded by a previous installation, or nothing.
+existing_perf() {
+	local key="$1" value=""
+	[[ -r "${ETC_DIR}/config.env" ]] || return 0
+	value="$(sed -n "s/^${key}=//p" "${ETC_DIR}/config.env" 2>/dev/null | tail -1)"
+	if [[ "${value}" =~ ^[0-9]{1,7}$ ]]; then
+		printf '%s' "$((10#${value}))"
+	fi
+	return 0
+}
+
+# prompt_perf asks for one setting, starting from the value already selected.
+prompt_perf() {
+	local key="$1" answer reason
+	while true; do
+		read -r -p "  $(perf_label "${key}")$(perf_unit "${key}") [${!key}]: " answer || die "cancelled"
+		answer="${answer:-${!key}}"
+		answer="${answer//[[:space:]]/}"
+		if reason="$(perf_problem "${key}" "${answer}")"; then
+			warn "${reason}"
+			continue
+		fi
+		printf -v "${key}" '%s' "$((10#${answer}))"
+		ok "$(perf_label "${key}"): ${!key}$(perf_unit "${key}")"
+		return 0
+	done
+}
+
+# select_performance_settings settles every network and performance limit before
+# anything is written:
+#   * an option on the command line wins and is validated;
+#   * otherwise an existing installation keeps the value in config.env;
+#   * otherwise the default applies;
+#   * an interactive run shows every setting, its unit and its meaning, and
+#     Enter keeps the value in brackets.
+select_performance_settings() {
+	local key existing reason interactive=0
+	[[ ${ASSUME_YES} -eq 0 && -t 0 ]] && interactive=1
+
+	for key in "${PERF_KEYS[@]}"; do
+		if [[ -n "${PERF_EXPLICIT["${key}"]:-}" ]]; then
+			reason="$(perf_problem "${key}" "${!key}")" || true
+			[[ -z "${reason}" ]] || die "$(perf_flag "${key}") ${!key}: ${reason}"
+			continue
+		fi
+		existing="$(existing_perf "${key}")"
+		if [[ -n "${existing}" ]]; then
+			printf -v "${key}" '%s' "${existing}"
+		fi
+	done
+
+	if ((interactive == 0)); then
+		for key in "${PERF_KEYS[@]}"; do
+			info "$(perf_label "${key}"): ${!key}$(perf_unit "${key}")"
+		done
+		return 0
+	fi
+
+	cat <<EOF
+
+  Network and performance settings
+
+  Bandwidth limits are per client IP, not per connection: extra connections from
+  the same address share the same allowance. Proxy and TURN are accounted
+  separately, and the control-plane API is not shaped. 0 disables one limit.
+  Press Enter to keep the value shown in brackets.
+
+EOF
+	for key in "${PERF_KEYS[@]}"; do
+		printf '  %s%s%s
+' "${C_DIM}" "$(perf_hint "${key}")" "${C_RESET}"
+		if [[ -n "${PERF_EXPLICIT["${key}"]:-}" ]]; then
+			ok "$(perf_label "${key}"): ${!key}$(perf_unit "${key}") (from $(perf_flag "${key}"))"
+			continue
+		fi
+		prompt_perf "${key}"
+	done
+}
+
 # --- Address and domain validation ------------------------------------------
 # is_public_ipv4 accepts only globally routable, unicast IPv4 addresses. Every
 # special-purpose range from the IANA registry that must never be advertised as
@@ -757,6 +992,9 @@ EOF
 	# The per-client connection ceiling is asked in the same place, so every
 	# setting a user may want to change is settled before anything is written.
 	select_max_connections
+	# Bandwidth and API request limits are asked in the same block, with their
+	# units, so the final summary is the whole picture.
+	select_performance_settings
 
 	cat <<EOF
 
@@ -769,6 +1007,14 @@ EOF
     per-client limit ${MAX_CONN_PER_IP} proxy connections
     TURN (UDP)       turn:${PUBLIC_HOST}:3478?transport=udp
     TURN (TLS)       turns:${PUBLIC_HOST}:5349?transport=tcp
+
+  Network and performance settings
+
+    proxy bandwidth  ${PROXY_DOWNLOAD_LIMIT_MBIT} Mbps down / ${PROXY_UPLOAD_LIMIT_MBIT} Mbps up per client IP
+    TURN bandwidth   ${TURN_DOWNLOAD_LIMIT_MBIT} Mbps down / ${TURN_UPLOAD_LIMIT_MBIT} Mbps up per client IP
+    API requests     ${PER_IP_RATE_PER_MINUTE}/minute per client IP, burst ${PER_IP_BURST}
+    API ceiling      ${GLOBAL_RATE_PER_MINUTE}/minute, burst ${GLOBAL_BURST}
+    shaping refresh  every ${TC_REFRESH_SECONDS}s, ${TC_MAX_CLIENTS} addresses per service
 
 EOF
 	if [[ ${ASSUME_YES} -eq 0 ]]; then
@@ -1453,6 +1699,18 @@ install_release_binaries() {
 # Kept for callers written against the previous source-build name.
 build_endpoint() { install_release_binaries; }
 
+# set_config_value rewrites KEY in an existing file, appending it when the file
+# predates the setting. Used so an upgrade adds new keys with real values instead
+# of leaving placeholders behind.
+set_config_value() { # FILE KEY VALUE
+	local file="$1" key="$2" value="$3"
+	if grep -q "^${key}=" "${file}"; then
+		sed -i "s|^${key}=.*|${key}=${value}|" "${file}"
+	else
+		printf '%s=%s\n' "${key}" "${value}" >>"${file}"
+	fi
+}
+
 render_config_env() {
 	local target="${ETC_DIR}/config.env"
 	local rendered="${target}.rendered"
@@ -1461,6 +1719,16 @@ render_config_env() {
 		-e "s|@API_PORT@|${API_PORT}|g" \
 		-e "s|@TLS_DIR@|${TLS_DIR}|g" \
 		-e "s|@SQUID_BINARY@|${SQUID_BINARY}|g" \
+		-e "s|@PROXY_UPLOAD_LIMIT_MBIT@|${PROXY_UPLOAD_LIMIT_MBIT}|g" \
+		-e "s|@PROXY_DOWNLOAD_LIMIT_MBIT@|${PROXY_DOWNLOAD_LIMIT_MBIT}|g" \
+		-e "s|@TURN_UPLOAD_LIMIT_MBIT@|${TURN_UPLOAD_LIMIT_MBIT}|g" \
+		-e "s|@TURN_DOWNLOAD_LIMIT_MBIT@|${TURN_DOWNLOAD_LIMIT_MBIT}|g" \
+		-e "s|@PER_IP_RATE_PER_MINUTE@|${PER_IP_RATE_PER_MINUTE}|g" \
+		-e "s|@PER_IP_BURST@|${PER_IP_BURST}|g" \
+		-e "s|@GLOBAL_RATE_PER_MINUTE@|${GLOBAL_RATE_PER_MINUTE}|g" \
+		-e "s|@GLOBAL_BURST@|${GLOBAL_BURST}|g" \
+		-e "s|@TC_MAX_CLIENTS@|${TC_MAX_CLIENTS}|g" \
+		-e "s|@TC_REFRESH_SECONDS@|${TC_REFRESH_SECONDS}|g" \
 		"${REPO_DIR}/deploy/templates/config.env.tmpl" >"${rendered}"
 
 	if [[ -f "${target}" ]] && grep -q '^HTTPS_PROXY_URL=' "${target}"; then
@@ -1497,6 +1765,15 @@ render_config_env() {
 		mv "${rendered}" "${target}"
 		info "wrote ${target}"
 	fi
+	# Limits are always written from the values settled at the start of this run,
+	# which are the existing values on an upgrade unless an option changed them.
+	local key
+	for key in "${PERF_KEYS[@]}"; do
+		set_config_value "${target}" "${key}" "${!key}"
+	done
+	chown root:dohcord-relay "${target}"
+	chmod 0640 "${target}"
+	info "network and performance limits recorded in ${target}"
 	rm -f "${rendered}"
 	install -d -m 0755 -o root -g root "${WEBROOT}"
 }
@@ -1523,6 +1800,10 @@ install_management_tools() {
 		warn "the management console is missing from this checkout; skipping it"
 	fi
 	install -m 0755 "${REPO_DIR}/deploy/scripts/verify.sh" "${LIB_DIR}/verify.sh"
+	if [[ -f "${REPO_DIR}/deploy/scripts/dohcord-relay-tc" ]]; then
+		install -m 0755 "${REPO_DIR}/deploy/scripts/dohcord-relay-tc" "${TC_SCRIPT}"
+		info "installed ${TC_SCRIPT}"
+	fi
 	if [[ -f "${REPO_DIR}/uninstall.sh" ]]; then
 		install -m 0755 "${REPO_DIR}/uninstall.sh" "${LIB_DIR}/uninstall.sh"
 	fi
@@ -1553,6 +1834,16 @@ PUBLIC_HOST=${PUBLIC_HOST}
 PUBLIC_IP=${PUBLIC_IP}
 PROXY_PORT=${PROXY_PORT}
 API_PORT=${API_PORT}
+PROXY_UPLOAD_LIMIT_MBIT=${PROXY_UPLOAD_LIMIT_MBIT}
+PROXY_DOWNLOAD_LIMIT_MBIT=${PROXY_DOWNLOAD_LIMIT_MBIT}
+TURN_UPLOAD_LIMIT_MBIT=${TURN_UPLOAD_LIMIT_MBIT}
+TURN_DOWNLOAD_LIMIT_MBIT=${TURN_DOWNLOAD_LIMIT_MBIT}
+PER_IP_RATE_PER_MINUTE=${PER_IP_RATE_PER_MINUTE}
+PER_IP_BURST=${PER_IP_BURST}
+GLOBAL_RATE_PER_MINUTE=${GLOBAL_RATE_PER_MINUTE}
+GLOBAL_BURST=${GLOBAL_BURST}
+TC_MAX_CLIENTS=${TC_MAX_CLIENTS}
+TC_REFRESH_SECONDS=${TC_REFRESH_SECONDS}
 REPO_REF=${ref}
 EOF
 	chown root:root "${INFO_FILE}.new"
@@ -1951,6 +2242,51 @@ apply_policy() {
 	info "destination policy validated and written to ${ETC_DIR}/squid-allow.conf"
 }
 
+# shaping_enabled reports whether any bandwidth limit is configured.
+shaping_enabled() {
+	((PROXY_UPLOAD_LIMIT_MBIT + PROXY_DOWNLOAD_LIMIT_MBIT + TURN_UPLOAD_LIMIT_MBIT + TURN_DOWNLOAD_LIMIT_MBIT > 0))
+}
+
+# install_shaping installs the traffic-shaping helper and its service, then
+# proves the limits are actually active. A shaping failure never silently
+# disables the limits: it is reported and fails verification.
+install_shaping() {
+	if [[ ! -f "${REPO_DIR}/deploy/scripts/dohcord-relay-tc" ]]; then
+		warn "the traffic-shaping helper is missing from this checkout; bandwidth limits cannot be enforced"
+		SHAPING_RC=1
+		return 0
+	fi
+	install -m 0755 "${REPO_DIR}/deploy/scripts/dohcord-relay-tc" "${TC_SCRIPT}"
+	sed -e "s|@TC_SCRIPT@|${TC_SCRIPT}|g" \
+		"${REPO_DIR}/deploy/systemd/dohcord-relay-tc.service" >"/etc/systemd/system/${TC_UNIT}"
+	chmod 0644 "/etc/systemd/system/${TC_UNIT}"
+	systemctl daemon-reload
+
+	if ! shaping_enabled; then
+		systemctl disable --now "${TC_UNIT}" >/dev/null 2>&1 || true
+		ok "bandwidth limits are set to 0; traffic shaping is disabled"
+		return 0
+	fi
+
+	if ! command -v tc >/dev/null 2>&1; then
+		warn "tc (iproute2) is not available; the configured bandwidth limits are NOT enforced"
+		SHAPING_RC=1
+		return 0
+	fi
+
+	systemctl enable "${TC_UNIT}" >/dev/null
+	systemctl restart "${TC_UNIT}" || true
+	sleep 2
+	info "proxy ${PROXY_DOWNLOAD_LIMIT_MBIT}/${PROXY_UPLOAD_LIMIT_MBIT} Mbps down/up, TURN ${TURN_DOWNLOAD_LIMIT_MBIT}/${TURN_UPLOAD_LIMIT_MBIT} Mbps down/up per client IP"
+	if "${TC_SCRIPT}" status >/dev/null 2>&1; then
+		ok "per-client-IP bandwidth limits are active"
+	else
+		warn "the bandwidth limits are configured but not active; diagnostics will report this until it is fixed"
+		"${TC_SCRIPT}" status 2>&1 | sed 's/^/      /' >&2 || true
+		SHAPING_RC=1
+	fi
+}
+
 start_services() {
 	systemctl daemon-reload
 	systemctl enable "${COTURN_UNIT}" "${SQUID_UNIT}" "${API_UNIT}" >/dev/null
@@ -2029,6 +2365,12 @@ Release              ${RELEASE_TAG:-unknown} (linux/${RELEASE_ARCH:-unknown})
 Software             squid ${SQUID_INSTALLED_VERSION}
                      coturn ${COTURN_INSTALLED_VERSION:-unknown}
                      certbot $("${CERTBOT}" --version 2>/dev/null | awk '{print $2}')
+Bandwidth limits     proxy ${PROXY_DOWNLOAD_LIMIT_MBIT}/${PROXY_UPLOAD_LIMIT_MBIT} Mbps down/up per client IP
+                     TURN ${TURN_DOWNLOAD_LIMIT_MBIT}/${TURN_UPLOAD_LIMIT_MBIT} Mbps down/up per client IP
+                     0 means unlimited; applied with tc per client IP
+API limits           ${PER_IP_RATE_PER_MINUTE}/minute per client IP, burst ${PER_IP_BURST}
+                     ${GLOBAL_RATE_PER_MINUTE}/minute global, burst ${GLOBAL_BURST}
+
 TLS certificate      ${TLS_DIR}/fullchain.pem
                      ${cert_subject:-SAN unavailable}
                      valid ${cert_not_before:-?} to ${cert_end:-?}
@@ -2039,6 +2381,7 @@ Firewall ports       80/tcp, ${PROXY_PORT}/tcp, ${API_PORT}/tcp,
                      3478/udp, 5349/tcp, 49152-65535/udp
 
 Services             systemctl status ${SQUID_UNIT} ${COTURN_UNIT} ${API_UNIT}
+Bandwidth shaper     "${TC_SCRIPT}" status
 Management console   sudo dohcord-relay
 Re-check any time    sudo dohcord-relay diagnostics
 Uninstall safely     sudo dohcord-relay  (option 10)
@@ -2128,6 +2471,9 @@ main() {
 	step_msg "Starting services"
 	start_services
 
+	step_msg "Applying per-client-IP bandwidth limits"
+	install_shaping
+
 	step_msg "Verifying the installation"
 	local verify_rc=0
 	if [[ ${SKIP_VERIFY} -eq 1 ]]; then
@@ -2135,6 +2481,7 @@ main() {
 	else
 		run_verification || verify_rc=1
 	fi
+	((SHAPING_RC == 0)) || verify_rc=1
 
 	write_install_info
 	print_progress

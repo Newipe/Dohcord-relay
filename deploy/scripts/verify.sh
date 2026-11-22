@@ -831,6 +831,185 @@ PY
 fi
 
 # --- ACME HTTP-01 -----------------------------------------------------------
+section "API request limits and response time"
+# The defaults must let several profiles load at once; these checks prove the
+# configured limits and the latency a profile load actually sees.
+PER_IP_RATE_V="$(cfg PER_IP_RATE_PER_MINUTE)"
+PER_IP_BURST_V="$(cfg PER_IP_BURST)"
+GLOBAL_RATE_V="$(cfg GLOBAL_RATE_PER_MINUTE)"
+GLOBAL_BURST_V="$(cfg GLOBAL_BURST)"
+PER_IP_RATE_V="${PER_IP_RATE_V:-60}"
+PER_IP_BURST_V="${PER_IP_BURST_V:-30}"
+GLOBAL_RATE_V="${GLOBAL_RATE_V:-1200}"
+GLOBAL_BURST_V="${GLOBAL_BURST_V:-300}"
+
+if [[ "${PER_IP_RATE_V}" =~ ^[0-9]+$ && "${PER_IP_BURST_V}" =~ ^[0-9]+$ &&
+	"${GLOBAL_RATE_V}" =~ ^[0-9]+$ && "${GLOBAL_BURST_V}" =~ ^[0-9]+$ ]] &&
+	((PER_IP_RATE_V >= 1 && PER_IP_BURST_V >= 1 && GLOBAL_RATE_V >= 1 && GLOBAL_BURST_V >= 1)); then
+	pass "request limits are valid (${PER_IP_RATE_V}/min per IP, burst ${PER_IP_BURST_V}; global ${GLOBAL_RATE_V}/min, burst ${GLOBAL_BURST_V})"
+else
+	fail "request limits in ${CONFIG} are missing or invalid"
+	note "expected whole numbers of at least 1 for PER_IP_RATE_PER_MINUTE, PER_IP_BURST, GLOBAL_RATE_PER_MINUTE and GLOBAL_BURST"
+fi
+if ((PER_IP_BURST_V < 10)); then
+	warn "per-IP burst ${PER_IP_BURST_V} is small: several profiles loading at once may receive 429"
+fi
+
+if [[ "${ENDPOINT}" == https://* ]] && command -v curl >/dev/null 2>&1; then
+	# Ten sequential profile loads: the average is the per-profile latency.
+	latency_total="0"
+	latency_ok=1
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		one="$(curl -sS -o /dev/null "${curl_tls_args[@]}" --max-time 10 -w '%{time_total}' "${ENDPOINT}" 2>/dev/null)" || latency_ok=0
+		[[ "${one}" =~ ^[0-9.]+$ ]] || {
+			latency_ok=0
+			one=0
+		}
+		latency_total="$(awk -v a="${latency_total}" -v b="${one}" 'BEGIN { printf "%.3f", a + b }')"
+	done
+	if ((latency_ok)); then
+		latency_avg="$(awk -v t="${latency_total}" 'BEGIN { printf "%.1f", t / 10 * 1000 }')"
+		note "average /network-config response time: ${latency_avg} ms over 10 requests"
+		if awk -v ms="${latency_avg}" 'BEGIN { exit !(ms < 1000) }'; then
+			pass "profile loads complete in well under a second (${latency_avg} ms average)"
+		else
+			fail "average response time ${latency_avg} ms is too slow; a profile load should take far less than a second"
+		fi
+	else
+		fail "could not measure the API response time"
+	fi
+
+	# Several profiles opening at the same moment must not be rate limited.
+	burst_out="$(mktemp)"
+	for _ in $(seq 1 15); do
+		curl -sS -o /dev/null "${curl_tls_args[@]}" --max-time 10 -w '%{http_code}\n' "${ENDPOINT}" >>"${burst_out}" 2>/dev/null &
+	done
+	wait
+	too_many="$(grep -c '^429$' "${burst_out}" 2>/dev/null || true)"
+	errors="$(grep -vc '^200$' "${burst_out}" 2>/dev/null || true)"
+	rm -f "${burst_out}"
+	if [[ "${errors}" == "0" ]]; then
+		pass "15 simultaneous profile loads all returned 200 (no 429)"
+	elif [[ "${too_many}" != "0" ]]; then
+		fail "${too_many} of 15 simultaneous profile loads were rate limited (429)"
+		note "raise PER_IP_BURST (currently ${PER_IP_BURST_V}) so several profiles can load at once"
+	else
+		fail "some simultaneous profile loads did not return 200"
+	fi
+else
+	skip "API response-time and burst checks (no HTTPS endpoint or curl available)"
+fi
+
+# Recent 429s are visible in the journal because the API logs each refusal.
+if command -v journalctl >/dev/null 2>&1 && [[ "${SKIP_UNITS}" != "1" ]]; then
+	limited_count="$(journalctl -u "${API_UNIT}" --since '-1 hour' --no-pager 2>/dev/null | grep -c 'rate limited' || true)"
+	limited_count="${limited_count:-0}"
+	if [[ "${limited_count}" == "0" ]]; then
+		pass "the API answered no request with a rate limit in the last hour"
+	else
+		warn "${limited_count} request(s) were rate limited in the last hour"
+	fi
+fi
+
+section "Per-client-IP bandwidth limits"
+PROXY_UP_V="$(cfg PROXY_UPLOAD_LIMIT_MBIT)"
+PROXY_DOWN_V="$(cfg PROXY_DOWNLOAD_LIMIT_MBIT)"
+TURN_UP_V="$(cfg TURN_UPLOAD_LIMIT_MBIT)"
+TURN_DOWN_V="$(cfg TURN_DOWNLOAD_LIMIT_MBIT)"
+PROXY_UP_V="${PROXY_UP_V:-8}"
+PROXY_DOWN_V="${PROXY_DOWN_V:-8}"
+TURN_UP_V="${TURN_UP_V:-16}"
+TURN_DOWN_V="${TURN_DOWN_V:-16}"
+TC_IFACE_V="$(cfg TC_INTERFACE)"
+TC_MAX_V="$(cfg TC_MAX_CLIENTS)"
+TC_MAX_V="${TC_MAX_V:-512}"
+TC_SCRIPT="${DOHCORD_RELAY_TC:-/usr/local/lib/dohcord-relay/dohcord-relay-tc}"
+
+for v in "${PROXY_UP_V}" "${PROXY_DOWN_V}" "${TURN_UP_V}" "${TURN_DOWN_V}"; do
+	if [[ ! "${v}" =~ ^[0-9]{1,6}$ ]]; then
+		fail "a bandwidth limit in ${CONFIG} is not a whole number of Mbit/s (${v})"
+	fi
+done
+note "configured per client IP: proxy ${PROXY_DOWN_V} Mbps down / ${PROXY_UP_V} Mbps up, TURN ${TURN_DOWN_V} Mbps down / ${TURN_UP_V} Mbps up (0 = unlimited)"
+shaping_configured=0
+((PROXY_UP_V + PROXY_DOWN_V + TURN_UP_V + TURN_DOWN_V > 0)) && shaping_configured=1
+
+if ! command -v tc >/dev/null 2>&1; then
+	if ((shaping_configured)); then
+		fail "tc is not installed, so the configured bandwidth limits are NOT enforced"
+		note "install iproute2 (apt-get install iproute2) and run: dohcord-relay diagnostics"
+	else
+		pass "no bandwidth limits configured and tc is not present"
+	fi
+else
+	# The interface the relay actually uses decides where shaping must be.
+	detected_iface="$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)"
+	if [[ -z "${detected_iface}" ]]; then
+		detected_iface="$(ip -o route show default 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)"
+	fi
+	shaped_iface="${TC_IFACE_V:-${detected_iface}}"
+	if [[ -n "${shaped_iface}" ]]; then
+		pass "network interface ${shaped_iface}$([[ -n "${TC_IFACE_V}" ]] && echo ' (pinned by TC_INTERFACE)' || echo ' (detected from the default route)')"
+		if [[ -n "${TC_IFACE_V}" && -n "${detected_iface}" && "${TC_IFACE_V}" != "${detected_iface}" ]]; then
+			warn "TC_INTERFACE is ${TC_IFACE_V} but the default route uses ${detected_iface}: client traffic may not be shaped"
+		fi
+	else
+		fail "could not determine the network interface; bandwidth limits cannot be applied"
+	fi
+
+	if [[ -x "${TC_SCRIPT}" ]]; then
+		tc_status="$("${TC_SCRIPT}" status 2>&1)"
+		printf '%s\n' "${tc_status}" | sed -n 's/^/        /p'
+		shaping_state="$(printf '%s\n' "${tc_status}" | sed -n 's/^shaping=//p' | tail -1)"
+		shaped_count="$(printf '%s\n' "${tc_status}" | sed -n 's/^shaped_addresses=//p' | tail -1)"
+		case "${shaping_state}" in
+		active)
+			pass "per-client-IP shaping is active on ${shaped_iface}${shaped_count:+ (${shaped_count} address classes)}"
+			;;
+		disabled)
+			if ((shaping_configured)); then
+				fail "bandwidth limits are configured but the shaper reports them disabled"
+			else
+				pass "bandwidth limits are disabled by configuration (all values 0)"
+			fi
+			;;
+		partial)
+			fail "upload limits are configured but the ingress shaper is not active: they are NOT enforced"
+			;;
+		*)
+			if ((shaping_configured)); then
+				fail "bandwidth limits are configured (proxy ${PROXY_DOWN_V}/${PROXY_UP_V} Mbps, TURN ${TURN_DOWN_V}/${TURN_UP_V} Mbps) but NOT enforced"
+				note "run: sudo systemctl status dohcord-relay-tc.service; sudo journalctl -u dohcord-relay-tc -n 30"
+				note "then: sudo ${TC_SCRIPT} apply"
+			else
+				pass "no bandwidth limits configured; shaping is inactive"
+			fi
+			;;
+		esac
+		if ((shaping_configured)) && [[ "${shaping_state}" == "active" ]]; then
+			# The kernel's own class rate must equal the configured limit.
+			if printf '%s\n' "${tc_status}" | grep -q '^rate_mismatch='; then
+				fail "the active shaper does not match the configured limits: $(printf '%s\n' "${tc_status}" | sed -n 's/^rate_mismatch=//p' | tr '\n' ' ')"
+				note "re-apply with: sudo ${TC_SCRIPT} apply"
+			elif printf '%s\n' "${tc_status}" | grep -q '^active_rate='; then
+				pass "the active classes carry the configured rates ($(printf '%s\n' "${tc_status}" | sed -n 's/^active_rate=//p' | tr '\n' ' '))"
+			else
+				warn "no per-address class is active yet (no client connected since the shaper started)"
+			fi
+			if ((TC_MAX_V < 64)); then
+				warn "TC_MAX_CLIENTS is ${TC_MAX_V}: only that many client addresses per service can be shaped at once"
+			fi
+		fi
+	else
+		if ((shaping_configured)); then
+			fail "the traffic-shaping helper ${TC_SCRIPT} is missing, so bandwidth limits are NOT enforced"
+			note "re-run the installer to restore it"
+		else
+			skip "traffic shaping is not installed (no bandwidth limits configured)"
+		fi
+	fi
+fi
+
 section "ACME HTTP-01 path"
 ACME_WEBROOT="$(cfg ACME_WEBROOT)"
 ACME_WEBROOT="${ACME_WEBROOT:-/var/www/dohcord-relay}"

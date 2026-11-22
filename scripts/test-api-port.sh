@@ -173,6 +173,9 @@ EOF
 out="$(bash -c '
 set -Eeuo pipefail
 source "'"${TMP}"'/install-lib.sh"
+install() { :; }
+chown() { :; }
+chmod() { :; }
 REPO_DIR="'"${REPO}"'"
 PUBLIC_HOST=relay.example.test
 PROXY_PORT=443

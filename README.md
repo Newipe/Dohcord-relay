@@ -61,8 +61,10 @@ for destinations the relay has been told to allow.
 | **Server-side enforcement** | The client is never trusted: limits, destination checks and resolved-address checks all happen on the server. |
 | **TURN relay** | coturn on 3478/udp and 5349/tcp with REST credentials and a bounded relay range. |
 | **Network Configuration API** | One HTTPS document (`/network-config`) with the proxy endpoint, routing rules and temporary credentials. |
+| **Per-client-IP bandwidth limits** | Independent upload/download ceilings for the proxy and the TURN relay, enforced with Linux `tc` and shared by every connection from the same address. |
+| **Measured profile loading** | The API allows 60 requests/minute per address with a burst of 30, so several profiles load at once without a `429`. |
 | **Automated certificates** | certbot with a deploy hook and a systemd timer, including IP certificates for address-only installs. |
-| **Management console** | `dohcord-relay` for status, policy, certificates, updates, repair and uninstall. |
+| **Management console** | `dohcord-relay` for status, limits, policy, certificates, updates, repair and uninstall. |
 | **Idempotent installer** | Re-running it keeps your configuration, policy and certificates. |
 
 ---
@@ -81,9 +83,9 @@ That single command:
 2. downloads this repository's archive over HTTPS into a private temporary
    directory — the archive is extracted, never piped into a shell;
 3. asks how clients should reach the server (a domain name, recommended, or the
-   public IPv4 address) and the Network Configuration API port (8443 by default)
-   and per-client connection limit (100 by default), then shows every setting
-   before changing anything;
+   public IPv4 address), the Network Configuration API port (8443 by default),
+   the per-client connection limit (100 by default) and every bandwidth and API
+   request limit, then shows every setting before changing anything;
 4. installs Squid, coturn and a pinned certbot, then downloads the verified
    precompiled relay binaries for this server's architecture;
 5. obtains a TLS certificate, opens the required firewall ports, installs the
@@ -184,6 +186,7 @@ destination-policy.conf ┘        └─► /network-config    (client routing)
 | **Init** | systemd |
 | **Privileges** | root (or a user with `sudo`) |
 | **Network** | outbound HTTPS; inbound TCP 80, 443, 8443 (or the chosen API port), 5349 and UDP 3478, 49152–65535 |
+| **Kernel** | `tc` (iproute2, installed automatically) and, for upload shaping, the `ifb` module; unavailable shaping is reported as a failed limit, never silently ignored |
 | **Client** | Dohcord's Custom Profile feature; no relay-specific client build |
 
 An IP-only install works without a domain, using a short-lived Let's Encrypt IP
@@ -210,6 +213,34 @@ Everything lives under `/etc/dohcord-relay`:
 | `install-info` | Version, mode and public endpoints, read by the management console. |
 
 Full details, including every `config.env` key: [docs/configuration.md](docs/configuration.md).
+
+### Limits and bandwidth
+
+Two independent groups of limits keep one client from affecting everyone else:
+
+| Setting | Default | Enforced by |
+|---|---|---|
+| Proxy download / upload per client IP | 8 / 8 Mbps | `tc` (HTB on the WAN interface and an IFB device) |
+| TURN download / upload per client IP | 16 / 16 Mbps | `tc`, same mechanism, separate classes |
+| API requests per client IP | 60/minute, burst 30 | the API's token bucket |
+| API requests for the whole relay | 1200/minute, burst 300 | the API's token bucket |
+
+- Limits are **per client IP, not per connection**: ten proxy connections from one
+  address share one 8 Mbps allowance, and several TURN allocations from one
+  address share one 16 Mbps allowance.
+- Upload and download are limited separately, and proxy and TURN are accounted
+  separately. The API's control traffic is never shaped.
+- `0` disables one individual limit; with all four at `0` the shaping rules are
+  removed entirely.
+- Change them during installation (the installer asks for each one, and accepts
+  `--proxy-upload-limit`, `--turn-download-limit`, `--api-per-ip-burst`, … for
+  automation) or afterwards in the console: **Limits & performance**
+  (`sudo dohcord-relay limits`).
+- Upgrades never overwrite configured values: only keys that are missing are
+  added, with their defaults.
+
+How the bandwidth enforcement works, and its honest limitations, are documented
+in [docs/configuration.md](docs/configuration.md#per-client-ip-bandwidth-limits).
 
 ---
 
@@ -413,6 +444,9 @@ place and reported at the end. Nothing is deleted without a typed confirmation.
   refused after resolution, which closes DNS-rebinding paths.
 - **Not an open proxy.** CONNECT only, no IP literals, per-client connection and
   rate limits, global descriptor limits, and a final `deny all`.
+- **Bounded per client IP.** Proxy and TURN bandwidth are capped per client
+  address, so extra connections or extra TURN allocations cannot buy more
+  throughput; the shaping only touches the relay's own `tc` handles.
 - **Credentials stay short-lived.** TURN credentials are HMACs over a server-side
   secret with an expiry; the secret never leaves the server and is never logged.
 

@@ -99,6 +99,11 @@ downloading anything, so local changes are what gets installed.
 | `--bps-capacity N` | Total relay bandwidth reservation (default 250000000). |
 | `--max-connections N` | Concurrent proxy connections per client IP (default 100). Interactive installs always show it and let you change it (Enter keeps the configured value on a re-run). Use this with `--yes` for automation. |
 | `--api-port N` | Network Configuration API port (default 8443). Interactive installs always show the port and let you change it (Enter keeps the configured one on a re-run). Use this with `--yes` for automation. |
+| `--proxy-upload-limit MBIT`, `--proxy-download-limit MBIT` | Proxy bandwidth per client IP (default 8 each, `0` disables). Interactive installs ask for both. |
+| `--turn-upload-limit MBIT`, `--turn-download-limit MBIT` | TURN bandwidth per client IP (default 16 each, `0` disables). Interactive installs ask for both. |
+| `--api-per-ip-rate N`, `--api-per-ip-burst N` | API requests per client IP (default 60/minute, burst 30) |
+| `--api-global-rate N`, `--api-global-burst N` | API requests for the whole relay (default 1200/minute, burst 300) |
+| `--tc-max-clients N`, `--tc-refresh SECONDS` | How many addresses the shaper tracks (512) and how often it refreshes (5) |
 | `--version vX.Y.Z` | Release to install. Defaults to the latest stable GitHub Release. `1.1.0` is accepted and normalised to `v1.1.0`. |
 | `--skip-renew-test` | Skip the certbot renewal dry run at the end. |
 | `--skip-verify` | Skip the verification suite at the end. |
@@ -123,6 +128,34 @@ recorded in `/etc/dohcord-relay/squid.conf` when re-running. Interactive
 installs always ask for it too, with the current value as the default, so the
 per-client connection ceiling can be changed without editing the template.
 
+### Network and performance settings
+
+After the connection limit, an interactive install shows a dedicated section with
+every bandwidth and API request limit, its unit and a one-line explanation, and
+asks for each in turn:
+
+```text
+  Network and performance settings
+
+  Bandwidth limits are per client IP, not per connection: extra connections from
+  the same address share the same allowance. ...
+  Each client IP gets this much proxy bandwidth in total, however many connections it opens. 0 disables the limit.
+  Proxy upload limit per client IP Mbps [8]:
+  Proxy download limit per client IP Mbps [8]:
+  ...
+```
+
+Enter keeps the value in brackets; anything else is validated immediately and a
+bad answer is explained and asked again. The confirmation summary then lists the
+bandwidth and API limits, so what will be applied is visible before anything is
+written.
+
+With `--yes` or no terminal, the recorded values are kept (a fresh install uses
+the defaults) and printed; the matching flags change them without asking. On an
+existing installation a value is only changed by an explicit option — an upgrade
+never resets an administrator's limits, and missing keys are added with their
+defaults.
+
 ## What the installer changes
 
 | Step | Effect |
@@ -131,7 +164,7 @@ per-client connection ceiling can be changed without editing the template.
 | Users | Creates `dohcord-relay` and `turnserver` system users |
 | Binaries | Downloads the release archive for this architecture, verifies it against `checksums.txt`, and installs `/usr/local/bin/dohcord-relayd` (server) and `/usr/local/bin/dohcord-relay` (management console); no compiler is installed |
 | Files | Writes `/etc/dohcord-relay/*`, the `dohcord-relay-manager` alias, `/usr/local/bin/dohcord-relay-tls-deploy`, `/usr/local/lib/dohcord-relay/*` |
-| Units | Installs and enables `dohcord-relay-api`, `dohcord-relay-squid`, `dohcord-relay-coturn`, and the renewal timer every 6 h |
+| Units | Installs and enables `dohcord-relay-api`, `dohcord-relay-squid`, `dohcord-relay-coturn`, `dohcord-relay-tc` (bandwidth shaping) and the renewal timer every 6 h |
 | Firewall | Opens the relay ports in `ufw` or `firewalld` if one is active, including the selected API port; removes an obsolete API port rule from a previous run, never resets unrelated rules, and warns if SSH is not allowed |
 | Certificates | Requests one certificate for the domain or address, installs it into `/etc/dohcord-relay/tls` through a deploy hook |
 | Policy | Validates the bundled destination policy and generates the Squid ACLs |
@@ -184,5 +217,6 @@ the same command resumes safely. Common causes:
 | `has an AAAA record … but this host has no global IPv6` | Remove the AAAA record or add IPv6 |
 | `certificate issuance failed` | Port 80 blocked, or DNS not pointing here |
 | `Squid rejected the generated policy` | The bundled policy did not validate; report the output |
+| `bandwidth limits are configured but not active` | The shaping service could not prepare the interface; see [operations/troubleshooting.md](operations/troubleshooting.md#bandwidth-limits-are-not-being-enforced) |
 
 Full recovery guidance: [operations/troubleshooting.md](operations/troubleshooting.md).

@@ -1,0 +1,39 @@
+[Unit]
+Description=Dohcord Relay per-client-IP bandwidth shaping (tc)
+Documentation=https://github.com/Newipe/Dohcord-relay
+After=network-online.target dohcord-relay-squid.service dohcord-relay-coturn.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Sets up the HTB/IFB trees, then refreshes the per-address classes. Only the
+# relay's own qdisc handles are touched, and stopping the unit removes them.
+ExecStartPre=@TC_SCRIPT@ apply
+ExecStart=@TC_SCRIPT@ watch
+ExecStopPost=@TC_SCRIPT@ stop
+Restart=on-failure
+RestartSec=5s
+RuntimeDirectory=dohcord-relay-tc
+RuntimeDirectoryMode=0700
+
+# tc, ip link and the IFB device need the network admin capability; the shaping
+# process needs nothing else.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+UMask=0077
+ReadWritePaths=/run/dohcord-relay-tc
+
+[Install]
+WantedBy=multi-user.target

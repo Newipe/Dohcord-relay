@@ -10,8 +10,10 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -19,7 +21,10 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -38,11 +43,57 @@ type Server struct {
 	global *ratelimit.Limiter
 	policy *policy.Cache
 
+	// proxy caches the parsed form of HTTPS_PROXY_URL. The endpoint does not
+	// change while the process runs, so every profile load reuses it; the raw
+	// string is compared so a replaced value is still parsed (and rejected).
+	proxy atomic.Pointer[proxyEndpoint]
+
+	// snapshot holds the JSON encoding of the policy-derived parts of the
+	// document, rebuilt only when the policy itself changes. Two profile loads
+	// that see the same policy share it without locking.
+	snapshot atomic.Pointer[policySnapshot]
+
+	// Encoded once: the document's static fields. Writing them directly avoids
+	// re-encoding (and re-compacting) kilobytes on every profile load.
+	proxyJSON json.RawMessage
+	urlJSON   json.RawMessage
+	urlsJSON  json.RawMessage
+
+	bufs sync.Pool // *bytes.Buffer, reused for response encoding
+
 	now func() time.Time
 }
 
+type proxyEndpoint struct {
+	raw  string
+	desc config.Endpoint
+}
+
+// endpoint returns the published proxy descriptor, parsing HTTPS_PROXY_URL only
+// when it is not the value already parsed.
+func (s *Server) endpoint() (config.Endpoint, bool) {
+	if cached := s.proxy.Load(); cached != nil && cached.raw == s.cfg.ProxyURL {
+		return cached.desc, true
+	}
+	desc, err := config.ParseEndpoint(s.cfg.ProxyURL)
+	if err != nil {
+		return config.Endpoint{}, false
+	}
+	s.proxy.Store(&proxyEndpoint{raw: s.cfg.ProxyURL, desc: desc})
+	return desc, true
+}
+
+type policySnapshot struct {
+	policy *policy.Policy
+
+	// allowedDestinations and routing are the encoded JSON fragments of the
+	// document, so a request does not re-encode an unchanged policy.
+	allowedDestinations json.RawMessage
+	routing             json.RawMessage
+}
+
 func New(cfg config.Config, logger *log.Logger) *Server {
-	return &Server{
+	s := &Server{
 		cfg:    cfg,
 		log:    logger,
 		secret: &secretStore{path: cfg.SecretFile},
@@ -56,6 +107,79 @@ func New(cfg config.Config, logger *log.Logger) *Server {
 		},
 		now: time.Now,
 	}
+	s.bufs.New = func() any { return new(bytes.Buffer) }
+	// The values are validated by config.Validate, so these cannot fail; a
+	// failed marshal leaves an empty fragment and the document stays valid JSON.
+	if desc, err := config.ParseEndpoint(cfg.ProxyURL); err == nil {
+		s.proxyJSON, _ = json.Marshal(desc)
+	}
+	s.urlJSON, _ = json.Marshal(cfg.ProxyURL)
+	s.urlsJSON, _ = json.Marshal(cfg.TurnURLs)
+	return s
+}
+
+// writeNetworkConfig writes the exact wire shape of /network-config: the static
+// fields are pre-encoded, the policy fragments come from the snapshot, and only
+// the credential fields are encoded per request. The field order and names are
+// what older clients already parse.
+//
+// The pieces are written straight into one buffer, so a profile load performs no
+// reflective encoding of the document and sends a single response body.
+func (s *Server) writeNetworkConfig(w http.ResponseWriter, snap *policySnapshot, ice []iceServer, expiresAt int64) {
+	server := ice[0]
+	username, _ := json.Marshal(server.Username)
+	credential, _ := json.Marshal(server.Credential)
+
+	buf := s.bufs.Get().(*bytes.Buffer)
+	buf.Reset()
+	buf.Grow(1024 + len(snap.allowedDestinations) + len(snap.routing))
+
+	buf.WriteString(`{"schemaVersion":`)
+	buf.WriteString(strconv.Itoa(policy.SchemaVersion))
+	buf.WriteString(`,"version":`)
+	buf.WriteString(strconv.Itoa(policy.SchemaVersion))
+	buf.WriteString(`,"proxy":`)
+	buf.Write(s.proxyJSON)
+	buf.WriteString(`,"httpsProxy":{"url":`)
+	buf.Write(s.urlJSON)
+	buf.WriteString(`,"allowedDestinations":`)
+	buf.Write(snap.allowedDestinations)
+	buf.WriteString(`},"routing":{"domains":`)
+	buf.Write(snap.routing)
+	buf.WriteString(`},"rtcRelay":{"expiresAt":`)
+	buf.WriteString(strconv.FormatInt(expiresAt, 10))
+	buf.WriteString(`,"iceServers":[{"urls":`)
+	buf.Write(s.urlsJSON)
+	buf.WriteString(`,"username":`)
+	buf.Write(username)
+	buf.WriteString(`,"credential":`)
+	buf.Write(credential)
+	buf.WriteString("}]}}\n")
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf.Bytes())
+	s.bufs.Put(buf)
+}
+
+// snapshotFor returns the encoded policy fragments for pol, rebuilding them only
+// when the cache handed back a different policy.
+func (s *Server) snapshotFor(pol *policy.Policy) (*policySnapshot, error) {
+	if snap := s.snapshot.Load(); snap != nil && snap.policy == pol {
+		return snap, nil
+	}
+	destinations, err := json.Marshal(pol.Destinations)
+	if err != nil {
+		return nil, err
+	}
+	routing, err := json.Marshal(pol.RoutingRules())
+	if err != nil {
+		return nil, err
+	}
+	snap := &policySnapshot{policy: pol, allowedDestinations: destinations, routing: routing}
+	s.snapshot.Store(snap)
+	return snap, nil
 }
 
 type iceServer struct {
@@ -87,6 +211,25 @@ type networkConfig struct {
 	HTTPSProxy    httpsProxyInfo  `json:"httpsProxy"`
 	Routing       routingPolicy   `json:"routing"`
 	RTCRelay      rtcRelay        `json:"rtcRelay"`
+}
+
+// writeDocument encodes doc into a pooled buffer and writes it in one call. The
+// response is a few kilobytes, so this removes a per-request buffer allocation
+// and the chunked framing json.Encoder would produce.
+func (s *Server) writeDocument(w http.ResponseWriter, status int, doc any) {
+	buf := s.bufs.Get().(*bytes.Buffer)
+	buf.Reset()
+	err := json.NewEncoder(buf).Encode(doc)
+	if err != nil {
+		s.bufs.Put(buf)
+		writeJSON(w, http.StatusInternalServerError, errorBody("encode response"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	w.WriteHeader(status)
+	_, _ = w.Write(buf.Bytes())
+	s.bufs.Put(buf)
 }
 
 type credentialsResponse struct {
@@ -127,11 +270,15 @@ func (s *Server) allowRequest(w http.ResponseWriter, r *http.Request, now time.T
 	clientIP := s.clientIP(r)
 	if ok, retry := s.global.Allow("global", now); !ok {
 		retryAfter(w, retry)
+		// One line per refusal: diagnostics count these, and a working relay
+		// should log none.
+		s.log.Printf("rate limited client=%s scope=global retry_after=%s", clientIP, retry)
 		writeJSON(w, http.StatusTooManyRequests, errorBody("global request limit reached"))
 		return clientIP, false
 	}
 	if ok, retry := s.perIP.Allow(clientIP, now); !ok {
 		retryAfter(w, retry)
+		s.log.Printf("rate limited client=%s scope=per-ip retry_after=%s", clientIP, retry)
 		writeJSON(w, http.StatusTooManyRequests, errorBody("too many requests from this address"))
 		return clientIP, false
 	}
@@ -181,25 +328,22 @@ func (s *Server) handleNetworkConfig(w http.ResponseWriter, r *http.Request) {
 
 	// A proxy URL that cannot be described precisely is a configuration error,
 	// not something to paper over: clients would be told to use an endpoint the
-	// relay cannot state.
-	desc, err := config.ParseEndpoint(s.cfg.ProxyURL)
-	if err != nil {
-		s.log.Printf("ERROR proxy endpoint unusable: %v", err)
+	// relay cannot state. It is parsed once at startup (and re-validated by
+	// config.Validate).
+	if _, ok = s.endpoint(); !ok {
+		s.log.Printf("ERROR proxy endpoint unusable: %q", s.cfg.ProxyURL)
 		writeJSON(w, http.StatusServiceUnavailable, errorBody("proxy configuration unavailable"))
 		return
 	}
 
-	writeJSON(w, http.StatusOK, networkConfig{
-		SchemaVersion: policy.SchemaVersion,
-		Version:       policy.SchemaVersion,
-		Proxy:         desc,
-		HTTPSProxy: httpsProxyInfo{
-			URL:                 s.cfg.ProxyURL,
-			AllowedDestinations: pol.Destinations,
-		},
-		Routing:  routingPolicy{Domains: pol.RoutingRules()},
-		RTCRelay: rtcRelay{ExpiresAt: expiresAt, IceServers: ice},
-	})
+	snap, err := s.snapshotFor(pol)
+	if err != nil {
+		s.log.Printf("ERROR encoding destination policy: %v", err)
+		writeJSON(w, http.StatusInternalServerError, errorBody("encode response"))
+		return
+	}
+
+	s.writeNetworkConfig(w, snap, ice, expiresAt)
 
 	// Log issuance without the credential: it is a bearer secret for the
 	// lifetime of the allocation.

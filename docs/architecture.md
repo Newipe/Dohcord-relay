@@ -84,3 +84,21 @@ Unit tests sit next to the package they test:
 - `internal/ratelimit/ratelimit_test.go` — token refill behaviour
 
 Run all of them with `go test ./...` or `./scripts/check.sh`.
+
+## Bandwidth enforcement
+
+```
+client IP --(443/tcp)--> Squid --                                  >-- HTB root qdisc on the WAN interface (download)
+client IP --(3478/udp,            /        one class per client IP and service
+             5349/tcp,           /
+             49152-65535/udp)-> coturn
+
+client IP --(relay ports)--> ingress mirror --> IFB --> HTB (upload)
+                                                       one class per client IP and service
+```
+
+`dohcord-relay-tc` (a small systemd service, no packet-path component) refreshes
+the class table from live connections and is the only thing that touches
+traffic-control state. Proxy and TURN are classified by port, so their allowances
+are independent, and the API's control traffic is never shaped. See
+[configuration.md](configuration.md#per-client-ip-bandwidth-limits).

@@ -84,6 +84,16 @@ it. Installer options are passed through unchanged:
   --max-connections N     Concurrent proxy connections per client IP (default
                           100); interactive runs also ask, Enter keeps the
                           current one.
+  --proxy-upload-limit MBIT     Proxy upload per client IP (default 8).
+  --proxy-download-limit MBIT   Proxy download per client IP (default 8).
+  --turn-upload-limit MBIT      TURN upload per client IP (default 16).
+  --turn-download-limit MBIT    TURN download per client IP (default 16).
+  --api-per-ip-rate N           API requests per client IP per minute (60).
+  --api-per-ip-burst N          API request burst per client IP (30).
+  --api-global-rate N           API requests per minute (1200).
+  --api-global-burst N          API request burst (300).
+  --tc-max-clients N            Client addresses shaped per service (512).
+  --tc-refresh SECONDS          Shaping refresh interval (5).
   --version vX.Y.Z        Release to install (default: the latest stable one).
   --yes                   Do not ask for confirmation.
   --skip-verify           Do not run the verification suite at the end.

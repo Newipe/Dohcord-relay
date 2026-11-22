@@ -4,30 +4,46 @@ package ratelimit
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// Limiter is a token-bucket rate Limiter. A Limiter with an empty key set acts as
-// a single global bucket; the per-address Limiter keys buckets by client address.
-//
-// Memory is bounded: idle buckets are swept periodically and a hard cap on the
-// number of tracked keys is enforced.
+// shardCount splits the bucket table so concurrent requests from different
+// addresses do not serialize on one mutex. 32 shards keep a busy relay's profile
+// loads independent while staying small enough that the per-shard maps remain
+// cache-friendly.
+const shardCount = 32
+
+// maxKeys bounds the total number of tracked keys, so a flood of unique
+// addresses cannot grow memory or kernel state without limit.
+const maxKeys = 50000
+
+// idleTTL is how long a bucket may sit unused before it is dropped.
+const idleTTL = 10 * time.Minute
+
+// Limiter is a token-bucket rate Limiter. A Limiter with a single key acts as a
+// global bucket; the per-address Limiter keys buckets by client address.
 type Limiter struct {
+	shards      [shardCount]shard
+	perShardMax int
+	rate        float64 // tokens added per second
+	burst       float64 // maximum tokens a bucket can hold
+
+	// lastSweep is the last global sweep, so expiring idle buckets costs one
+	// atomic load per request instead of a second lock.
+	lastSweep int64
+	sweepMu   sync.Mutex
+}
+
+type shard struct {
 	mu      sync.Mutex
 	buckets map[string]*bucket
-	rate    float64 // tokens added per second
-	burst   float64 // maximum tokens a bucket can hold
-	maxKeys int
-	lastGC  time.Time
 }
 
 type bucket struct {
 	tokens float64
 	last   time.Time
 }
-
-// idleTTL is how long a bucket may sit unused before it is dropped.
-const idleTTL = 10 * time.Minute
 
 func New(perMinute, burst int) *Limiter {
 	if perMinute < 1 {
@@ -36,31 +52,41 @@ func New(perMinute, burst int) *Limiter {
 	if burst < 1 {
 		burst = 1
 	}
-	return &Limiter{
-		buckets: make(map[string]*bucket),
-		rate:    float64(perMinute) / 60,
-		burst:   float64(burst),
-		maxKeys: 50000,
+	perShard := maxKeys / shardCount
+	if perShard < 1 {
+		perShard = 1
 	}
+	l := &Limiter{
+		perShardMax: perShard,
+		rate:        float64(perMinute) / 60,
+		burst:       float64(burst),
+	}
+	for i := range l.shards {
+		l.shards[i].buckets = make(map[string]*bucket)
+	}
+	return l
 }
 
-// allow consumes one token for key. When the request is refused it also reports
+// Allow consumes one token for key. When the request is refused it also reports
 // how long the caller should wait before retrying.
 func (l *Limiter) Allow(key string, now time.Time) (bool, time.Duration) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	if now.UnixNano()-atomic.LoadInt64(&l.lastSweep) >= int64(time.Minute) {
+		l.sweepIdle(now)
+	}
 
-	l.sweep(now)
+	s := &l.shards[keyShard(key)]
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	b, ok := l.buckets[key]
+	b, ok := s.buckets[key]
 	if !ok {
-		if len(l.buckets) >= l.maxKeys {
-			// Too many distinct clients right now: refuse rather than grow
-			// without bound.
+		if len(s.buckets) >= l.perShardMax {
+			// Too many distinct clients on this shard right now: refuse
+			// rather than grow without bound.
 			return false, time.Second
 		}
 		b = &bucket{tokens: l.burst, last: now}
-		l.buckets[key] = b
+		s.buckets[key] = b
 	}
 
 	elapsed := now.Sub(b.last).Seconds()
@@ -84,23 +110,47 @@ func (l *Limiter) Allow(key string, now time.Time) (bool, time.Duration) {
 	return false, wait
 }
 
-// sweep drops buckets that have been idle for a while. It runs at most once a
-// minute and must be called with l.mu held.
-func (l *Limiter) sweep(now time.Time) {
-	if !l.lastGC.IsZero() && now.Sub(l.lastGC) < time.Minute {
+// sweepIdle drops buckets that have been idle for a while across every shard.
+// It runs at most once a minute: a request that loses the try-lock simply skips
+// it, so a busy relay never waits behind the sweep. Idle buckets cost a map
+// entry, nothing more, which is why skipping a sweep is harmless.
+func (l *Limiter) sweepIdle(now time.Time) {
+	if !l.sweepMu.TryLock() {
 		return
 	}
-	l.lastGC = now
-	for k, b := range l.buckets {
-		if now.Sub(b.last) > idleTTL {
-			delete(l.buckets, k)
+	defer l.sweepMu.Unlock()
+	atomic.StoreInt64(&l.lastSweep, now.UnixNano())
+	for i := range l.shards {
+		s := &l.shards[i]
+		s.mu.Lock()
+		for k, b := range s.buckets {
+			if now.Sub(b.last) > idleTTL {
+				delete(s.buckets, k)
+			}
 		}
+		s.mu.Unlock()
 	}
 }
 
 // size reports the number of tracked keys (used by tests).
 func (l *Limiter) Size() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return len(l.buckets)
+	total := 0
+	for i := range l.shards {
+		s := &l.shards[i]
+		s.mu.Lock()
+		total += len(s.buckets)
+		s.mu.Unlock()
+	}
+	return total
+}
+
+// keyShard maps a key to a shard with FNV-1a, which is cheap and spreads
+// addresses evenly.
+func keyShard(key string) uint32 {
+	var h uint32 = 2166136261
+	for i := 0; i < len(key); i++ {
+		h ^= uint32(key[i])
+		h *= 16777619
+	}
+	return h % shardCount
 }

@@ -43,8 +43,13 @@ parsed, not sourced.
 | `ALLOWED_DOMAINS_FILE`, `DESTINATION_POLICY_FILE` | The authoritative policy. |
 | `POLICY_STATE_FILE` | Applied-policy snapshot written after a successful apply. |
 | `SQUID_CONF`, `SQUID_ALLOW_FILE`, `SQUID_BINARY` | Where Squid lives, for validation and reload. |
-| `PER_IP_RATE_PER_MINUTE`, `PER_IP_BURST` | Per-client request limits on the API. |
-| `GLOBAL_RATE_PER_MINUTE`, `GLOBAL_BURST` | Global request limits on the API. |
+| `PER_IP_RATE_PER_MINUTE`, `PER_IP_BURST` | Per-client request limits on the API (default `60`/minute, burst `30`). |
+| `GLOBAL_RATE_PER_MINUTE`, `GLOBAL_BURST` | Global request limits on the API (default `1200`/minute, burst `300`). |
+| `PROXY_UPLOAD_LIMIT_MBIT`, `PROXY_DOWNLOAD_LIMIT_MBIT` | Per-client proxy bandwidth in Mbit/s, `0` disables (default `8`/`8`). |
+| `TURN_UPLOAD_LIMIT_MBIT`, `TURN_DOWNLOAD_LIMIT_MBIT` | Per-client TURN bandwidth in Mbit/s, `0` disables (default `16`/`16`). |
+| `TC_INTERFACE` | Interface to shape. Empty detects it from the default route. |
+| `TC_MAX_CLIENTS` | Client addresses tracked per service and direction (default `512`, range 1-2047). |
+| `TC_REFRESH_SECONDS` | How often active client addresses are re-read (default `5`). |
 | `TRUST_PROXY_HEADER` | Set `true` **only** behind a reverse proxy that overwrites `X-Forwarded-For`. |
 
 The API reloads this file on `SIGHUP` (the unit's `ExecReload`) and picks up
@@ -53,6 +58,29 @@ rotated secrets and tuning without a restart. `systemctl reload dohcord-relay-ap
 > Changing `HTTPS_PROXY_URL` changes what clients are told. It must stay the
 > address clients actually reach the proxy on; the installer sets it from your
 > answers.
+
+### API request limits
+
+`/network-config` and `/turn-credentials` share two token buckets: one per client
+address and one for the relay as a whole.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `PER_IP_RATE_PER_MINUTE` | `60` | Steady allowance for one address |
+| `PER_IP_BURST` | `30` | How many requests may arrive at once from one address |
+| `GLOBAL_RATE_PER_MINUTE` | `1200` | Steady allowance for the whole relay |
+| `GLOBAL_BURST` | `300` | Burst for the whole relay |
+
+One profile load is exactly one request, so the burst has to cover the profiles a
+user opens at the same time. The old defaults (6/minute, burst 3) answered `429`
+for perfectly normal use; the current ones leave the limiter to do what it is
+for, bounding abuse. A refused request logs `rate limited client=<addr>
+scope=per-ip` and is counted by `dohcord-relay diagnostics`.
+
+Values are validated at startup (whole numbers, 1 to 1,000,000); an invalid
+value stops the service instead of silently disabling the limiter. Changes take
+effect with `systemctl reload dohcord-relay-api` and are made for you by the
+installer or **Limits & performance** in the console.
 
 ### Network Configuration API port
 
@@ -87,7 +115,76 @@ include /etc/dohcord-relay/squid-allow.conf
 with `squid -k parse` before anything is installed or reloaded. Do not edit
 `squid.conf` by hand: re-running the installer re-renders it. If you must change
 timeouts or limits permanently, change the template and re-install, or use the
-installer's flags where they exist (`--max-connections`).
+installer's flags where they exist (`--max-connections`), or change it with
+`sudo dohcord-relay limits` (**Limits & performance**), which validates the whole
+Squid configuration before reloading it.
+
+## Per-client-IP bandwidth limits
+
+Bandwidth is limited **per client IP**, separately for the proxy and the TURN
+relay, in each direction, with Linux `tc`. Nothing is per connection or per
+session, no application is placed in the packet path, and Squid/coturn protocols
+are unchanged.
+
+| Key | Default | Applies to |
+|---|---|---|
+| `PROXY_UPLOAD_LIMIT_MBIT` | `8` | All proxy upload from one client IP, all connections together |
+| `PROXY_DOWNLOAD_LIMIT_MBIT` | `8` | All proxy download to one client IP |
+| `TURN_UPLOAD_LIMIT_MBIT` | `16` | All TURN upload from one client IP, all allocations together |
+| `TURN_DOWNLOAD_LIMIT_MBIT` | `16` | All TURN download to one client IP |
+
+`0` disables that single limit. With all four at `0` the shaper removes its own
+rules and does nothing.
+
+### How it is enforced
+
+`/usr/local/lib/dohcord-relay/dohcord-relay-tc` (run by
+`dohcord-relay-tc.service`) builds two HTB trees:
+
+- **download** (server to client) on the WAN interface: one class per client IP
+  per service, and a `u32` filter that matches the client address together with
+  the service's source port (`443`, `3478`, `5349`, and the coturn relay range
+  `49152-65535`). Anything that matches no class uses the default class, which is
+  unlimited, so unrelated traffic on the server is untouched.
+- **upload** (client to server) on an IFB device: only packets addressed to
+  those relay ports are mirrored there (unrelated traffic never leaves the normal
+  path), and the same per-address classification happens on the IFB.
+
+Limit values are Mbit/s everywhere: installer, console, `config.env`, this page.
+HTB is given a 50 ms burst so UDP voice does not suffer from packet loss on
+micro-bursts.
+
+### Limitations, stated plainly
+
+Linux `tc` has no per-IP hash table for HTB, so the class table is refreshed from
+the connections that actually exist, every `TC_REFRESH_SECONDS`:
+
+- a client that starts its first connection is shaped within one refresh
+  interval (5 s by default); until then its traffic uses the unlimited class;
+- at most `TC_MAX_CLIENTS` addresses are tracked per service and direction
+  (`512` by default, 1-2047). Beyond that, extra addresses are logged as not
+  limited and reported by diagnostics; raise the value or lower the number of
+  active addresses;
+- an address with no traffic for `TC_IDLE_SECONDS` (60) is forgotten, so kernel
+  state does not grow without bound;
+- if the interface already carries a root qdisc the relay does not manage (`mq`,
+  `cake`, …) the shaper refuses to replace it and reports that shaping is not
+  active, instead of overwriting an administrator's configuration. The previous
+  qdisc kind is recorded and restored by `dohcord-relay-tc stop`;
+- IPv6 clients are shaped with their own filters; if a kernel rejects them the
+  `status` command reports the missing classes rather than claiming success.
+
+### Changing and checking limits
+
+- During installation: the **Network and performance settings** section asks for
+  each value, with units and defaults; Enter keeps the value in brackets.
+- Afterwards: `sudo dohcord-relay limits` (**Limits & performance**). Changes are
+  staged, validated, backed up to `/var/backups/dohcord-relay/limits-<time>/`,
+  applied, verified, and rolled back if the services do not come back healthy.
+- Diagnosis: `sudo dohcord-relay-tc status` prints the configured limits, the
+  interface, the qdiscs and whether the classes carry the configured rates;
+  `dohcord-relay diagnostics` and `verify.sh` report a configured-but-inactive
+  limit as a failure, never as success.
 
 ## coturn configuration
 
@@ -123,6 +220,10 @@ rotate it, see [../README.md#security](../README.md#security) and
 | More bandwidth | `--max-bps N`, `--bps-capacity N` |
 | Longer credential lifetime | `CREDENTIAL_TTL` in `config.env`, then reload the API |
 | Stricter API rate limiting | `PER_IP_RATE_PER_MINUTE`, `GLOBAL_RATE_PER_MINUTE`, reload |
+| Proxy bandwidth per client IP | `--proxy-upload-limit` / `--proxy-download-limit`, or **Limits & performance** |
+| TURN bandwidth per client IP | `--turn-upload-limit` / `--turn-download-limit`, or **Limits & performance** |
+| More simultaneous profiles | `--api-per-ip-burst` / `--api-per-ip-rate` |
+| Shape more client addresses at once | `--tc-max-clients`, `TC_REFRESH_SECONDS` |
 
 After any change: `sudo dohcord-relay diagnostics`.
 

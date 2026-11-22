@@ -26,6 +26,21 @@ const (
 
 	// MaxIdentityLength bounds the TURN Identity in a REST username.
 	MaxIdentityLength = 64
+
+	// Default request limits. Several Dohcord profiles load their configuration
+	// at the same time, so the per-address allowance has to cover a burst of
+	// profile loads (and a reconnect) without answering 429. These are far above
+	// normal use: a client fetches /network-config once per profile load and
+	// then keeps its connection, so the limiter only exists to bound abuse.
+	DefaultPerIPRate   = 60
+	DefaultPerIPBurst  = 30
+	DefaultGlobalRate  = 1200
+	DefaultGlobalBurst = 300
+
+	// MaxRate and MaxBurst bound what an operator may configure, so a typo can
+	// never turn the limiter into a denial of service for the relay itself.
+	MaxRate  = 1_000_000
+	MaxBurst = 1_000_000
 	// MaxTTL and MinTTL bound the lifetime of an issued TURN credential.
 	MaxTTL = 7 * 24 * time.Hour
 	MinTTL = time.Minute
@@ -84,10 +99,10 @@ func Default() Config {
 		SquidConf:             "/etc/dohcord-relay/squid.conf",
 		SquidAllowFile:        "/etc/dohcord-relay/squid-allow.conf",
 		SquidBinary:           "/usr/sbin/squid",
-		PerIPRate:             6,
-		PerIPBurst:            3,
-		GlobalRate:            120,
-		GlobalBurst:           60,
+		PerIPRate:             DefaultPerIPRate,
+		PerIPBurst:            DefaultPerIPBurst,
+		GlobalRate:            DefaultGlobalRate,
+		GlobalBurst:           DefaultGlobalBurst,
 	}
 }
 
@@ -176,33 +191,25 @@ func Load(path string) (Config, error) {
 	if v, ok := values["SQUID_BINARY"]; ok {
 		cfg.SquidBinary = v
 	}
-	if v, ok := values["PER_IP_RATE_PER_MINUTE"]; ok {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 {
-			return Config{}, fmt.Errorf("PER_IP_RATE_PER_MINUTE must be a positive integer, got %q", v)
+	for _, limit := range []struct {
+		key string
+		dst *int
+		max int
+	}{
+		{"PER_IP_RATE_PER_MINUTE", &cfg.PerIPRate, MaxRate},
+		{"PER_IP_BURST", &cfg.PerIPBurst, MaxBurst},
+		{"GLOBAL_RATE_PER_MINUTE", &cfg.GlobalRate, MaxRate},
+		{"GLOBAL_BURST", &cfg.GlobalBurst, MaxBurst},
+	} {
+		v, ok := values[limit.key]
+		if !ok {
+			continue
 		}
-		cfg.PerIPRate = n
-	}
-	if v, ok := values["PER_IP_BURST"]; ok {
 		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 {
-			return Config{}, fmt.Errorf("PER_IP_BURST must be a positive integer, got %q", v)
+		if err != nil || n < 1 || n > limit.max {
+			return Config{}, fmt.Errorf("%s must be a whole number between 1 and %d, got %q", limit.key, limit.max, v)
 		}
-		cfg.PerIPBurst = n
-	}
-	if v, ok := values["GLOBAL_RATE_PER_MINUTE"]; ok {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 {
-			return Config{}, fmt.Errorf("GLOBAL_RATE_PER_MINUTE must be a positive integer, got %q", v)
-		}
-		cfg.GlobalRate = n
-	}
-	if v, ok := values["GLOBAL_BURST"]; ok {
-		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 {
-			return Config{}, fmt.Errorf("GLOBAL_BURST must be a positive integer, got %q", v)
-		}
-		cfg.GlobalBurst = n
+		*limit.dst = n
 	}
 	if v, ok := values["TRUST_PROXY_HEADER"]; ok {
 		b, err := strconv.ParseBool(v)
@@ -261,6 +268,16 @@ func (c Config) Validate() error {
 	} {
 		if p == "" {
 			return fmt.Errorf("%s must be set", name)
+		}
+	}
+	for name, limit := range map[string]struct{ value, max int }{
+		"PER_IP_RATE_PER_MINUTE": {c.PerIPRate, MaxRate},
+		"PER_IP_BURST":           {c.PerIPBurst, MaxBurst},
+		"GLOBAL_RATE_PER_MINUTE": {c.GlobalRate, MaxRate},
+		"GLOBAL_BURST":           {c.GlobalBurst, MaxBurst},
+	} {
+		if limit.value < 1 || limit.value > limit.max {
+			return fmt.Errorf("%s must be between 1 and %d, got %d", name, limit.max, limit.value)
 		}
 	}
 	if c.NetworkConfigPort < 1 || c.NetworkConfigPort > 65535 {

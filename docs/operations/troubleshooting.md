@@ -223,3 +223,48 @@ sudo journalctl -u dohcord-relay-api -u dohcord-relay-squid -u dohcord-relay-cot
 ```
 
 Do not paste `/etc/dohcord-relay/turn-secret` or `tls/privkey.pem` into an issue.
+
+## Bandwidth limits are not being enforced
+
+`dohcord-relay diagnostics`, `verify.sh` and `dohcord-relay-tc status` all report
+this explicitly; a configured limit that is not active is a failure, never a
+success.
+
+```bash
+sudo dohcord-relay-tc status
+sudo systemctl status dohcord-relay-tc.service
+sudo journalctl -u dohcord-relay-tc -n 50 --no-pager
+```
+
+| Symptom | Cause and fix |
+|---|---|
+| `shaping=inactive`, log says the root qdisc is not managed | The interface already carries an administrator's qdisc (`mq`, `cake`, …). The relay refuses to overwrite it: remove it, or set `TC_INTERFACE` to an interface whose root qdisc is `htb`/`fq_codel`, then `sudo dohcord-relay-tc apply` |
+| `tc is not installed` | `sudo apt-get install iproute2` |
+| `no network interface detected` | Set `TC_INTERFACE` in `/etc/dohcord-relay/config.env` (the default route could not be read) |
+| `ingress_qdisc=missing` | Upload shaping needs the `ifb` kernel module: `sudo modprobe ifb`, then restart `dohcord-relay-tc` |
+| `shaped_addresses=0` | No client is connected yet; the table fills within `TC_REFRESH_SECONDS` |
+| A client is not limited | It may be above `TC_MAX_CLIENTS`; the shaper logs which address was skipped and diagnostics reports it. Raise the limit or reduce concurrent addresses |
+| New connection is briefly fast | Expected: the class table is refreshed every `TC_REFRESH_SECONDS` (5 s by default). Lower it for a tighter bound |
+| Rates look different from the configuration | `sudo dohcord-relay-tc apply` re-applies the current `config.env`; `status` prints any `rate_mismatch` |
+
+The shaper only ever deletes its own qdisc handles (`1:` on the interface,
+`2:` on the IFB device, the `ffff:` ingress hook and the IFB device itself).
+`dohcord-relay-tc stop` removes them and restores the root qdisc kind that was
+there before.
+
+## Profiles load slowly or are rate limited
+
+A profile load is one `GET /network-config`; it should take milliseconds.
+
+```bash
+curl -sS -o /dev/null -w '%{http_code} %{time_total}s
+' "$(sed -n 's/^NETWORK_CONFIG_URL=//p' /etc/dohcord-relay/config.env)"
+sudo journalctl -u dohcord-relay-api --since '-1 hour' | grep -c 'rate limited'
+```
+
+- `429` with a `Retry-After` header means the burst was genuinely exhausted:
+  raise `PER_IP_BURST` (default 30) or `PER_IP_RATE_PER_MINUTE` (default 60) with
+  `sudo dohcord-relay limits` (**Limits & performance**), then reload/restart.
+- No `429` at all means the limit was never the problem; check the endpoint's
+  latency and the API unit's log.
+- A `503` is a configuration problem (policy or TURN secret), not a limit.

@@ -1,0 +1,908 @@
+#!/usr/bin/env bash
+# Dohcord Relay - per-client-IP bandwidth enforcement with Linux tc.
+#
+# The relay enforces bandwidth per *client IP*, not per connection:
+#
+#   proxy  upload + download  (Squid, its HTTPS CONNECT port)
+#   TURN   upload + download  (coturn, UDP 3478, TCP/UDP 5349, relay ports)
+#
+# Proxy and TURN are accounted separately, and each direction has its own limit,
+# so ten proxy connections from one address share one proxy allowance and several
+# TURN allocations from that address share one TURN allowance.
+#
+# How it works
+# ------------
+# Download (server -> client) is shaped on the WAN interface with an HTB root
+# qdisc: every client IP gets one HTB class per service, and a filter matches the
+# service's source port into that class. Traffic that matches no class uses the
+# default unlimited class, so unrelated traffic is untouched.
+#
+# Upload (client -> server) is shaped on an IFB device: only packets addressed to
+# the proxy/TURN ports are mirrored there (unrelated traffic is never redirected),
+# and on the IFB an HTB tree does the same per-source-IP classification.
+#
+# Linux tc cannot key a shaper by "any source address": HTB has no per-IP hash
+# table. This script therefore refreshes its class table from the connections that
+# actually exist (ss), every few seconds, from a small systemd service. The
+# consequences are stated plainly:
+#
+#   * a client that starts a new connection is shaped within one refresh interval
+#     (default 5s); until then its traffic uses the default class;
+#   * the number of tracked addresses is bounded (TC_MAX_CLIENTS), so a flood of
+#     unique addresses cannot grow kernel state without limit;
+#   * an address with no connection for TC_IDLE_SECONDS is forgotten.
+#
+# Nothing here is per connection or per session, and no protocol is modified.
+set -Eeuo pipefail
+
+readonly PROGRAM="dohcord-relay-tc"
+readonly DEFAULT_CONFIG="/etc/dohcord-relay/config.env"
+readonly DEFAULT_TURN_CONF="/etc/dohcord-relay/turnserver.conf"
+
+CONFIG="${DOHCORD_RELAY_CONFIG:-${DEFAULT_CONFIG}}"
+TURN_CONF="${DOHCORD_RELAY_TURN_CONF:-${DEFAULT_TURN_CONF}}"
+STATE_DIR="${DOHCORD_RELAY_TC_STATE:-/run/dohcord-relay-tc}"
+
+# --- Defaults (mirrored in deploy/templates/config.env.tmpl) ---------------
+PROXY_UPLOAD_LIMIT_MBIT=8
+PROXY_DOWNLOAD_LIMIT_MBIT=8
+TURN_UPLOAD_LIMIT_MBIT=16
+TURN_DOWNLOAD_LIMIT_MBIT=16
+TC_INTERFACE=""
+TC_MAX_CLIENTS=512
+TC_IDLE_SECONDS=60
+TC_REFRESH_SECONDS=5
+
+IFACE=""
+IFB="dohcord-ifb"
+readonly EGRESS_HANDLE=1
+readonly INGRESS_HANDLE=2
+readonly DEFAULT_CLASS=999
+readonly MINOR_MAX=2047
+
+PROXY_PORT=443
+TURN_PORTS=(3478 5349)
+RELAY_MIN=49152
+RELAY_MAX=65535
+RELAY_RANGE=0
+
+DRY_RUN=0
+VERBOSE=0
+ONCE=0
+COMMAND=""
+FILTERS_READY=0
+
+# --- Output -----------------------------------------------------------------
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+	C_RESET=$'\033[0m' C_GREEN=$'\033[32m' C_RED=$'\033[31m' C_YELLOW=$'\033[33m' C_DIM=$'\033[2m'
+else
+	C_RESET="" C_GREEN="" C_RED="" C_YELLOW="" C_DIM=""
+fi
+
+say() { printf '%s\n' "$*"; }
+info() { printf '  %s\n' "$*"; }
+ok() { printf '  %s✓%s %s\n' "${C_GREEN}" "${C_RESET}" "$*"; }
+warn() { printf '  %s!%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*" >&2; }
+fail() { printf '  %s✗%s %s\n' "${C_RED}" "${C_RESET}" "$*" >&2; }
+log() { if ((VERBOSE)); then printf '    %s\n' "$*" >&2; fi; }
+
+usage() {
+	cat <<EOF
+${PROGRAM} - per-client-IP bandwidth limits for Dohcord Relay
+
+Usage: ${PROGRAM} <command> [options]
+
+  apply         Install the traffic-shaping rules for the configured limits
+  refresh       Re-read the active client addresses and update the rules once
+  watch         Keep refreshing (this is what the systemd service runs)
+  status        Report the configured limits and whether they are active
+  stop          Remove only the rules this program installed
+  validate      Check the limit settings in ${CONFIG}
+
+Options:
+  --dry-run         Print the traffic-control commands instead of running them
+  --once            With watch: refresh once and exit
+  --config PATH     Configuration file (default ${CONFIG})
+  --interface NAME  Network interface (default: detected from the default route)
+  -v, --verbose     Print every command as it runs
+  -h, --help        This help
+
+Configuration (${DEFAULT_CONFIG}):
+  PROXY_UPLOAD_LIMIT_MBIT=8     proxy upload per client IP, Mbit/s (0 disables)
+  PROXY_DOWNLOAD_LIMIT_MBIT=8   proxy download per client IP, Mbit/s
+  TURN_UPLOAD_LIMIT_MBIT=16     TURN upload per client IP, Mbit/s
+  TURN_DOWNLOAD_LIMIT_MBIT=16   TURN download per client IP, Mbit/s
+  TC_INTERFACE=                 interface to shape (empty: auto-detect)
+  TC_MAX_CLIENTS=512            addresses tracked per service and direction
+  TC_IDLE_SECONDS=60            forget an address after this long without a flow
+  TC_REFRESH_SECONDS=5          how often the class table is refreshed
+
+Limits are aggregate per client IP: extra connections from the same address
+share the same allowance. The API's control traffic is not shaped.
+EOF
+}
+
+die() {
+	fail "$*"
+	exit 1
+}
+
+# --- Configuration ----------------------------------------------------------
+# config_get reads one KEY=value from the configuration file without sourcing it.
+config_get() {
+	local key="$1" line value=""
+	[[ -r "${CONFIG}" ]] || return 0
+	line="$(sed -n "s/^${key}=//p" "${CONFIG}" 2>/dev/null | tail -1)"
+	value="${line%$'\r'}"
+	if [[ ${#value} -ge 2 && ( ( ${value:0:1} == '"' && ${value: -1} == '"' ) || ( ${value:0:1} == "'" && ${value: -1} == "'" ) ) ]]; then
+		value="${value:1:${#value}-2}"
+	fi
+	printf '%s' "${value}"
+}
+
+load_config() {
+	local v
+	v="$(config_get PROXY_UPLOAD_LIMIT_MBIT)"
+	[[ -z "${v}" ]] || PROXY_UPLOAD_LIMIT_MBIT="${v}"
+	v="$(config_get PROXY_DOWNLOAD_LIMIT_MBIT)"
+	[[ -z "${v}" ]] || PROXY_DOWNLOAD_LIMIT_MBIT="${v}"
+	v="$(config_get TURN_UPLOAD_LIMIT_MBIT)"
+	[[ -z "${v}" ]] || TURN_UPLOAD_LIMIT_MBIT="${v}"
+	v="$(config_get TURN_DOWNLOAD_LIMIT_MBIT)"
+	[[ -z "${v}" ]] || TURN_DOWNLOAD_LIMIT_MBIT="${v}"
+	v="$(config_get TC_INTERFACE)"
+	[[ -z "${v}" ]] || TC_INTERFACE="${v}"
+	v="$(config_get TC_MAX_CLIENTS)"
+	[[ -z "${v}" ]] || TC_MAX_CLIENTS="${v}"
+	v="$(config_get TC_IDLE_SECONDS)"
+	[[ -z "${v}" ]] || TC_IDLE_SECONDS="${v}"
+	v="$(config_get TC_REFRESH_SECONDS)"
+	[[ -z "${v}" ]] || TC_REFRESH_SECONDS="${v}"
+
+	# The proxy port is the port in HTTPS_PROXY_URL, so a non-default proxy port
+	# is shaped correctly without another setting.
+	v="$(config_get HTTPS_PROXY_URL)"
+	if [[ -n "${v}" ]]; then
+		v="${v#*://}"
+		v="${v%%/*}"
+		v="${v##*:}"
+		[[ "${v}" =~ ^[0-9]+$ ]] && PROXY_PORT="$((10#${v}))"
+	fi
+
+	if [[ -r "${TURN_CONF}" ]]; then
+		local min max p
+		min="$(sed -n 's/^min-port=//p' "${TURN_CONF}" | tail -1)"
+		max="$(sed -n 's/^max-port=//p' "${TURN_CONF}" | tail -1)"
+		[[ "${min}" =~ ^[0-9]+$ ]] && RELAY_MIN="$((10#min))"
+		[[ "${max}" =~ ^[0-9]+$ ]] && RELAY_MAX="$((10#max))"
+		p="$(sed -n 's/^listening-port=//p' "${TURN_CONF}" | tail -1)"
+		[[ "${p}" =~ ^[0-9]+$ ]] && TURN_PORTS[0]="$((10#p))"
+		p="$(sed -n 's/^tls-listening-port=//p' "${TURN_CONF}" | tail -1)"
+		[[ "${p}" =~ ^[0-9]+$ ]] && TURN_PORTS[1]="$((10#p))"
+	fi
+	if ((RELAY_MIN <= RELAY_MAX)); then
+		RELAY_RANGE=1
+	fi
+}
+
+# limit_problem prints why VALUE is not a usable Mbit limit and returns 0;
+# returns 1 when it is fine.
+limit_problem() {
+	local name="$1" value="$2"
+	if [[ ! "${value}" =~ ^[0-9]{1,6}$ ]]; then
+		printf '%s must be a whole number of Mbit/s (0 disables the limit), got %q' "${name}" "${value}"
+		return 0
+	fi
+	if ((10#${value} > 100000)); then
+		printf '%s must be at most 100000 Mbit/s, got %s' "${name}" "${value}"
+		return 0
+	fi
+	return 1
+}
+
+# validate_config reports every unusable setting. It never changes anything.
+validate_config() {
+	local problems=0 name value reason
+	for name in PROXY_UPLOAD_LIMIT_MBIT PROXY_DOWNLOAD_LIMIT_MBIT TURN_UPLOAD_LIMIT_MBIT TURN_DOWNLOAD_LIMIT_MBIT; do
+		value="${!name}"
+		if reason="$(limit_problem "${name}" "${value}")"; then
+			fail "${reason}"
+			problems=$((problems + 1))
+		fi
+	done
+	if [[ ! "${TC_MAX_CLIENTS}" =~ ^[0-9]{1,6}$ ]] || ((10#${TC_MAX_CLIENTS} < 1 || 10#${TC_MAX_CLIENTS} > MINOR_MAX)); then
+		fail "TC_MAX_CLIENTS must be between 1 and ${MINOR_MAX}, got ${TC_MAX_CLIENTS}"
+		problems=$((problems + 1))
+	fi
+	if [[ ! "${TC_IDLE_SECONDS}" =~ ^[0-9]{1,6}$ ]] || ((10#${TC_IDLE_SECONDS} < 10)); then
+		fail "TC_IDLE_SECONDS must be a whole number of at least 10, got ${TC_IDLE_SECONDS}"
+		problems=$((problems + 1))
+	fi
+	if [[ ! "${TC_REFRESH_SECONDS}" =~ ^[0-9]{1,4}$ ]] || ((10#${TC_REFRESH_SECONDS} < 1)); then
+		fail "TC_REFRESH_SECONDS must be a whole number of at least 1, got ${TC_REFRESH_SECONDS}"
+		problems=$((problems + 1))
+	fi
+	if [[ -n "${TC_INTERFACE}" ]] && [[ ! "${TC_INTERFACE}" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]]; then
+		fail "TC_INTERFACE is not a valid interface name: ${TC_INTERFACE}"
+		problems=$((problems + 1))
+	fi
+	((problems == 0))
+}
+
+# --- Interface and capabilities ---------------------------------------------
+detect_interface() {
+	if [[ -n "${TC_INTERFACE}" ]]; then
+		IFACE="${TC_INTERFACE}"
+	else
+		IFACE="$(ip -o route get 1.1.1.1 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)"
+		if [[ -z "${IFACE}" ]]; then
+			IFACE="$(ip -o route show default 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)"
+		fi
+	fi
+	[[ -n "${IFACE}" ]]
+}
+
+# link_rate_mbit is the interface's nominal speed, used only as the ceiling of
+# the default class. When the driver does not report one, 10000 Mbit/s is used,
+# which is above any small VPS uplink.
+link_rate_mbit() {
+	local speed=""
+	[[ -r "/sys/class/net/${IFACE}/speed" ]] && speed="$(cat "/sys/class/net/${IFACE}/speed" 2>/dev/null || true)"
+	if [[ "${speed}" =~ ^[0-9]+$ ]] && ((speed > 0)); then
+		printf '%s' "${speed}"
+		return 0
+	fi
+	printf '10000'
+}
+
+# burst_bytes keeps UDP voice usable: too small a bucket drops packets on
+# micro-bursts. 50 ms of the limit, clamped, is comfortable for speech and still
+# enforces the average rate.
+burst_bytes() {
+	local mbit="$1" bytes
+	bytes=$((mbit * 1000000 / 8 / 20))
+	((bytes < 16384)) && bytes=16384
+	((bytes > 524288)) && bytes=524288
+	printf '%s' "${bytes}"
+}
+
+# --- State ------------------------------------------------------------------
+# The class table is persisted so a refresh (or a service restart) keeps the same
+# class for the same address, and so expired addresses can be removed exactly.
+#
+# Format: <direction> <service> <minor> <ip> <last-seen-unix>
+state_file() { printf '%s/classes' "${STATE_DIR}"; }
+
+ensure_state_dir() {
+	((DRY_RUN)) && return 0
+	install -d -m 0700 -o root -g root "${STATE_DIR}"
+}
+
+declare -A ALLOC_MINOR=() # "dir|service|ip" -> minor
+declare -A ALLOC_SEEN=()  # "dir|service|ip" -> last seen
+declare -A USED_MINOR=()  # "dir|minor" -> "service|ip"
+
+load_state() {
+	local file dir service minor ip seen
+	file="$(state_file)"
+	[[ -r "${file}" ]] || return 0
+	while read -r dir service minor ip seen; do
+		[[ -n "${dir}" && -n "${service}" && -n "${minor}" && -n "${ip}" ]] || continue
+		ALLOC_MINOR["${dir}|${service}|${ip}"]="${minor}"
+		ALLOC_SEEN["${dir}|${service}|${ip}"]="${seen:-0}"
+		USED_MINOR["${dir}|${minor}"]="${service}|${ip}"
+	done <"${file}"
+}
+
+save_state() {
+	((DRY_RUN)) && return 0
+	local file key tmp dir service ip
+	file="$(state_file)"
+	tmp="${file}.new"
+	: >"${tmp}"
+	for key in "${!ALLOC_MINOR[@]}"; do
+		IFS='|' read -r dir service ip <<<"${key}"
+		printf '%s %s %s %s %s\n' "${dir}" "${service}" "${ALLOC_MINOR[${key}]}" "${ip}" "${ALLOC_SEEN[${key}]:-0}" >>"${tmp}"
+	done
+	mv "${tmp}" "${file}"
+}
+
+# next_minor allocates the lowest free class id for direction DIR.
+next_minor() {
+	local dir="$1" n
+	for ((n = 1; n <= MINOR_MAX; n++)); do
+		((n == DEFAULT_CLASS)) && continue
+		[[ -z "${USED_MINOR["${dir}|${n}"]:-}" ]] || continue
+		printf '%s' "${n}"
+		return 0
+	done
+	return 1
+}
+
+# --- Command execution ------------------------------------------------------
+run_tc() {
+	if ((DRY_RUN)); then
+		printf 'tc %s\n' "$*"
+		return 0
+	fi
+	log "tc $*"
+	tc "$@"
+}
+
+have_ifb() { ip link show "${IFB}" >/dev/null 2>&1; }
+
+# own_qdisc reports whether the root qdisc of IFACE is the HTB tree this program
+# installed. Anything else belongs to the administrator.
+own_qdisc() {
+	tc qdisc show dev "${IFACE}" 2>/dev/null | grep -q "qdisc htb ${EGRESS_HANDLE}: root"
+}
+
+current_root_qdisc() {
+	tc qdisc show dev "${IFACE}" 2>/dev/null | sed -n 's/^qdisc \([^ ]*\) .*/\1/p' | head -1
+}
+
+previous_root_file() { printf '%s/previous-root' "${STATE_DIR}"; }
+
+# --- Limits -----------------------------------------------------------------
+# service_ports SERVICE fills SERVICE_PORTS with that service's local ports.
+service_ports() {
+	SERVICE_PORTS=()
+	case "$1" in
+	proxy) SERVICE_PORTS=("${PROXY_PORT}") ;;
+	turn) SERVICE_PORTS=("${TURN_PORTS[@]}") ;;
+	esac
+}
+
+class_rate() {
+	case "$1:$2" in
+	proxy:upload) printf '%s' "${PROXY_UPLOAD_LIMIT_MBIT}" ;;
+	proxy:download) printf '%s' "${PROXY_DOWNLOAD_LIMIT_MBIT}" ;;
+	turn:upload) printf '%s' "${TURN_UPLOAD_LIMIT_MBIT}" ;;
+	turn:download) printf '%s' "${TURN_DOWNLOAD_LIMIT_MBIT}" ;;
+	esac
+}
+
+# shaping_directions SERVICE prints the directions that have a non-zero limit.
+shaping_directions() {
+	local dir out=""
+	for dir in upload download; do
+		if (($(class_rate "$1" "${dir}") > 0)); then
+			out+="${dir} "
+		fi
+	done
+	printf '%s' "${out% }"
+}
+
+all_limits_disabled() {
+	[[ -z "$(shaping_directions proxy)$(shaping_directions turn)" ]]
+}
+
+# --- Device setup -----------------------------------------------------------
+ensure_device() {
+	local link previous
+	link="$(link_rate_mbit)"
+
+	if ! own_qdisc; then
+		previous="$(current_root_qdisc)"
+		if [[ -n "${previous}" && "${previous}" != "noqueue" && "${previous}" != "pfifo_fast" && "${previous}" != "fq_codel" && "${previous}" != "pfifo" ]]; then
+			fail "the root qdisc on ${IFACE} is ${previous}, which this relay does not manage.
+    Remove it or set TC_INTERFACE to another interface. Existing traffic-control
+    configuration is never overwritten."
+			return 1
+		fi
+		if ((DRY_RUN)); then
+			printf '# record previous root qdisc: %s\n' "${previous:-none}"
+		else
+			ensure_state_dir
+			printf '%s\n' "${previous:-none}" >"$(previous_root_file)"
+		fi
+		run_tc qdisc replace dev "${IFACE}" root handle "${EGRESS_HANDLE}:" htb default "${DEFAULT_CLASS}"
+	fi
+	run_tc class replace dev "${IFACE}" parent "${EGRESS_HANDLE}:" classid "${EGRESS_HANDLE}:${DEFAULT_CLASS}" \
+		htb rate "${link}mbit" ceil "${link}mbit"
+
+	[[ -n "$(shaping_directions proxy)$(shaping_directions turn)" ]] || return 0
+
+	# Upload shaping: mirror only relay traffic to an IFB device.
+	if ! have_ifb; then
+		if ((DRY_RUN)); then
+			printf 'ip link add %s type ifb\n' "${IFB}"
+			printf 'ip link set %s up\n' "${IFB}"
+		else
+			log "ip link add ${IFB} type ifb"
+			ip link add "${IFB}" type ifb 2>/dev/null || true
+			ip link set "${IFB}" up
+		fi
+	fi
+	run_tc qdisc replace dev "${IFB}" root handle "${INGRESS_HANDLE}:" htb default "${DEFAULT_CLASS}"
+	run_tc class replace dev "${IFB}" parent "${INGRESS_HANDLE}:" classid "${INGRESS_HANDLE}:${DEFAULT_CLASS}" \
+		htb rate "${link}mbit" ceil "${link}mbit"
+
+	if ((DRY_RUN)); then
+		printf 'tc filter del dev %s parent ffff:\n' "${IFACE}"
+	else
+		tc qdisc replace dev "${IFACE}" handle ffff: ingress 2>/dev/null || true
+		tc filter del dev "${IFACE}" parent ffff: 2>/dev/null || true
+	fi
+	run_tc filter add dev "${IFACE}" parent ffff: protocol ip prio 1 u32 \
+		match ip dport "${PROXY_PORT}" 0xffff action mirred egress redirect dev "${IFB}"
+	local p
+	for p in "${TURN_PORTS[@]}"; do
+		run_tc filter add dev "${IFACE}" parent ffff: protocol ip prio 1 u32 \
+			match ip dport "${p}" 0xffff action mirred egress redirect dev "${IFB}"
+	done
+	if ((RELAY_RANGE)); then
+		run_tc filter add dev "${IFACE}" parent ffff: protocol ip prio 2 u32 \
+			match ip dport 0xc000 0xc000 action mirred egress redirect dev "${IFB}"
+	fi
+	return 0
+}
+
+reset_filters() {
+	((DRY_RUN)) && return 0
+	tc filter del dev "${IFACE}" parent "${EGRESS_HANDLE}:" 2>/dev/null || true
+	if have_ifb; then
+		tc filter del dev "${IFB}" parent "${INGRESS_HANDLE}:" 2>/dev/null || true
+	fi
+}
+
+add_class() {
+	local dir="$1" service="$2" minor="$3" rate="$4" dev parent classid burst
+	if [[ "${dir}" == "download" ]]; then
+		dev="${IFACE}"
+		parent="${EGRESS_HANDLE}:"
+	else
+		dev="${IFB}"
+		parent="${INGRESS_HANDLE}:"
+	fi
+	classid="${parent}${minor}"
+	burst="$(burst_bytes "${rate}")"
+	run_tc class replace dev "${dev}" parent "${parent}" classid "${classid}" \
+		htb rate "${rate}mbit" ceil "${rate}mbit" burst "${burst}" cburst "${burst}"
+}
+
+# add_filters DIR SERVICE MINOR IP steers that address's relay traffic into its
+# class: one filter per service port, plus one for the coturn relay range.
+add_filters() {
+	local dir="$1" service="$2" minor="$3" ip="$4" p handle prefix sport dport
+	local -a ports
+	service_ports "${service}"
+	ports=("${SERVICE_PORTS[@]}")
+
+	local is6=0
+	[[ "${ip}" == *:* ]] && is6=1
+
+	if ((is6)); then
+		prefix="ip6"
+		handle="3"
+	else
+		prefix="ip"
+		handle="1"
+	fi
+
+	local dev parent key
+	if [[ "${dir}" == "download" ]]; then
+		dev="${IFACE}"
+		parent="${EGRESS_HANDLE}:"
+		key="dst"
+		sport=1
+		dport=0
+	else
+		dev="${IFB}"
+		parent="${INGRESS_HANDLE}:"
+		key="src"
+		sport=0
+		dport=1
+	fi
+
+	local port_field="sport"
+	((dport)) && port_field="dport"
+
+	for p in "${ports[@]}"; do
+		if ((is6)); then
+			run_tc filter add dev "${dev}" parent "${parent}" protocol ipv6 prio "${handle}" u32 \
+				match "${prefix}" "${key}" "${ip}/128" match "${prefix}" "${port_field}" "${p}" 0xffff \
+				flowid "${parent}${minor}"
+		else
+			run_tc filter add dev "${dev}" parent "${parent}" protocol ip prio "${handle}" u32 \
+				match "${prefix}" "${key}" "${ip}/32" match "${prefix}" "${port_field}" "${p}" 0xffff \
+				flowid "${parent}${minor}"
+		fi
+	done
+	if ((RELAY_RANGE)) && [[ "${service}" == "turn" ]]; then
+		if ((is6)); then
+			run_tc filter add dev "${dev}" parent "${parent}" protocol ipv6 prio 4 u32 \
+				match ip6 "${key}" "${ip}/128" match ip6 "${port_field}" 0xc000 0xc000 \
+				flowid "${parent}${minor}"
+		else
+			run_tc filter add dev "${dev}" parent "${parent}" protocol ip prio 2 u32 \
+				match ip "${key}" "${ip}/32" match ip "${port_field}" 0xc000 0xc000 \
+				flowid "${parent}${minor}"
+		fi
+	fi
+}
+
+# --- Client discovery -------------------------------------------------------
+# peer_ip extracts the address from an ss endpoint ("1.2.3.4:5678",
+# "[2001:db8::1]:443", "1.2.3.4%eth0:5678").
+peer_ip() {
+	local value="$1"
+	case "${value}" in
+	\[*\]:*) value="${value#[}"; value="${value%%]*}" ;;
+	*) value="${value%:*}" ;;
+	esac
+	value="${value%%\%*}"
+	printf '%s' "${value}"
+}
+
+# discover_clients SERVICE DIR prints the client addresses currently using it.
+# No packet contents are read; only socket endpoints.
+discover_clients() {
+	local service="$1" ip line lport peer
+	if [[ -n "${DOHCORD_RELAY_TC_FAKE_CLIENTS:-}" ]]; then
+		# Test hook: a comma separated list stands in for live connections.
+		printf '%s\n' "${DOHCORD_RELAY_TC_FAKE_CLIENTS}" | tr ',' '\n'
+		return 0
+	fi
+
+	local -A seen=()
+
+	if [[ "${service}" == "proxy" ]]; then
+		while read -r line; do
+			ip="$(peer_ip "${line##* }")"
+			[[ "${ip}" =~ ^[0-9a-fA-F:.]+$ ]] || continue
+			[[ -n "${seen["${ip}"]:-}" ]] && continue
+			seen["${ip}"]=1
+			printf '%s\n' "${ip}"
+		done < <(ss -Htn state established "( sport = :${PROXY_PORT} )" 2>/dev/null || true)
+		return 0
+	fi
+
+	while read -r lport peer; do
+		lport="${lport##*:}"
+		[[ "${lport}" =~ ^[0-9]+$ ]] || continue
+		local local_port=$((10#lport)) relevant=0 p
+		for p in "${TURN_PORTS[@]}"; do
+			((local_port == p)) && relevant=1
+		done
+		if ((RELAY_RANGE && local_port >= RELAY_MIN && local_port <= RELAY_MAX)); then
+			relevant=1
+		fi
+		((relevant)) || continue
+		ip="$(peer_ip "${peer}")"
+		[[ "${ip}" =~ ^[0-9a-fA-F:.]+$ ]] || continue
+		[[ "${ip}" == "0.0.0.0" || "${ip}" == "*" || "${ip}" == "::" ]] && continue
+		[[ -n "${seen["${ip}"]:-}" ]] && continue
+		seen["${ip}"]=1
+		printf '%s\n' "${ip}"
+	done < <(ss -Huan 2>/dev/null | awk '{print $4, $5}')
+}
+
+# --- Apply and refresh ------------------------------------------------------
+apply_rules() {
+	ensure_device || return 1
+	refresh_rules
+}
+
+refresh_rules() {
+	local now key dir service ip minor rate rebuild=0 k
+	now="$(date +%s)"
+	local -A current=()
+
+	for service in proxy turn; do
+		for dir in upload download; do
+			rate="$(class_rate "${service}" "${dir}")"
+			((rate > 0)) || continue
+
+			while read -r ip; do
+				[[ -n "${ip}" ]] || continue
+				key="${dir}|${service}|${ip}"
+				[[ -n "${current["${key}"]:-}" ]] && continue
+
+				if [[ -z "${ALLOC_MINOR["${key}"]:-}" ]]; then
+					# A new address is only tracked while the table has room.
+					local tracked=0
+					for k in "${!ALLOC_MINOR[@]}"; do
+						[[ "${k%%|*}" == "${dir}" ]] && tracked=$((tracked + 1))
+					done
+					if ((tracked >= TC_MAX_CLIENTS)); then
+						warn "${service} ${dir}: ${TC_MAX_CLIENTS} client addresses are already tracked; ${ip} is not limited. Raise TC_MAX_CLIENTS or reduce the number of active addresses."
+						continue
+					fi
+					minor="$(next_minor "${dir}")" || {
+						warn "no free class left for ${service} ${dir}; ${ip} is not limited"
+						continue
+					}
+					ALLOC_MINOR["${key}"]="${minor}"
+					USED_MINOR["${dir}|${minor}"]="${service}|${ip}"
+					add_class "${dir}" "${service}" "${minor}" "${rate}"
+					rebuild=1
+				fi
+				current["${key}"]=1
+				ALLOC_SEEN["${key}"]="${now}"
+			done < <(discover_clients "${service}" "${dir}")
+		done
+	done
+
+	# Forget addresses that have been gone longer than TC_IDLE_SECONDS.
+	for key in "${!ALLOC_MINOR[@]}"; do
+		[[ -n "${current["${key}"]:-}" ]] && continue
+		IFS='|' read -r dir service ip <<<"${key}"
+		minor="${ALLOC_MINOR["${key}"]}"
+		local seen="${ALLOC_SEEN["${key}"]:-0}"
+		((now - seen < TC_IDLE_SECONDS)) && continue
+		if [[ "${dir}" == "download" ]]; then
+			run_tc class del dev "${IFACE}" classid "${EGRESS_HANDLE}:${minor}" 2>/dev/null || true
+		else
+			run_tc class del dev "${IFB}" classid "${INGRESS_HANDLE}:${minor}" 2>/dev/null || true
+		fi
+		unset "ALLOC_MINOR[${key}]" "ALLOC_SEEN[${key}]" "USED_MINOR[\"${dir}|${minor}\"]"
+		rebuild=1
+	done
+
+	# Filters are cheap and fully derived from the class table: rebuild them
+	# whenever that table changed, or the first time this process runs. That
+	# keeps a restarted service from stacking duplicate filters.
+	if ((rebuild || !FILTERS_READY)); then
+		reset_filters
+		for key in "${!ALLOC_MINOR[@]}"; do
+			IFS='|' read -r dir service ip <<<"${key}"
+			add_filters "${dir}" "${service}" "${ALLOC_MINOR["${key}"]}" "${ip}"
+		done
+		FILTERS_READY=1
+		save_state
+	fi
+	return 0
+}
+
+# --- Status -----------------------------------------------------------------
+# status prints key=value lines and exits 0 only when every configured limit is
+# actually installed on the interface.
+status() {
+	local problems=0 active_class egress_ok=0 ingress_ok=0 needed=0
+	printf 'interface=%s\n' "${IFACE:-unknown}"
+	printf 'proxy_upload_mbit=%s\n' "${PROXY_UPLOAD_LIMIT_MBIT}"
+	printf 'proxy_download_mbit=%s\n' "${PROXY_DOWNLOAD_LIMIT_MBIT}"
+	printf 'turn_upload_mbit=%s\n' "${TURN_UPLOAD_LIMIT_MBIT}"
+	printf 'turn_download_mbit=%s\n' "${TURN_DOWNLOAD_LIMIT_MBIT}"
+	printf 'max_clients=%s\n' "${TC_MAX_CLIENTS}"
+	[[ -n "$(shaping_directions proxy)$(shaping_directions turn)" ]] && needed=1
+	printf 'limits_configured=%s\n' "${needed}"
+
+	if ! command -v tc >/dev/null 2>&1; then
+		printf 'shaping=unavailable\n'
+		fail "tc is not installed; no bandwidth limit is being enforced"
+		return 1
+	fi
+	if [[ -z "${IFACE}" ]]; then
+		printf 'shaping=inactive\n'
+		fail "no network interface detected; no bandwidth limit is being enforced"
+		return 1
+	fi
+	if ((needed == 0)); then
+		printf 'shaping=disabled\n'
+		return 0
+	fi
+
+	if own_qdisc; then
+		egress_ok=1
+		printf 'egress_qdisc=htb %s:\n' "${EGRESS_HANDLE}"
+	else
+		printf 'egress_qdisc=%s\n' "$(current_root_qdisc)"
+	fi
+	if have_ifb && tc qdisc show dev "${IFB}" 2>/dev/null | grep -q "qdisc htb ${INGRESS_HANDLE}: root"; then
+		ingress_ok=1
+		printf 'ingress_qdisc=htb %s:,%s\n' "${INGRESS_HANDLE}" "${IFB}"
+	else
+		printf 'ingress_qdisc=missing\n'
+	fi
+
+	load_state
+	local key dir service ip minor rate line active_rate unit checked
+	local -A reported=()
+	for key in "${!ALLOC_MINOR[@]}"; do
+		IFS='|' read -r dir service ip <<<"${key}"
+		rate="$(class_rate "${service}" "${dir}")"
+		((rate > 0)) || continue
+		minor="${ALLOC_MINOR["${key}"]}"
+		if [[ "${dir}" == "download" ]]; then
+			line="$(tc class show dev "${IFACE}" 2>/dev/null | grep "class htb ${EGRESS_HANDLE}:${minor} " || true)"
+		else
+			line="$(tc class show dev "${IFB}" 2>/dev/null | grep "class htb ${INGRESS_HANDLE}:${minor} " || true)"
+		fi
+		if [[ -z "${line}" ]]; then
+			printf 'missing_class=%s,%s,%s\n' "${dir}" "${service}" "${ip}"
+			problems=$((problems + 1))
+			continue
+		fi
+		# The rate the kernel actually holds for this class, in Mbit/s, so a
+		# configuration change that was never applied is visible.
+		active_rate="$(sed -n 's/.*rate \([0-9][0-9]*\)\([KMGT]\?\)bit.*/\1 \2/p' <<<"${line}" | head -1)"
+		checked="${dir},${service}"
+		[[ -n "${reported["${checked}"]:-}" ]] && continue
+		if [[ -z "${active_rate}" ]]; then
+			printf 'rate_unreadable=%s,%s\n' "${dir}" "${service}"
+			continue
+		fi
+		unit="${active_rate##* }"
+		active_rate="${active_rate%% *}"
+		case "${unit}" in
+		M | "") ;;
+		K) active_rate=$((active_rate / 1000)) ;;
+		G) active_rate=$((active_rate * 1000)) ;;
+		*) active_rate=0 ;;
+		esac
+		reported["${checked}"]=1
+		printf 'active_rate=%s,%s,%s\n' "${dir}" "${service}" "${active_rate}"
+		if ((active_rate != rate)); then
+			printf 'rate_mismatch=%s,%s,%s,%s\n' "${dir}" "${service}" "${rate}" "${active_rate}"
+			problems=$((problems + 1))
+		fi
+	done
+
+	if ((problems == 0 && egress_ok == 1)); then
+		if [[ -n "$(shaping_directions proxy)$(shaping_directions turn)" ]] && ((ingress_ok == 0)); then
+			printf 'shaping=partial\n'
+			fail "upload limits are configured but the ingress shaper is not active"
+			return 1
+		fi
+		printf 'shaping=active\n'
+		printf 'shaped_addresses=%s\n' "${#ALLOC_MINOR[@]}"
+		return 0
+	fi
+	printf 'shaping=inactive\n'
+	fail "bandwidth limits are configured but are not enforced on ${IFACE} (${problems} missing classes)"
+	return 1
+}
+
+# --- Stop -------------------------------------------------------------------
+stop_shaping() {
+	detect_interface || true
+	if [[ -n "${IFACE}" ]]; then
+		local previous=""
+		[[ -r "$(previous_root_file)" ]] && previous="$(cat "$(previous_root_file)")"
+		if own_qdisc || ((DRY_RUN)); then
+			run_tc qdisc del dev "${IFACE}" root
+			if [[ -n "${previous}" && "${previous}" != "none" ]]; then
+				run_tc qdisc replace dev "${IFACE}" root "${previous}" || warn "could not restore the previous root qdisc (${previous})"
+			fi
+		fi
+		run_tc qdisc del dev "${IFACE}" handle ffff: ingress
+	fi
+	if have_ifb; then
+		if ((DRY_RUN)); then
+			printf 'ip link del %s\n' "${IFB}"
+		else
+			ip link del "${IFB}" 2>/dev/null || true
+		fi
+	fi
+	((DRY_RUN)) || rm -rf "${STATE_DIR}"
+	return 0
+}
+
+# --- Watch ------------------------------------------------------------------
+watch() {
+	local interval="${TC_REFRESH_SECONDS}"
+	((interval < 1)) && interval=1
+	if ((ONCE)); then
+		refresh_rules
+		return 0
+	fi
+	trap 'exit 0' TERM INT
+	while :; do
+		refresh_rules || warn "refresh failed; the previous rules stay in place"
+		sleep "${interval}" &
+		wait $! || true
+	done
+}
+
+# --- Main -------------------------------------------------------------------
+parse_args() {
+	while [[ $# -gt 0 ]]; do
+		case "$1" in
+		apply | refresh | status | stop | validate | watch)
+			COMMAND="$1"
+			shift
+			;;
+		--dry-run)
+			DRY_RUN=1
+			shift
+			;;
+		--once)
+			ONCE=1
+			shift
+			;;
+		--config)
+			CONFIG="${2:-}"
+			shift 2
+			;;
+		--interface)
+			TC_INTERFACE="${2:-}"
+			shift 2
+			;;
+		-v | --verbose)
+			VERBOSE=1
+			shift
+			;;
+		-h | --help)
+			usage
+			exit 0
+			;;
+		*)
+			die "unknown option: $1 (see --help)"
+			;;
+		esac
+	done
+	if [[ -z "${COMMAND}" ]]; then
+		usage
+		exit 1
+	fi
+}
+
+main() {
+	parse_args "$@"
+	load_config
+	validate_config || die "the bandwidth limits in ${CONFIG} are not usable; nothing was changed"
+
+	if [[ "${COMMAND}" == "validate" ]]; then
+		ok "bandwidth limits are valid: proxy ${PROXY_DOWNLOAD_LIMIT_MBIT}/${PROXY_UPLOAD_LIMIT_MBIT} Mbit/s down/up per client IP, TURN ${TURN_DOWNLOAD_LIMIT_MBIT}/${TURN_UPLOAD_LIMIT_MBIT} Mbit/s down/up per client IP"
+		return 0
+	fi
+
+	case "${COMMAND}" in
+	apply | refresh | watch | stop)
+		if ((DRY_RUN == 0 && EUID != 0)); then
+			die "changing traffic-control rules needs root"
+		fi
+		;;
+	esac
+	detect_interface || {
+		if [[ "${COMMAND}" == "status" ]]; then
+			status
+			exit 1
+		fi
+		die "no network interface detected; set TC_INTERFACE in ${CONFIG}"
+	}
+
+	case "${COMMAND}" in
+	apply)
+		if all_limits_disabled; then
+			stop_shaping
+			ok "all bandwidth limits are set to 0; traffic shaping is disabled"
+			return 0
+		fi
+		ensure_state_dir
+		load_state
+		apply_rules || die "could not install the traffic-shaping rules"
+		if ((DRY_RUN)); then
+			return 0
+		fi
+		if ! status >/dev/null; then
+			fail "the rules were written but they are not active; run ${PROGRAM} status for details"
+			return 1
+		fi
+		ok "per-client-IP bandwidth limits are installed on ${IFACE}"
+		;;
+	refresh)
+		ensure_state_dir
+		load_state
+		refresh_rules
+		;;
+	watch)
+		ensure_state_dir
+		load_state
+		watch
+		;;
+	status)
+		status
+		;;
+	stop)
+		stop_shaping
+		if ((DRY_RUN == 0)); then
+			ok "traffic shaping removed"
+		fi
+		;;
+	esac
+}
+
+main "$@"

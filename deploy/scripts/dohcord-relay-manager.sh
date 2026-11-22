@@ -42,6 +42,11 @@ COTURN_UNIT="dohcord-relay-coturn.service"
 RENEW_TIMER="dohcord-relay-certbot-renew.timer"
 UNITS=("${API_UNIT}" "${SQUID_UNIT}" "${COTURN_UNIT}")
 REPO_SLUG="Newipe/Dohcord-relay"
+TC_SCRIPT="${DOHCORD_RELAY_TC:-${LIB_DIR}/dohcord-relay-tc}"
+SQUID_BIN="${DOHCORD_RELAY_SQUID_BIN:-/usr/sbin/squid}"
+LIMITS_PENDING="${ETC_DIR}/pending"
+LIMITS_BACKUP_ROOT="${DOHCORD_RELAY_BACKUP_DIR:-/var/backups/dohcord-relay}"
+readonly LIMIT_KEYS=(PROXY_UPLOAD_LIMIT_MBIT PROXY_DOWNLOAD_LIMIT_MBIT TURN_UPLOAD_LIMIT_MBIT TURN_DOWNLOAD_LIMIT_MBIT PER_IP_RATE_PER_MINUTE PER_IP_BURST GLOBAL_RATE_PER_MINUTE GLOBAL_BURST TC_MAX_CLIENTS TC_REFRESH_SECONDS)
 LAST_POLICY_BACKUP=""
 
 # --- Output -----------------------------------------------------------------
@@ -922,6 +927,76 @@ diagnostics() {
 		fi
 	fi
 
+	# Limits and performance
+	local key bw_configured=0 tc_out shaping_state
+	for key in PROXY_UPLOAD_LIMIT_MBIT PROXY_DOWNLOAD_LIMIT_MBIT TURN_UPLOAD_LIMIT_MBIT TURN_DOWNLOAD_LIMIT_MBIT; do
+		local v
+		v="$(limits_read "${key}")"
+		if [[ "${v}" =~ ^[0-9]+$ ]] && ((10#${v} > 0)); then
+			bw_configured=1
+		fi
+	done
+	printf '  %-24s proxy %s/%s Mbps, TURN %s/%s Mbps (down/up per IP)\n' \
+		"Bandwidth limits" \
+		"$(limits_read PROXY_DOWNLOAD_LIMIT_MBIT)" "$(limits_read PROXY_UPLOAD_LIMIT_MBIT)" \
+		"$(limits_read TURN_DOWNLOAD_LIMIT_MBIT)" "$(limits_read TURN_UPLOAD_LIMIT_MBIT)"
+	printf '  %-24s %s/min per IP (burst %s), %s/min global (burst %s)\n' \
+		"API rate limits" \
+		"$(limits_read PER_IP_RATE_PER_MINUTE)" "$(limits_read PER_IP_BURST)" \
+		"$(limits_read GLOBAL_RATE_PER_MINUTE)" "$(limits_read GLOBAL_BURST)"
+	if ((bw_configured)); then
+		shaping_state=""
+		if [[ -x "${TC_SCRIPT}" ]]; then
+			tc_out="$("${TC_SCRIPT}" status 2>&1)" || true
+			shaping_state="$(printf '%s\n' "${tc_out}" | sed -n 's/^shaping=//p' | tail -1)"
+		fi
+		case "${shaping_state}" in
+		active)
+			ok "per-client-IP bandwidth limits are enforced"
+			printf '%s\n' "${tc_out}" | sed -n 's/^interface=/        interface /p;s/^shaped_addresses=/        shaped addresses /p'
+			if printf '%s\n' "${tc_out}" | grep -q '^rate_mismatch='; then
+				bad "the active shaping rules do not carry the configured rates"
+				problems=$((problems + 1))
+			fi
+			;;
+		*)
+			bad "bandwidth limits are configured but NOT enforced (shaping ${shaping_state:-unavailable})"
+			info "the relay is running, but clients are not limited; run: ${TC_SCRIPT} apply"
+			problems=$((problems + 1))
+			;;
+		esac
+	else
+		ok "bandwidth limits are disabled by configuration (0 = unlimited)"
+	fi
+
+	# API response time is what a profile load waits for.
+	if [[ -n "$(api_url)" ]] && have curl; then
+		local total=0 ok_samples=0 one
+		for _ in 1 2 3 4 5; do
+			one="$(curl -sS -o /dev/null --max-time 8 -w '%{time_total}' "$(api_url)" 2>/dev/null)" || continue
+			[[ "${one}" =~ ^[0-9.]+$ ]] || continue
+			total="$(awk -v a="${total}" -v b="${one}" 'BEGIN { printf "%.4f", a + b }')"
+			ok_samples=$((ok_samples + 1))
+		done
+		if ((ok_samples > 0)); then
+			local avg_ms
+			avg_ms="$(awk -v t="${total}" -v n="${ok_samples}" 'BEGIN { printf "%.0f", t / n * 1000 }')"
+			if ((avg_ms < 1000)); then
+				ok "profile load takes ${avg_ms} ms on average"
+			else
+				bad "profile load takes ${avg_ms} ms on average: slower than a profile should wait"
+				problems=$((problems + 1))
+			fi
+		fi
+	fi
+	if command -v journalctl >/dev/null 2>&1; then
+		local limited_count
+		limited_count="$(journalctl -u "${API_UNIT}" --since '-1 hour' --no-pager 2>/dev/null | grep -c 'rate limited' || true)"
+		if [[ "${limited_count:-0}" != "0" ]]; then
+			warn "${limited_count} API request(s) were rate limited in the last hour (per-IP burst is $(limits_read PER_IP_BURST))"
+		fi
+	fi
+
 	# Certificate
 	if [[ -r "${TLS_DIR}/fullchain.pem" ]]; then
 		local days
@@ -994,6 +1069,478 @@ diagnostics() {
 			DOHCORD_RELAY_SKIP_RENEW=1 bash "${script}" || true
 		fi
 	fi
+}
+
+# --- Limits and performance -------------------------------------------------
+# Every limit lives in a file the installer writes, so this section edits those
+# files. Changes are staged in a pending copy, validated as a whole, backed up,
+# written, applied and verified; a failure restores the previous configuration
+# and restarts the services that were touched.
+
+limits_pending_config() { printf '%s/config.env' "${LIMITS_PENDING}"; }
+limits_pending_squid() { printf '%s/squid.conf' "${LIMITS_PENDING}"; }
+limits_pending_turn() { printf '%s/turnserver.conf' "${LIMITS_PENDING}"; }
+
+limits_default() {
+	case "$1" in
+	PROXY_UPLOAD_LIMIT_MBIT | PROXY_DOWNLOAD_LIMIT_MBIT) printf '8' ;;
+	TURN_UPLOAD_LIMIT_MBIT | TURN_DOWNLOAD_LIMIT_MBIT) printf '16' ;;
+	PER_IP_RATE_PER_MINUTE) printf '60' ;;
+	PER_IP_BURST) printf '30' ;;
+	GLOBAL_RATE_PER_MINUTE) printf '1200' ;;
+	GLOBAL_BURST) printf '300' ;;
+	TC_MAX_CLIENTS) printf '512' ;;
+	TC_REFRESH_SECONDS) printf '5' ;;
+	esac
+}
+
+limits_label() {
+	case "$1" in
+	PROXY_UPLOAD_LIMIT_MBIT) printf 'Proxy upload per client IP' ;;
+	PROXY_DOWNLOAD_LIMIT_MBIT) printf 'Proxy download per client IP' ;;
+	TURN_UPLOAD_LIMIT_MBIT) printf 'TURN upload per client IP' ;;
+	TURN_DOWNLOAD_LIMIT_MBIT) printf 'TURN download per client IP' ;;
+	PER_IP_RATE_PER_MINUTE) printf 'API requests per IP per minute' ;;
+	PER_IP_BURST) printf 'API request burst per IP' ;;
+	GLOBAL_RATE_PER_MINUTE) printf 'API requests per minute (global)' ;;
+	GLOBAL_BURST) printf 'API request burst (global)' ;;
+	TC_MAX_CLIENTS) printf 'Client addresses shaped per service' ;;
+	TC_REFRESH_SECONDS) printf 'Seconds between shaping refreshes' ;;
+	esac
+}
+
+limits_unit() {
+	case "$1" in
+	*_MBIT) printf ' Mbps' ;;
+	*_RATE_PER_MINUTE) printf '/min' ;;
+	TC_REFRESH_SECONDS) printf 's' ;;
+	esac
+}
+
+limits_value_from() { # FILE KEY PENDING
+	local file="$1" key="$2" source="$1"
+	if [[ -n "${3:-}" && -r "$3" ]]; then
+		source="$3"
+	fi
+	sed -n "s/^${key}=//p" "${source}" 2>/dev/null | tail -1
+}
+
+# limits_read prints one setting from the pending copy, falling back to the live
+# configuration and then to the shipped default.
+limits_read() {
+	local key="$1" value=""
+	value="$(limits_value_from "${CONFIG_FILE}" "${key}" "$(limits_pending_config)")"
+	[[ -n "${value}" ]] || value="$(limits_default "${key}")"
+	printf '%s' "${value}"
+}
+
+limits_set_pending() { # KEY VALUE
+	local key="$1" value="$2"
+	limits_set_file "$(limits_pending_config)" "${key}" "${value}"
+}
+
+limits_set_file() { # FILE KEY VALUE
+	local file="$1" key="$2" value="$3"
+	if grep -q "^${key}=" "${file}" 2>/dev/null; then
+		sed -i "s|^${key}=.*|${key}=${value}|" "${file}"
+	else
+		printf '%s=%s\n' "${key}" "${value}" >>"${file}"
+	fi
+}
+
+# limits_number_problem prints why VALUE is unusable and returns 0; returns 1
+# when it is inside MIN..MAX.
+limits_number_problem() { # LABEL VALUE MIN MAX
+	local label="$1" value="$2" min="$3" max="$4"
+	if [[ ! "${value}" =~ ^[0-9]{1,11}$ ]]; then
+		printf '%s must be a whole number, got %q' "${label}" "${value}"
+		return 0
+	fi
+	if ((10#${value} < min || 10#${value} > max)); then
+		printf '%s must be between %d and %d, got %s' "${label}" "${min}" "${max}" "${value}"
+		return 0
+	fi
+	return 1
+}
+
+limits_stage() {
+	if [[ ! -d "${LIMITS_PENDING}" ]]; then
+		install -d -m 0700 -o root -g root "${LIMITS_PENDING}" 2>/dev/null || mkdir -p "${LIMITS_PENDING}" || return 1
+	fi
+	local file
+	for file in config.env squid.conf turnserver.conf; do
+		[[ -r "${LIMITS_PENDING}/${file}" ]] && continue
+		if [[ -r "${ETC_DIR}/${file}" ]]; then
+			cp -p "${ETC_DIR}/${file}" "${LIMITS_PENDING}/${file}"
+		fi
+	done
+}
+
+limits_discard() { rm -rf "${LIMITS_PENDING}"; }
+
+limits_squid_connections() {
+	local source="${SQUID_CONF}"
+	[[ -r "$(limits_pending_squid)" ]] && source="$(limits_pending_squid)"
+	sed -n 's/^[[:space:]]*client_ip_max_connections[[:space:]]\{1,\}\([0-9][0-9]*\).*/\1/p' "${source}" 2>/dev/null | tail -1
+}
+
+limits_turn_value() { # KEY
+	local source="${TURNSERVER_CONF}"
+	[[ -r "$(limits_pending_turn)" ]] && source="$(limits_pending_turn)"
+	sed -n "s/^${1}=//p" "${source}" 2>/dev/null | tail -1
+}
+
+limits_shaping_summary() {
+	if [[ -x "${TC_SCRIPT}" ]]; then
+		local out
+		out="$("${TC_SCRIPT}" status 2>/dev/null || true)"
+		printf '%s\n' "${out}" | sed -n 's/^shaping=/    shaping status       /p;s/^interface=/    interface            /p;s/^egress_qdisc=/    egress qdisc         /p;s/^ingress_qdisc=/    ingress qdisc        /p;s/^shaped_addresses=/    shaped addresses     /p'
+	else
+		dim "traffic-shaping helper not installed (${TC_SCRIPT})"
+	fi
+}
+
+limits_show() {
+	heading "Limits and performance"
+	local key
+	say "  Bandwidth limits are per client IP, not per connection; 0 means unlimited."
+	say "  Proxy and TURN are accounted separately."
+	say ""
+	say "  Bandwidth (Mbit/s)"
+	for key in PROXY_UPLOAD_LIMIT_MBIT PROXY_DOWNLOAD_LIMIT_MBIT TURN_UPLOAD_LIMIT_MBIT TURN_DOWNLOAD_LIMIT_MBIT; do
+		printf '    %-38s %s\n' "$(limits_label "${key}")" "$(limits_read "${key}")$(limits_unit "${key}")"
+	done
+	say ""
+	say "  API request limits"
+	for key in PER_IP_RATE_PER_MINUTE PER_IP_BURST GLOBAL_RATE_PER_MINUTE GLOBAL_BURST; do
+		printf '    %-38s %s\n' "$(limits_label "${key}")" "$(limits_read "${key}")$(limits_unit "${key}")"
+	done
+	say ""
+	say "  Proxy and TURN"
+	printf '    %-38s %s\n' "Concurrent proxy connections per IP" "$(limits_squid_connections)"
+	printf '    %-38s %s\n' "TURN allocations per credential" "$(limits_turn_value user-quota)"
+	printf '    %-38s %s\n' "TURN allocations in total" "$(limits_turn_value total-quota)"
+	printf '    %-38s %s\n' "TURN per-session ceiling (bytes/s)" "$(limits_turn_value max-bps)"
+	printf '    %-38s %s\n' "TURN relay capacity (bytes/s)" "$(limits_turn_value bps-capacity)"
+	say ""
+	say "  Traffic shaping"
+	printf '    %-38s %s\n' "$(limits_label TC_MAX_CLIENTS)" "$(limits_read TC_MAX_CLIENTS)"
+	printf '    %-38s %s\n' "$(limits_label TC_REFRESH_SECONDS)" "$(limits_read TC_REFRESH_SECONDS)s"
+	limits_shaping_summary
+	if [[ -d "${LIMITS_PENDING}" ]]; then
+		say ""
+		warn "unapplied changes are staged; choose Apply staged changes to activate them"
+	fi
+}
+
+limits_prompt() { # KEY MIN MAX
+	local key="$1" min="$2" max="$3" current answer reason
+	current="$(limits_read "${key}")"
+	while true; do
+		printf '  %s [%s]: ' "$(limits_label "${key}")" "${current}"
+		read -r answer || return 1
+		answer="${answer:-${current}}"
+		answer="${answer//[[:space:]]/}"
+		if reason="$(limits_number_problem "$(limits_label "${key}")" "${answer}" "${min}" "${max}")"; then
+			warn "${reason}"
+			continue
+		fi
+		limits_set_pending "${key}" "$((10#${answer}))"
+		ok "$(limits_label "${key}") set to $((10#${answer}))$(limits_unit "${key}")"
+		return 0
+	done
+}
+
+limits_edit_api() {
+	limits_prompt PER_IP_RATE_PER_MINUTE 1 1000000 || return 0
+	limits_prompt PER_IP_BURST 1 1000000 || return 0
+	limits_prompt GLOBAL_RATE_PER_MINUTE 1 1000000 || return 0
+	limits_prompt GLOBAL_BURST 1 1000000 || return 0
+}
+
+limits_edit_connections() {
+	local current answer reason max
+	max="$(sed -n 's/^max_filedescriptors[[:space:]]\{1,\}\([0-9][0-9]*\).*/\1/p' "${SQUID_CONF}" 2>/dev/null | tail -1)"
+	max="${max:-8192}"
+	current="$(limits_squid_connections)"
+	current="${current:-100}"
+	limits_stage
+	while true; do
+		printf '  Concurrent proxy connections per client IP [%s]: ' "${current}"
+		read -r answer || return 0
+		answer="${answer:-${current}}"
+		answer="${answer//[[:space:]]/}"
+		if reason="$(limits_number_problem "connections per client IP" "${answer}" 1 "${max}")"; then
+			warn "${reason} (max_filedescriptors is ${max})"
+			continue
+		fi
+		limits_set_file "$(limits_pending_squid)" client_ip_max_connections "$((10#${answer}))"
+		ok "each client IP may hold $((10#${answer})) concurrent proxy connections"
+		return 0
+	done
+}
+
+limits_edit_turn() {
+	local key current answer reason user total
+	limits_stage
+	for key in user-quota total-quota; do
+		current="$(limits_turn_value "${key}")"
+		current="${current:-12}"
+		while true; do
+			printf '  %s [%s]: ' "${key}" "${current}"
+			read -r answer || return 0
+			answer="${answer:-${current}}"
+			answer="${answer//[[:space:]]/}"
+			if reason="$(limits_number_problem "${key}" "${answer}" 1 100000)"; then
+				warn "${reason}"
+				continue
+			fi
+			limits_set_file "$(limits_pending_turn)" "${key}" "$((10#${answer}))"
+			ok "${key} set to $((10#${answer}))"
+			break
+		done
+	done
+	user="$(limits_turn_value user-quota)"
+	total="$(limits_turn_value total-quota)"
+	if [[ "${user}" =~ ^[0-9]+$ && "${total}" =~ ^[0-9]+$ ]] && ((total < user)); then
+		warn "total-quota (${total}) is below user-quota (${user}); allocations may be refused"
+	fi
+	for key in max-bps bps-capacity; do
+		current="$(limits_turn_value "${key}")"
+		current="${current:-2000000}"
+		while true; do
+			printf '  %s (bytes/s) [%s]: ' "${key}" "${current}"
+			read -r answer || return 0
+			answer="${answer:-${current}}"
+			answer="${answer//[[:space:]]/}"
+			if reason="$(limits_number_problem "${key}" "${answer}" 1000 10000000000)"; then
+				warn "${reason}"
+				continue
+			fi
+			limits_set_file "$(limits_pending_turn)" "${key}" "$((10#${answer}))"
+			ok "${key} set to $((10#${answer})) bytes/s"
+			break
+		done
+	done
+}
+
+limits_validate() {
+	local problems=0 key value reason min max connections user total bps cap
+	local -A ranges=(
+		[PROXY_UPLOAD_LIMIT_MBIT]="0 100000"
+		[PROXY_DOWNLOAD_LIMIT_MBIT]="0 100000"
+		[TURN_UPLOAD_LIMIT_MBIT]="0 100000"
+		[TURN_DOWNLOAD_LIMIT_MBIT]="0 100000"
+		[PER_IP_RATE_PER_MINUTE]="1 1000000"
+		[PER_IP_BURST]="1 1000000"
+		[GLOBAL_RATE_PER_MINUTE]="1 1000000"
+		[GLOBAL_BURST]="1 1000000"
+		[TC_MAX_CLIENTS]="1 2047"
+		[TC_REFRESH_SECONDS]="1 60"
+	)
+	for key in "${LIMIT_KEYS[@]}"; do
+		value="$(limits_read "${key}")"
+		read -r min max <<<"${ranges[${key}]}"
+		if reason="$(limits_number_problem "$(limits_label "${key}")" "${value}" "${min}" "${max}")"; then
+			bad "${reason}"
+			problems=$((problems + 1))
+		fi
+	done
+	connections="$(limits_squid_connections)"
+	if [[ -z "${connections}" ]]; then
+		bad "squid.conf has no client_ip_max_connections line"
+		problems=$((problems + 1))
+	fi
+	user="$(limits_turn_value user-quota)"
+	total="$(limits_turn_value total-quota)"
+	bps="$(limits_turn_value max-bps)"
+	cap="$(limits_turn_value bps-capacity)"
+	for pair in "user-quota:${user}:1:100000" "total-quota:${total}:1:100000" "max-bps:${bps}:1000:10000000000" "bps-capacity:${cap}:1000:10000000000"; do
+		IFS=':' read -r key value min max <<<"${pair}"
+		if reason="$(limits_number_problem "${key}" "${value}" "${min}" "${max}")"; then
+			bad "${reason}"
+			problems=$((problems + 1))
+		fi
+	done
+	if [[ "${user}" =~ ^[0-9]+$ && "${total}" =~ ^[0-9]+$ ]] && ((total < user)); then
+		bad "total-quota (${total}) must be at least user-quota (${user})"
+		problems=$((problems + 1))
+	fi
+	if [[ "${bps}" =~ ^[0-9]+$ && "${cap}" =~ ^[0-9]+$ ]] && ((cap < bps)); then
+		bad "bps-capacity (${cap}) must be at least max-bps (${bps}); coturn would refuse allocations"
+		problems=$((problems + 1))
+	fi
+	((problems == 0))
+}
+
+limits_restore_from() { # DIR
+	local dir="$1" file
+	for file in config.env squid.conf turnserver.conf; do
+		[[ -r "${dir}/${file}" ]] && cp -p "${dir}/${file}" "${ETC_DIR}/${file}"
+	done
+}
+
+# limits_apply writes the staged configuration, applies it and verifies it. Any
+# failure restores the previous files and restarts what was restarted.
+limits_apply() {
+	need_root
+	require_install
+	if [[ ! -d "${LIMITS_PENDING}" ]]; then
+		info "no staged changes; nothing to apply"
+		return 0
+	fi
+	if ! limits_validate; then
+		bad "the staged configuration is not valid; nothing was changed"
+		return 1
+	fi
+	if [[ -r "$(limits_pending_squid)" ]]; then
+		if ! "${SQUID_BIN}" -k parse -f "$(limits_pending_squid)" >/dev/null 2>&1; then
+			bad "Squid rejected the new configuration; nothing was changed"
+			"${SQUID_BIN}" -k parse -f "$(limits_pending_squid)" 2>&1 | tail -5 | sed 's/^/        /'
+			return 1
+		fi
+	fi
+
+	local stamp backup file failed=0 config_changed=0 squid_changed=0 turn_changed=0
+	stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+	backup="${LIMITS_BACKUP_ROOT}/limits-${stamp}"
+	install -d -m 0700 -o root -g root "${backup}"
+	for file in config.env squid.conf turnserver.conf; do
+		[[ -r "${ETC_DIR}/${file}" ]] && cp -p "${ETC_DIR}/${file}" "${backup}/${file}"
+	done
+	info "backup written to ${backup}"
+
+	if [[ -r "$(limits_pending_config)" ]] && ! cmp -s "$(limits_pending_config)" "${CONFIG_FILE}"; then
+		config_changed=1
+	fi
+	if [[ -r "$(limits_pending_squid)" ]] && ! cmp -s "$(limits_pending_squid)" "${SQUID_CONF}"; then
+		squid_changed=1
+	fi
+	if [[ -r "$(limits_pending_turn)" ]] && ! cmp -s "$(limits_pending_turn)" "${TURNSERVER_CONF}"; then
+		turn_changed=1
+	fi
+
+	((config_changed)) && cp -p "$(limits_pending_config)" "${CONFIG_FILE}"
+	((squid_changed)) && cp -p "$(limits_pending_squid)" "${SQUID_CONF}"
+	((turn_changed)) && cp -p "$(limits_pending_turn)" "${TURNSERVER_CONF}"
+
+	if ((config_changed)) && [[ -x "${TC_SCRIPT}" ]]; then
+		"${TC_SCRIPT}" apply >/dev/null 2>&1 || {
+			bad "the new bandwidth limits could not be applied"
+			failed=1
+		}
+	fi
+	if ((squid_changed)); then
+		systemctl reload "${SQUID_UNIT}" >/dev/null 2>&1 || systemctl restart "${SQUID_UNIT}" >/dev/null 2>&1 || failed=1
+	fi
+	if ((turn_changed)); then
+		systemctl restart "${COTURN_UNIT}" >/dev/null 2>&1 || failed=1
+	fi
+	if ((config_changed)); then
+		systemctl restart "${API_UNIT}" >/dev/null 2>&1 || failed=1
+	fi
+
+	if ((failed == 0)); then
+		sleep 1
+		local u
+		for u in "${UNITS[@]}"; do
+			if [[ "${u}" == "${SQUID_UNIT}" ]] && ((squid_changed == 0)); then
+				continue
+			fi
+			if [[ "${u}" == "${COTURN_UNIT}" ]] && ((turn_changed == 0)); then
+				continue
+			fi
+			if [[ "${u}" == "${API_UNIT}" ]] && ((config_changed == 0)); then
+				continue
+			fi
+			if [[ "$(unit_state "${u}")" != "active" ]]; then
+				bad "${u} did not stay running after applying the new limits"
+				failed=1
+			fi
+		done
+	fi
+	if ((failed == 0)) && ((config_changed)) && [[ -x "${TC_SCRIPT}" ]]; then
+		if ! "${TC_SCRIPT}" status >/dev/null 2>&1; then
+			bad "the shaper is not enforcing the new bandwidth limits"
+			"${TC_SCRIPT}" status 2>&1 | sed 's/^/        /' || true
+			failed=1
+		fi
+	fi
+
+	if ((failed)); then
+		limits_restore_from "${backup}"
+		warn "restored the previous configuration from ${backup}"
+		if ((squid_changed)); then
+			systemctl reload "${SQUID_UNIT}" >/dev/null 2>&1 || systemctl restart "${SQUID_UNIT}" >/dev/null 2>&1 || true
+		fi
+		if ((turn_changed)); then
+			systemctl restart "${COTURN_UNIT}" >/dev/null 2>&1 || true
+		fi
+		if ((config_changed)); then
+			systemctl restart "${API_UNIT}" >/dev/null 2>&1 || true
+			if [[ -x "${TC_SCRIPT}" ]]; then
+				"${TC_SCRIPT}" apply >/dev/null 2>&1 || true
+			fi
+		fi
+		bad "the new limits were not applied; the previous configuration is back in place"
+		return 1
+	fi
+
+	limits_discard
+	ok "limits applied and verified"
+	return 0
+}
+
+limits_menu() {
+	need_root
+	require_install
+	while true; do
+		limits_show
+		say ""
+		printf '  1. Change proxy bandwidth limits\n'
+		printf '  2. Change TURN bandwidth limits\n'
+		printf '  3. Change API request limits\n'
+		printf '  4. Change proxy connection limit\n'
+		printf '  5. Change TURN quotas and capacity\n'
+		printf '  6. Disable all bandwidth limits (0 = unlimited)\n'
+		printf '  7. Apply staged changes\n'
+		printf '  8. Discard staged changes\n'
+		printf '  0. Back\n\n  Select an option: '
+		local choice key
+		read -r choice || return 0
+		case "${choice}" in
+		1)
+			limits_stage
+			limits_prompt PROXY_UPLOAD_LIMIT_MBIT 0 100000 || :
+			limits_prompt PROXY_DOWNLOAD_LIMIT_MBIT 0 100000 || :
+			;;
+		2)
+			limits_stage
+			limits_prompt TURN_UPLOAD_LIMIT_MBIT 0 100000 || :
+			limits_prompt TURN_DOWNLOAD_LIMIT_MBIT 0 100000 || :
+			;;
+		3) limits_stage && limits_edit_api ;;
+		4) limits_edit_connections ;;
+		5) limits_edit_turn ;;
+		6)
+			limits_stage
+			for key in PROXY_UPLOAD_LIMIT_MBIT PROXY_DOWNLOAD_LIMIT_MBIT TURN_UPLOAD_LIMIT_MBIT TURN_DOWNLOAD_LIMIT_MBIT; do
+				limits_set_pending "${key}" 0
+			done
+			warn "all four bandwidth limits are staged as 0; choose Apply staged changes to remove the shaping rules"
+			;;
+		7) limits_apply || : ;;
+		8)
+			if [[ -d "${LIMITS_PENDING}" ]] && confirm "Discard the staged changes?"; then
+				limits_discard
+				ok "staged changes discarded"
+			fi
+			;;
+		0 | q | Q) return 0 ;;
+		*) warn "invalid option" ;;
+		esac
+		pause
+	done
 }
 
 # --- Update -----------------------------------------------------------------
@@ -1425,6 +1972,7 @@ menu() {
 		box_row "4. Domain policy" "9. Repair"
 		box_row "5. Firewall" "10. Uninstall"
 		box_line ""
+		box_row "11. Limits & performance" ""
 		box_row "0. Exit" ""
 		box_bottom
 		printf '\n'
@@ -1442,6 +1990,7 @@ menu() {
 		8) update_menu ;;
 		9) repair_menu ;;
 		10) uninstall_menu ;;
+		11) limits_menu ;;
 		0 | q | Q | exit) exit 0 ;;
 		*) warn "invalid option" ;;
 		esac
@@ -1763,6 +2312,7 @@ Usage: ${PROGRAM} [command]
   policy add|remove     Edit the policy files (validated, then optionally applied)
   policy check|apply    Validate, or validate and reload Squid
   cert status|renew     Certificate details, manual renewal
+  limits                Limits and performance (bandwidth, API rate, quotas)
   diagnostics           Health checks (optionally runs verify.sh)
   update                Download and install the newest version
   repair                Fix permissions, directories, stopped services
@@ -1820,6 +2370,7 @@ main() {
 		*) die "usage: ${PROGRAM} cert status|renew" ;;
 		esac
 		;;
+	limits | performance) limits_menu ;;
 	diagnostics | doctor) diagnostics ;;
 	update) update_menu ;;
 	repair) repair_menu ;;
