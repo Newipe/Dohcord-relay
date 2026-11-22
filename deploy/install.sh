@@ -151,6 +151,7 @@ fi
 step=0
 stage_names=()
 stage_done=()
+stage_failed=()
 
 banner() {
 	cat <<EOF
@@ -186,6 +187,14 @@ step_msg() {
 	step=$((step + 1))
 	stage_names+=("$*")
 	printf '\n  %s%02d%s  %s%s%s\n' "${C_DIM}" "${step}" "${C_RESET}" "${C_BOLD}" "$*" "${C_RESET}"
+}
+# step_failed marks the step that is running right now as failed, so the final
+# progress box does not report a check the installer already knows failed.
+step_failed() {
+	if ((step > 0)); then
+		stage_failed[step - 1]=1
+	fi
+	return 0
 }
 info() { printf '      %s\n' "$*"; }
 ok() { printf '      %s✓%s %s\n' "${C_GREEN}" "${C_RESET}" "$*"; }
@@ -227,7 +236,9 @@ print_progress() {
 	((pad < 1)) && pad=1
 	printf '\n  %s╭─ %s %s╮%s\n' "${C_CYAN}" "${title}" "$(repeat_char "${pad}" '─')" "${C_RESET}"
 	for i in "${!stage_names[@]}"; do
-		if [[ "${stage_done[i]:-0}" == "1" ]]; then
+		if [[ "${stage_failed[i]:-0}" == "1" ]]; then
+			printf '  │ %s[!!]%s %-*s │\n' "${C_RED}" "${C_RESET}" "${label_width}" "${stage_names[i]}"
+		elif [[ "${stage_done[i]:-0}" == "1" ]]; then
 			printf '  │ %s[OK]%s %-*s │\n' "${C_GREEN}" "${C_RESET}" "${label_width}" "${stage_names[i]}"
 		else
 			printf '  │ %s[--]%s %-*s │\n' "${C_DIM}" "${C_RESET}" "${label_width}" "${stage_names[i]}"
@@ -2254,6 +2265,7 @@ install_shaping() {
 	if [[ ! -f "${REPO_DIR}/deploy/scripts/dohcord-relay-tc" ]]; then
 		warn "the traffic-shaping helper is missing from this checkout; bandwidth limits cannot be enforced"
 		SHAPING_RC=1
+		step_failed
 		return 0
 	fi
 	install -m 0755 "${REPO_DIR}/deploy/scripts/dohcord-relay-tc" "${TC_SCRIPT}"
@@ -2271,6 +2283,7 @@ install_shaping() {
 	if ! command -v tc >/dev/null 2>&1; then
 		warn "tc (iproute2) is not available; the configured bandwidth limits are NOT enforced"
 		SHAPING_RC=1
+		step_failed
 		return 0
 	fi
 
@@ -2284,6 +2297,7 @@ install_shaping() {
 		warn "the bandwidth limits are configured but not active; diagnostics will report this until it is fixed"
 		"${TC_SCRIPT}" status 2>&1 | sed 's/^/      /' >&2 || true
 		SHAPING_RC=1
+		step_failed
 	fi
 }
 
@@ -2482,6 +2496,7 @@ main() {
 		run_verification || verify_rc=1
 	fi
 	((SHAPING_RC == 0)) || verify_rc=1
+	((verify_rc == 0)) || step_failed
 
 	write_install_info
 	print_progress

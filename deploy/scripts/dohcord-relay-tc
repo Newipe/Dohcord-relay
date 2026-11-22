@@ -74,9 +74,9 @@ FILTERS_READY=0
 
 # --- Output -----------------------------------------------------------------
 if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
-	C_RESET=$'\033[0m' C_GREEN=$'\033[32m' C_RED=$'\033[31m' C_YELLOW=$'\033[33m' C_DIM=$'\033[2m'
+	C_RESET=$'\033[0m' C_GREEN=$'\033[32m' C_RED=$'\033[31m' C_YELLOW=$'\033[33m'
 else
-	C_RESET="" C_GREEN="" C_RED="" C_YELLOW="" C_DIM=""
+	C_RESET="" C_GREEN="" C_RED="" C_YELLOW=""
 fi
 
 say() { printf '%s\n' "$*"; }
@@ -173,12 +173,12 @@ load_config() {
 		local min max p
 		min="$(sed -n 's/^min-port=//p' "${TURN_CONF}" | tail -1)"
 		max="$(sed -n 's/^max-port=//p' "${TURN_CONF}" | tail -1)"
-		[[ "${min}" =~ ^[0-9]+$ ]] && RELAY_MIN="$((10#min))"
-		[[ "${max}" =~ ^[0-9]+$ ]] && RELAY_MAX="$((10#max))"
+		[[ "${min}" =~ ^[0-9]+$ ]] && RELAY_MIN="$((10#${min}))"
+		[[ "${max}" =~ ^[0-9]+$ ]] && RELAY_MAX="$((10#${max}))"
 		p="$(sed -n 's/^listening-port=//p' "${TURN_CONF}" | tail -1)"
-		[[ "${p}" =~ ^[0-9]+$ ]] && TURN_PORTS[0]="$((10#p))"
+		[[ "${p}" =~ ^[0-9]+$ ]] && TURN_PORTS[0]="$((10#${p}))"
 		p="$(sed -n 's/^tls-listening-port=//p' "${TURN_CONF}" | tail -1)"
-		[[ "${p}" =~ ^[0-9]+$ ]] && TURN_PORTS[1]="$((10#p))"
+		[[ "${p}" =~ ^[0-9]+$ ]] && TURN_PORTS[1]="$((10#${p}))"
 	fi
 	if ((RELAY_MIN <= RELAY_MAX)); then
 		RELAY_RANGE=1
@@ -464,7 +464,7 @@ add_class() {
 # add_filters DIR SERVICE MINOR IP steers that address's relay traffic into its
 # class: one filter per service port, plus one for the coturn relay range.
 add_filters() {
-	local dir="$1" service="$2" minor="$3" ip="$4" p handle prefix sport dport
+	local dir="$1" service="$2" minor="$3" ip="$4" p handle prefix dport
 	local -a ports
 	service_ports "${service}"
 	ports=("${SERVICE_PORTS[@]}")
@@ -485,13 +485,11 @@ add_filters() {
 		dev="${IFACE}"
 		parent="${EGRESS_HANDLE}:"
 		key="dst"
-		sport=1
 		dport=0
 	else
 		dev="${IFB}"
 		parent="${INGRESS_HANDLE}:"
 		key="src"
-		sport=0
 		dport=1
 	fi
 
@@ -561,7 +559,7 @@ discover_clients() {
 	while read -r lport peer; do
 		lport="${lport##*:}"
 		[[ "${lport}" =~ ^[0-9]+$ ]] || continue
-		local local_port=$((10#lport)) relevant=0 p
+		local local_port=$((10#${lport})) relevant=0 p
 		for p in "${TURN_PORTS[@]}"; do
 			((local_port == p)) && relevant=1
 		done
@@ -629,8 +627,8 @@ refresh_rules() {
 		[[ -n "${current["${key}"]:-}" ]] && continue
 		IFS='|' read -r dir service ip <<<"${key}"
 		minor="${ALLOC_MINOR["${key}"]}"
-		local seen="${ALLOC_SEEN["${key}"]:-0}"
-		((now - seen < TC_IDLE_SECONDS)) && continue
+		local last_seen="${ALLOC_SEEN["${key}"]:-0}"
+		((now - last_seen < TC_IDLE_SECONDS)) && continue
 		if [[ "${dir}" == "download" ]]; then
 			run_tc class del dev "${IFACE}" classid "${EGRESS_HANDLE}:${minor}" 2>/dev/null || true
 		else
@@ -659,7 +657,7 @@ refresh_rules() {
 # status prints key=value lines and exits 0 only when every configured limit is
 # actually installed on the interface.
 status() {
-	local problems=0 active_class egress_ok=0 ingress_ok=0 needed=0
+	local problems=0 egress_ok=0 ingress_ok=0 needed=0
 	printf 'interface=%s\n' "${IFACE:-unknown}"
 	printf 'proxy_upload_mbit=%s\n' "${PROXY_UPLOAD_LIMIT_MBIT}"
 	printf 'proxy_download_mbit=%s\n' "${PROXY_DOWNLOAD_LIMIT_MBIT}"

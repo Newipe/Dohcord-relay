@@ -405,5 +405,38 @@ else
 	bad "manager help"
 fi
 
+# --- 12. coturn ports and failed-step reporting ------------------------------
+# Regression: the helper once parsed coturn's ports as 10#min/10#max, which bash
+# rejects as an invalid number, so apply exited before shaping anything.
+printf 'min-port=50000\nmax-port=50100\nlistening-port=3478\ntls-listening-port=5349\n' >"${TMP}/turnserver.conf"
+out="$(DOHCORD_RELAY_TURN_CONF="${TMP}/turnserver.conf" DOHCORD_RELAY_TC_STATE="${TMP}/tcstate2" \
+	bash "${TC}" status --config "${TMP}/tc.env" 2>&1)" || true
+if grep -q 'value too great' <<<"${out}"; then
+	bad "reading coturn's ports produced an arithmetic error: ${out}"
+elif grep -q 'shaping=' <<<"${out}"; then
+	ok "coturn's relay range and listener ports are read without arithmetic errors"
+else
+	bad "status with a coturn configuration: ${out}"
+fi
+if DOHCORD_RELAY_TURN_CONF="${TMP}/turnserver.conf" DOHCORD_RELAY_TC_STATE="${TMP}/tcstate2" \
+	bash "${TC}" apply --dry-run --interface eth0 --config "${TMP}/tc.env" >/dev/null 2>&1; then
+	ok "applying the limits succeeds with a coturn configuration present"
+else
+	bad "apply failed with a coturn configuration present"
+fi
+
+out="$(run 'stage_names=()
+stage_done=()
+stage_failed=()
+step=0
+step_msg "Applying per-client-IP bandwidth limits"
+step_failed
+print_progress')"
+if grep -q '\[!!\] Applying per-client-IP bandwidth limits' <<<"${out}"; then
+	ok "the progress box marks a step that failed instead of reporting it as OK"
+else
+	bad "progress box for a failed step: ${out}"
+fi
+
 printf '\nNetwork and performance limit tests: %s\n' "$( ((fail == 0)) && echo 'passed' || echo 'FAILED' )"
 exit "${fail}"
