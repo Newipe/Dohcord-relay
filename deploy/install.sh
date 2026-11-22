@@ -2287,6 +2287,18 @@ install_shaping() {
 		return 0
 	fi
 
+	# Upload shaping mirrors relay traffic onto an ifb device. The service runs
+	# with ProtectKernelModules=yes, so it cannot autoload the module itself:
+	# load it now and have systemd load it at boot.
+	if ! modprobe ifb >/dev/null 2>&1 && [[ ! -d /sys/module/ifb ]]; then
+		warn "the ifb kernel module is unavailable; per-client-IP upload limits cannot be enforced"
+	fi
+	if [[ -d /etc/modules-load.d && ! -e /etc/modules-load.d/dohcord-relay-ifb.conf ]]; then
+		printf '# Dohcord-relay: upload shaping mirrors relay traffic onto an ifb device.\nifb\n' \
+			>/etc/modules-load.d/dohcord-relay-ifb.conf 2>/dev/null ||
+			warn "could not persist the ifb module for the next boot"
+	fi
+
 	systemctl enable "${TC_UNIT}" >/dev/null
 	systemctl restart "${TC_UNIT}" || true
 	sleep 2
@@ -2296,6 +2308,10 @@ install_shaping() {
 	else
 		warn "the bandwidth limits are configured but not active; diagnostics will report this until it is fixed"
 		"${TC_SCRIPT}" status 2>&1 | sed 's/^/      /' >&2 || true
+		# The shaper explains why it failed only in its journal, which is where
+		# systemd puts the ExecStartPre output. Show it instead of a bare
+		# "Job for ... failed".
+		journalctl -u "${TC_UNIT}" -n 20 --no-pager 2>/dev/null | sed 's/^/      /' >&2 || true
 		SHAPING_RC=1
 		step_failed
 	fi

@@ -384,12 +384,20 @@ ensure_device() {
 
 	if ! own_qdisc; then
 		previous="$(current_root_qdisc)"
-		if [[ -n "${previous}" && "${previous}" != "noqueue" && "${previous}" != "pfifo_fast" && "${previous}" != "fq_codel" && "${previous}" != "pfifo" ]]; then
+		# Only qdisc kinds that the kernel or the driver installs by default may
+		# be replaced. A multiqueue NIC (AWS ENA, most 10G+ adapters) comes up
+		# with `mq` at the root, which carries no configuration of its own; it is
+		# recorded and put back on stop. Anything else is an administrator's
+		# traffic-control tree and is never touched.
+		case "${previous}" in
+		"" | noqueue | pfifo | pfifo_fast | fq_codel | mq) ;;
+		*)
 			fail "the root qdisc on ${IFACE} is ${previous}, which this relay does not manage.
     Remove it or set TC_INTERFACE to another interface. Existing traffic-control
     configuration is never overwritten."
 			return 1
-		fi
+			;;
+		esac
 		if ((DRY_RUN)); then
 			printf '# record previous root qdisc: %s\n' "${previous:-none}"
 		else
@@ -411,6 +419,10 @@ ensure_device() {
 		else
 			log "ip link add ${IFB} type ifb"
 			ip link add "${IFB}" type ifb 2>/dev/null || true
+			if ! have_ifb; then
+				fail "could not create ${IFB}: upload shaping needs the ifb kernel module (modprobe ifb)"
+				return 1
+			fi
 			ip link set "${IFB}" up
 		fi
 	fi
@@ -749,7 +761,11 @@ status() {
 		return 0
 	fi
 	printf 'shaping=inactive\n'
-	fail "bandwidth limits are configured but are not enforced on ${IFACE} (${problems} missing classes)"
+	if ((egress_ok == 0)); then
+		fail "the root qdisc on ${IFACE} is $(current_root_qdisc); this relay's shaping tree is not installed, so no bandwidth limit is enforced"
+	else
+		fail "bandwidth limits are configured but are not enforced on ${IFACE} (${problems} missing classes)"
+	fi
 	return 1
 }
 
@@ -761,11 +777,18 @@ stop_shaping() {
 		[[ -r "$(previous_root_file)" ]] && previous="$(cat "$(previous_root_file)")"
 		if own_qdisc || ((DRY_RUN)); then
 			run_tc qdisc del dev "${IFACE}" root
-			if [[ -n "${previous}" && "${previous}" != "none" ]]; then
-				run_tc qdisc replace dev "${IFACE}" root "${previous}" || warn "could not restore the previous root qdisc (${previous})"
+			if [[ -n "${previous}" && "${previous}" != "none" && "${previous}" != "noqueue" ]]; then
+				if [[ "${previous}" == "mq" ]]; then
+					# A multiqueue device gets its mq root back as soon as the HTB
+					# root is removed; replace is a no-op then and restores it if not.
+					run_tc qdisc replace dev "${IFACE}" root mq 2>/dev/null || true
+				else
+					run_tc qdisc replace dev "${IFACE}" root "${previous}" || warn "could not restore the previous root qdisc (${previous})"
+				fi
 			fi
 		fi
-		run_tc qdisc del dev "${IFACE}" handle ffff: ingress
+		# A failed or partial apply may have left no ingress hook at all.
+		run_tc qdisc del dev "${IFACE}" handle ffff: ingress 2>/dev/null || true
 	fi
 	if have_ifb; then
 		if ((DRY_RUN)); then

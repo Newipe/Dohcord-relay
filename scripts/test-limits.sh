@@ -298,6 +298,49 @@ else
 	bad "disabled shaping: ${out}"
 fi
 
+# --- 8b. traffic shaping: kernel-default root qdiscs -------------------------
+# Regression: AWS ENA and other multiqueue NICs carry the kernel's `mq` root
+# qdisc, which used to abort `apply` and leave shaping inactive.
+mkdir -p "${TMP}/faketc"
+cat >"${TMP}/faketc/tc" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "qdisc" && "${2:-}" == "show" ]]; then
+	printf 'qdisc %s 0: root\n' "${FAKE_ROOT_QDISC:-mq}"
+fi
+exit 0
+EOF
+chmod +x "${TMP}/faketc/tc"
+
+fake_apply() { # qdisc state-dir
+	PATH="${TMP}/faketc:${PATH}" FAKE_ROOT_QDISC="$1" \
+		DOHCORD_RELAY_TC_STATE="$2" \
+		bash "${TC}" apply --dry-run --interface eth0 --config "${TMP}/tc.env" 2>&1
+}
+
+if out="$(fake_apply mq "${TMP}/tcstate-mq")" &&
+	grep -q '# record previous root qdisc: mq' <<<"${out}" &&
+	grep -q 'tc qdisc replace dev eth0 root handle 1: htb default 999' <<<"${out}"; then
+	ok "a multiqueue mq root qdisc is taken over instead of failing the service"
+else
+	bad "mq root qdisc: ${out}"
+fi
+
+if out="$(fake_apply tbf "${TMP}/tcstate-tbf")"; then
+	bad "an administrator's root qdisc was replaced: ${out}"
+else
+	ok "a root qdisc the relay does not manage is still refused"
+fi
+
+mkdir -p "${TMP}/tcstate-stop"
+printf 'mq\n' >"${TMP}/tcstate-stop/previous-root"
+if out="$(DOHCORD_RELAY_TC_STATE="${TMP}/tcstate-stop" \
+	bash "${TC}" stop --dry-run --interface eth0 --config "${TMP}/tc.env" 2>&1)" &&
+	grep -q 'tc qdisc replace dev eth0 root mq' <<<"${out}"; then
+	ok "stopping restores the mq root qdisc that was there before"
+else
+	bad "stop restore: ${out}"
+fi
+
 # --- 9. traffic shaping: validation -----------------------------------------
 for value in abc -1 100001 1.5; do
 	sed -e "s/^PROXY_UPLOAD_LIMIT_MBIT=.*/PROXY_UPLOAD_LIMIT_MBIT=${value}/" "${TMP}/tc.env" >"${TMP}/tc-bad.env"

@@ -167,10 +167,15 @@ the connections that actually exist, every `TC_REFRESH_SECONDS`:
   active addresses;
 - an address with no traffic for `TC_IDLE_SECONDS` (60) is forgotten, so kernel
   state does not grow without bound;
-- if the interface already carries a root qdisc the relay does not manage (`mq`,
-  `cake`, …) the shaper refuses to replace it and reports that shaping is not
-  active, instead of overwriting an administrator's configuration. The previous
-  qdisc kind is recorded and restored by `dohcord-relay-tc stop`;
+- if the interface already carries an administrator's root qdisc (`cake`, `tbf`,
+  a foreign `htb`, …) the shaper refuses to replace it and reports that shaping
+  is not active, instead of overwriting an administrator's configuration. Kernel
+  and driver defaults (`mq` on multiqueue NICs, `fq_codel`, `pfifo_fast`) are
+  replaced, and the previous qdisc kind is recorded and restored by
+  `dohcord-relay-tc stop`;
+- upload shaping needs the `ifb` kernel module. The service runs with
+  `ProtectKernelModules=yes`, so the installer loads the module and records it in
+  `/etc/modules-load.d/dohcord-relay-ifb.conf` for the next boot;
 - IPv6 clients are shaped with their own filters; if a kernel rejects them the
   `status` command reports the missing classes rather than claiming success.
 

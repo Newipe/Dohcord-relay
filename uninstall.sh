@@ -27,6 +27,7 @@ UNITS=(
 	dohcord-relay-api.service
 	dohcord-relay-squid.service
 	dohcord-relay-coturn.service
+	dohcord-relay-tc.service
 	dohcord-relay-certbot-renew.timer
 	dohcord-relay-certbot-renew.service
 	dohcord-relay-credentials.service
@@ -34,6 +35,7 @@ UNITS=(
 RUN_DIRS=(
 	/run/dohcord-relay-squid
 	/run/dohcord-relay-coturn
+	/run/dohcord-relay-tc
 )
 
 PURGE=0
@@ -96,7 +98,7 @@ ${C_CYAN}${C_BOLD}  ── Dohcord-relay uninstall ──${C_RESET}
 
   This will remove:
 
-    · the services ${C_BOLD}dohcord-relay-api${C_RESET}, ${C_BOLD}dohcord-relay-squid${C_RESET} and ${C_BOLD}dohcord-relay-coturn${C_RESET}
+    · the services ${C_BOLD}dohcord-relay-api${C_RESET}, ${C_BOLD}dohcord-relay-squid${C_RESET}, ${C_BOLD}dohcord-relay-coturn${C_RESET} and ${C_BOLD}dohcord-relay-tc${C_RESET}
     · their systemd units and the certificate renewal timer
     · ${DAEMON} and ${CLI}
     · ${MANAGER} (compatibility alias)
@@ -180,6 +182,10 @@ done
 if [[ -d "${WEBROOT}" ]]; then
 	rm -rf -- "${WEBROOT}"
 	ok "removed ${WEBROOT} (ACME challenge directory)"
+fi
+if [[ -f /etc/modules-load.d/dohcord-relay-ifb.conf ]]; then
+	rm -f /etc/modules-load.d/dohcord-relay-ifb.conf
+	ok "removed /etc/modules-load.d/dohcord-relay-ifb.conf"
 fi
 if [[ -d "${LOG_DIR}" ]]; then
 	rm -rf -- "${LOG_DIR}"

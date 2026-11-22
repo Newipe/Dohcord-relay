@@ -238,10 +238,11 @@ sudo journalctl -u dohcord-relay-tc -n 50 --no-pager
 
 | Symptom | Cause and fix |
 |---|---|
-| `shaping=inactive`, log says the root qdisc is not managed | The interface already carries an administrator's qdisc (`mq`, `cake`, …). The relay refuses to overwrite it: remove it, or set `TC_INTERFACE` to an interface whose root qdisc is `htb`/`fq_codel`, then `sudo dohcord-relay-tc apply` |
+| `shaping=inactive`, log says the root qdisc is not managed | The interface already carries an administrator's qdisc (`cake`, `tbf`, a foreign `htb`, …). The relay refuses to overwrite it: remove it, or set `TC_INTERFACE` to an interface whose root qdisc is a kernel default (`mq`, `fq_codel`, `pfifo_fast`), then `sudo dohcord-relay-tc apply` |
+| `egress_qdisc=mq` in `status` | The interface is multiqueue (common on AWS ENA and 10G+ NICs) and its default `mq` root is still in place: the `dohcord-relay-tc` service failed to start. Run `sudo journalctl -u dohcord-relay-tc -n 30` for the reason, fix it, then `sudo systemctl restart dohcord-relay-tc` |
 | `tc is not installed` | `sudo apt-get install iproute2` |
 | `no network interface detected` | Set `TC_INTERFACE` in `/etc/dohcord-relay/config.env` (the default route could not be read) |
-| `ingress_qdisc=missing` | Upload shaping needs the `ifb` kernel module: `sudo modprobe ifb`, then restart `dohcord-relay-tc` |
+| `ingress_qdisc=missing` | Upload shaping needs the `ifb` kernel module: `sudo modprobe ifb`, then restart `dohcord-relay-tc`. The installer loads it and records it in `/etc/modules-load.d/dohcord-relay-ifb.conf`; the service itself cannot autoload modules |
 | `shaped_addresses=0` | No client is connected yet; the table fills within `TC_REFRESH_SECONDS` |
 | A client is not limited | It may be above `TC_MAX_CLIENTS`; the shaper logs which address was skipped and diagnostics reports it. Raise the limit or reduce concurrent addresses |
 | New connection is briefly fast | Expected: the class table is refreshed every `TC_REFRESH_SECONDS` (5 s by default). Lower it for a tighter bound |
