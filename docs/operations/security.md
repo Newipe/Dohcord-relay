@@ -19,7 +19,7 @@ outright.
 
 ## Transport
 
-- **End-to-end TLS.** Discord's TLS session is between Dohcord and Discord. Squid
+- **End-to-end TLS.** Discord's TLS session is between Pishcord and Discord. Squid
   does not `ssl_bump`, holds no signing certificate, and cannot read the traffic.
 - **Proxy listener is TLS.** `https_port` only, with a real certificate chain; no
   plain `http_port` for proxy traffic. The chain must include the intermediate,

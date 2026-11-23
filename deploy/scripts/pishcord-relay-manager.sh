@@ -2224,7 +2224,7 @@ network_change_port() {
 
 	say ""
 	warn "the API will be briefly unavailable while its port changes"
-	info "Dohcord profiles using https://$(info_value PUBLIC_HOST):${current}/network-config"
+	info "Pishcord profiles using https://$(info_value PUBLIC_HOST):${current}/network-config"
 	info "must be updated to port ${port}; remote management also uses this port"
 	confirm "Change the Network Configuration API port from ${current} to ${port}?" ||
 		die "cancelled; nothing was changed"
@@ -2279,7 +2279,7 @@ network_change_port() {
 
 	say ""
 	ok "the Network Configuration API now listens on port ${port}"
-	info "update the Network Configuration URL in Dohcord to https://$(info_value PUBLIC_HOST):${port}/network-config"
+	info "update the Network Configuration URL in Pishcord to https://$(info_value PUBLIC_HOST):${port}/network-config"
 }
 
 network_menu() {

@@ -52,7 +52,7 @@ ${C_CYAN}${C_BOLD}  ╭───────────────────
 
   Welcome to Pishcord-relay.
 
-  This sets up a private HTTPS proxy and TURN relay for Dohcord on
+  This sets up a private HTTPS proxy and TURN relay for Pishcord on
   this server. The installer checks the machine first, explains what
   it found, and asks before it changes anything.
 EOF

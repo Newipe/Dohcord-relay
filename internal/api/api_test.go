@@ -119,8 +119,8 @@ func TestCredentialsHandler(t *testing.T) {
 	}; strings.Join(ice.URLs, ",") != strings.Join(want, ",") {
 		t.Errorf("urls = %v, want %v", ice.URLs, want)
 	}
-	if !strings.HasSuffix(ice.Username, ":Dohcord") {
-		t.Errorf("username = %q, want it to end with :Dohcord", ice.Username)
+	if !strings.HasSuffix(ice.Username, ":Pishcord") {
+		t.Errorf("username = %q, want it to end with :Pishcord", ice.Username)
 	}
 	expiryFromName, _, err := credentials.ParseUsername(ice.Username)
 	if err != nil {

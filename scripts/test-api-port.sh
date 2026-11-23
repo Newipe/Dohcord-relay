@@ -305,7 +305,7 @@ d = json.load(open(sys.argv[1]))
 assert d["schemaVersion"] == 1
 assert d["httpsProxy"]["url"] == "https://relay.example.test:443"
 assert d["proxy"]["port"] == 443
-assert d["rtcRelay"]["iceServers"][0]["username"].endswith(":Dohcord")
+assert d["rtcRelay"]["iceServers"][0]["username"].endswith(":Pishcord")
 PY
 then
 	ok "daemon serves the unchanged /network-config JSON on the configured port"

@@ -3,9 +3,9 @@
 # Rendered by install.sh. Do not edit by hand: re-run the installer instead.
 # Path on the server: /etc/pishcord-relay/squid.conf
 #
-# This is a TLS-enabled FORWARD proxy. Dohcord opens a TLS connection to this
+# This is a TLS-enabled FORWARD proxy. Pishcord opens a TLS connection to this
 # port, sends "CONNECT host:port" inside it, and this proxy opens a plain TCP
-# connection to the approved destination. The inner TLS session (Dohcord to
+# connection to the approved destination. The inner TLS session (Pishcord to
 # Discord) is never decrypted: no ssl_bump, no generated CA, no interception.
 
 # --- Listener --------------------------------------------------------------

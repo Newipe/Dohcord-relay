@@ -1,6 +1,6 @@
 # Network Configuration API
 
-The one endpoint Dohcord needs. It returns the proxy endpoint, the routing policy
+The one endpoint Pishcord needs. It returns the proxy endpoint, the routing policy
 and short-lived TURN credentials, all active at install time.
 
 ```text
@@ -8,7 +8,7 @@ GET https://<relay>:8443/network-config
 ```
 
 The port is configurable (`NETWORK_CONFIG_PORT`, default `8443`); the path, the
-JSON document, TLS and rate limiting are the same on any port. Dohcord profiles
+JSON document, TLS and rate limiting are the same on any port. Pishcord profiles
 must name the configured port in their Network Configuration URL.
 
 - HTTPS only; TLS is validated normally — nothing here asks a client to skip
@@ -18,7 +18,7 @@ must name the configured port in their Network Configuration URL.
 - No authentication, no account, no API key — it is configuration data, not an
   authorization mechanism. Enforcement happens in Squid.
 - `GET /turn-credentials` still exists and returns only the TURN part, for older
-  Dohcord builds.
+  Pishcord builds.
 
 ## Schema
 
@@ -55,7 +55,7 @@ before `schemaVersion` existed.
     "iceServers": [ {
       "urls": [ "turn:relay.example.com:3478?transport=udp",
                 "turns:relay.example.com:5349?transport=tcp" ],
-      "username": "1794600000:Dohcord",
+      "username": "1794600000:Pishcord",
       "credential": "<base64 HMAC>"
     } ]
   }
@@ -154,7 +154,7 @@ back to an empty list is never correct — it would silently stop proxying.
 are visible on the next request; there is no TTL to wait out and no CDN in front
 of it. If you put a reverse proxy in front anyway, do not cache this path.
 
-## Using it in Dohcord
+## Using it in Pishcord
 
 **Settings → Custom Profile → add server**, then paste:
 
@@ -162,9 +162,9 @@ of it. If you put a reverse proxy in front anyway, do not cache this path.
 https://relay.example.com:8443/network-config
 ```
 
-Save and select the profile. Dohcord fetches the document and configures its
+Save and select the profile. Pishcord fetches the document and configures its
 proxy and TURN settings from it. No other value is typed in, and no relay-specific
-Dohcord build is needed.
+Pishcord build is needed.
 
 ## Checking it yourself
 

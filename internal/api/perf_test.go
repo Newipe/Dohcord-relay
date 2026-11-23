@@ -24,7 +24,7 @@ func profileLoad(srv *Server, addr string) int {
 }
 
 // TestSimultaneousProfileLoadsFromOneAddress is the case that used to be slow
-// and rate limited: several Dohcord profiles (or a client with many accounts)
+// and rate limited: several Pishcord profiles (or a client with many accounts)
 // loading their configuration at the same moment from one public address.
 func TestSimultaneousProfileLoadsFromOneAddress(t *testing.T) {
 	srv, _ := testServer(t, "0123456789abcdef0123456789abcdef", time.Hour)

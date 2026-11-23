@@ -46,7 +46,7 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 	body := strings.Join([]string{
 		"# comment",
 		"CREDENTIAL_TTL=86400",
-		"TURN_IDENTITY=\"Dohcord\"",
+		"TURN_IDENTITY=\"Pishcord\"",
 		"TURN_URLS=turn:relay.example.test:3478?transport=udp turns:relay.example.test:5349?transport=tcp",
 		"HTTPS_PROXY_URL=https://relay.example.test:443",
 		"NETWORK_CONFIG_URL=https://relay.example.test:8443/network-config",
@@ -63,8 +63,8 @@ func TestLoadConfigDefaultsAndOverrides(t *testing.T) {
 	if cfg.TTL != 24*time.Hour {
 		t.Errorf("ttl = %v, want 24h", cfg.TTL)
 	}
-	if cfg.Identity != "Dohcord" {
-		t.Errorf("identity = %q, want Dohcord", cfg.Identity)
+	if cfg.Identity != "Pishcord" {
+		t.Errorf("identity = %q, want Pishcord", cfg.Identity)
 	}
 	if len(cfg.TurnURLs) != 2 {
 		t.Errorf("urls = %v, want 2 entries", cfg.TurnURLs)

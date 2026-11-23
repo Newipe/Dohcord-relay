@@ -69,7 +69,7 @@ func BenchmarkNetworkConfig(b *testing.B) {
 }
 
 // BenchmarkNetworkConfigParallel measures concurrent profile loads, which is
-// what several Dohcord profiles opening at once actually do.
+// what several Pishcord profiles opening at once actually do.
 func BenchmarkNetworkConfigParallel(b *testing.B) {
 	srv := benchServer(b)
 	h := srv.Routes()

@@ -6,7 +6,7 @@
 # Path on the server: /etc/pishcord-relay/turnserver.conf
 
 # --- Listeners -------------------------------------------------------------
-# Plain TURN/STUN over UDP is the primary transport Dohcord uses.
+# Plain TURN/STUN over UDP is the primary transport Pishcord uses.
 listening-port=3478
 # TURN over TLS (the fallback transport when UDP/TCP is filtered).
 tls-listening-port=5349
@@ -29,7 +29,7 @@ max-port=65535
 
 # --- TURN REST authentication ----------------------------------------------
 # Temporary credentials are minted by the credential endpoint:
-#   username = <unix-expiration-timestamp>:Dohcord
+#   username = <unix-expiration-timestamp>:Pishcord
 #   password = base64(HMAC-SHA1(shared secret, username))
 # The shared secret lives only on this host.
 use-auth-secret
@@ -70,7 +70,7 @@ no-software-attribute
 
 # --- Quotas and bandwidth --------------------------------------------------
 # Concurrent allocations per temporary credential (one credential is issued per
-# Dohcord client per 24h, and a client uses a handful of allocations per call).
+# Pishcord client per 24h, and a client uses a handful of allocations per call).
 # 12 leaves room for several simultaneous calls from the same client.
 user-quota=@USER_QUOTA@
 # Global ceiling on concurrent allocations for the whole relay.

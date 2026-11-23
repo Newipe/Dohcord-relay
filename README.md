@@ -1,8 +1,8 @@
 # Pishcord-relay
 
-**A private HTTPS proxy and TURN relay for [Dohcord](https://github.com/Newipe/Dohcord), on your own server.**
+**A private HTTPS proxy and TURN relay for [Pishcord](https://github.com/Newipe/Pishcord), on your own server.**
 
-Pishcord-relay gives Dohcord a way to reach Discord's HTTPS, WebSocket and voice
+Pishcord-relay gives Pishcord a way to reach Discord's HTTPS, WebSocket and voice
 endpoints through a server you control, without a VPN and without decrypting
 anything. It runs two well-known pieces of software, Squid and coturn, behind a
 small HTTPS endpoint that tells the client exactly how to connect.
@@ -26,7 +26,7 @@ small HTTPS endpoint that tells the client exactly how to connect.
 
 ## About
 
-Dohcord is a Discord client. Discord's traffic has two halves: ordinary HTTPS
+Pishcord is a Discord client. Discord's traffic has two halves: ordinary HTTPS
 and WebSocket connections to a handful of domains, and WebRTC media for voice
 and video. Pishcord-relay provides a server-side rendezvous for both:
 
@@ -35,18 +35,18 @@ and video. Pishcord-relay provides a server-side rendezvous for both:
 - a **TURN relay** (coturn) for voice and video when a direct connection between
   peers is not possible;
 - a **Network Configuration API** (port 8443 by default, configurable at install
-  time) that hands Dohcord the proxy address, the routing policy and short-lived
+  time) that hands Pishcord the proxy address, the routing policy and short-lived
   TURN credentials in one document.
 
 Nothing is intercepted or re-encrypted. Discord's TLS session runs end-to-end
-between Dohcord and Discord; the proxy only sees host names and ports, and only
+between Pishcord and Discord; the proxy only sees host names and ports, and only
 for destinations the relay has been told to allow.
 
 > **Compatibility promise.** The client-facing contract is unchanged by this
 > documentation and tooling work: same ports, same endpoints, same JSON, same
-> proxy and TURN protocols. An existing Dohcord build keeps working; no client
+> proxy and TURN protocols. An existing Pishcord build keeps working; no client
 > update is needed to use this version of the relay. The API port defaults to
-> 8443; if an administrator chooses a custom port, the Dohcord profile's Network
+> 8443; if an administrator chooses a custom port, the Pishcord profile's Network
 > Configuration URL must name that port (the path, JSON, TLS and authentication
 > are unchanged).
 
@@ -90,9 +90,9 @@ That single command:
    precompiled relay binaries for this server's architecture;
 5. obtains a TLS certificate, opens the required firewall ports, installs the
    systemd services and validates the configuration;
-6. runs the verification suite and prints the URLs to paste into Dohcord.
+6. runs the verification suite and prints the URLs to paste into Pishcord.
 
-When it finishes you get the line to add in **Dohcord → Settings → Custom
+When it finishes you get the line to add in **Pishcord → Settings → Custom
 Profile**:
 
 ```text
@@ -139,7 +139,7 @@ API port), **3478/udp**, **5349/tcp**, **49152–65535/udp**.
 ```mermaid
 flowchart TB
     subgraph client["Your machine"]
-        D["Dohcord (Electron)"]
+        D["Pishcord (Electron)"]
     end
 
     subgraph vps["Your VPS"]
@@ -187,7 +187,7 @@ destination-policy.conf ┘        └─► /network-config    (client routing)
 | **Privileges** | root (or a user with `sudo`) |
 | **Network** | outbound HTTPS; inbound TCP 80, 443, 8443 (or the chosen API port), 5349 and UDP 3478, 49152–65535 |
 | **Kernel** | `tc` (iproute2, installed automatically) and, for upload shaping, the `ifb` module; unavailable shaping is reported as a failed limit, never silently ignored |
-| **Client** | Dohcord's Custom Profile feature; no relay-specific client build |
+| **Client** | Pishcord's Custom Profile feature; no relay-specific client build |
 
 An IP-only install works without a domain, using a short-lived Let's Encrypt IP
 certificate that the renewal timer keeps current. A domain install additionally
@@ -249,7 +249,7 @@ in [docs/configuration.md](docs/configuration.md#per-client-ip-bandwidth-limits)
 
 ## Network Configuration API
 
-`GET https://<your relay>:8443/network-config` is the only endpoint Dohcord needs
+`GET https://<your relay>:8443/network-config` is the only endpoint Pishcord needs
 (replace `8443` with your configured API port if it is different; existing 8443
 profiles are unaffected by the default).
 
@@ -406,7 +406,7 @@ curl -sS https://relay.example.com:8443/network-config | python3 -m json.tool
 | Installer stops at ports | Something already listens on 80/443/8443/3478/5349 (or your chosen API port) — `sudo pishcord-relay dashboard` |
 | Certificate issuance fails | Port 80 reachable, A record points here, no AAAA record without IPv6 |
 | Let's Encrypt rate limit | The existing certificate is kept; wait for the stated reset. Do not retry in a loop |
-| Dohcord cannot connect | `curl` the config URL; check `pishcord-relay-api` and the firewall |
+| Pishcord cannot connect | `curl` the config URL; check `pishcord-relay-api` and the firewall |
 | Proxy returns 403 | The host is not in the policy, or the port is not allowed for it |
 | Voice fails, text works | TURN ports/security group, or coturn is down (`services status`) |
 | Squid will not start | `pishcord-relay policy check`, then `services validate` |
@@ -437,7 +437,7 @@ place and reported at the end. Nothing is deleted without a typed confirmation.
 
 ## Security
 
-- **No interception.** TLS runs end-to-end between Dohcord and Discord. There is
+- **No interception.** TLS runs end-to-end between Pishcord and Discord. There is
   no `ssl_bump`, no generated certificates, no plaintext.
 - **Server-side authorization.** The destination policy is enforced by Squid from
   files on the server. A modified client cannot reach a host the relay has not

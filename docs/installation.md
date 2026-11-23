@@ -198,7 +198,7 @@ To upgrade later, run `sudo pishcord-relay update` (or the one-line installer); 
 updater downloads and verifies the new release and rolls back the executables if
 the service does not start. Configuration, certificates and policy are untouched.
 
-In Dohcord: **Settings → Custom Profile → add server**, paste
+In Pishcord: **Settings → Custom Profile → add server**, paste
 `https://relay.example.com:8443/network-config` (use your chosen port if it is
 not 8443), save, select it.
 

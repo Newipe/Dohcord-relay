@@ -27,7 +27,7 @@ const (
 	// MaxIdentityLength bounds the TURN Identity in a REST username.
 	MaxIdentityLength = 64
 
-	// Default request limits. Several Dohcord profiles load their configuration
+	// Default request limits. Several Pishcord profiles load their configuration
 	// at the same time, so the per-address allowance has to cover a burst of
 	// profile loads (and a reconnect) without answering 429. These are far above
 	// normal use: a client fetches /network-config once per profile load and
@@ -84,7 +84,7 @@ type Config struct {
 
 func Default() Config {
 	return Config{
-		Identity:              "Dohcord",
+		Identity:              "Pishcord",
 		TTL:                   24 * time.Hour,
 		SecretFile:            "/etc/pishcord-relay/turn-secret",
 		CertFile:              "/etc/pishcord-relay/tls/fullchain.pem",

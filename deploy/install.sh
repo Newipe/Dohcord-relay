@@ -3,8 +3,8 @@
 #
 # Sets up two networking services on one VPS:
 #
-#   Dohcord --TLS--> Squid :443 --CONNECT host:port--> Discord HTTPS/WSS
-#   Dohcord --TURN--> coturn :3478/udp, :5349/tcp --> Discord RTC media
+#   Pishcord --TLS--> Squid :443 --CONNECT host:port--> Discord HTTPS/WSS
+#   Pishcord --TURN--> coturn :3478/udp, :5349/tcp --> Discord RTC media
 #
 # plus a small HTTPS endpoint (8443 by default, or the port chosen at install
 # time) that publishes the proxy address, the destination policy and temporary
@@ -165,12 +165,12 @@ ${C_CYAN}${C_BOLD}  ╭───────────────────
 
   Welcome to Pishcord-relay ${INSTALLER_VERSION}.
 
-  This server will host two services for Dohcord:
+  This server will host two services for Pishcord:
 
     · an HTTPS proxy on 443, limited to the destinations in the policy
     · a TURN relay on 3478/udp and 5349/tcp for voice and video
 
-  plus a small HTTPS endpoint that tells Dohcord how to reach them. It
+  plus a small HTTPS endpoint that tells Pishcord how to reach them. It
   listens on port 8443 by default; the settings below show the port and let
   you change it. Nothing on this server is decrypted; the proxy forwards
   encrypted connections and only decides where they may go.
@@ -538,7 +538,7 @@ prompt_api_port() {
 
   Network Configuration API port
 
-  Dohcord fetches its configuration from this small HTTPS endpoint. Its port is
+  Pishcord fetches its configuration from this small HTTPS endpoint. Its port is
   independent of the proxy (${PROXY_PORT}/tcp) and the TURN relay (3478/udp,
   5349/tcp), so any free port between 1024 and 65535 works. Press Enter to keep
   the port shown in brackets.
@@ -932,7 +932,7 @@ wizard() {
 		fi
 		cat <<'EOF'
 
-  How should Dohcord reach this server?
+  How should Pishcord reach this server?
 
     1. By domain name (recommended)
        Clients connect to https://relay.example.com:443 and the certificate
@@ -2418,7 +2418,7 @@ Uninstall safely     sudo pishcord-relay  (option 10)
 Server daemon        ${DAEMON} (pishcord-relay-api.service)
                      keeps configuration and certificates unless you purge
 
-In Dohcord: Settings -> Custom Profile -> add this server:
+In Pishcord: Settings -> Custom Profile -> add this server:
   Network Configuration URL: https://${PUBLIC_HOST}:${API_PORT}/network-config
 ==========================================================================
 EOF

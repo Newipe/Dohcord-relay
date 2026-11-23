@@ -130,7 +130,7 @@ coturn reads differ. They are the same file; re-run the installer to re-render
 | Symptom | Cause |
 |---|---|
 | `connection refused` on 8443 | `pishcord-relay-api` is down, or the port is closed |
-| `connection refused` after changing the API port | The Dohcord profile still names the old port; run `sudo pishcord-relay diagnostics` and update the profile to the configured port |
+| `connection refused` after changing the API port | The Pishcord profile still names the old port; run `sudo pishcord-relay diagnostics` and update the profile to the configured port |
 | `502`/`504` from a reverse proxy in front | You have something in front of it; the API expects to be reached directly |
 | `503 destination policy unavailable` | No valid policy/snapshot; run `-policy-check` |
 | `503 turn configuration unavailable` | `turn-secret` missing or shorter than 16 bytes |

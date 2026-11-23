@@ -33,7 +33,7 @@ parsed, not sourced.
 | `NETWORK_CONFIG_PORT` | The Network Configuration API port (default `8443`, chosen at install time). Authoritative: `HTTPS_LISTEN` and `NETWORK_CONFIG_URL` must name the same port. |
 | `NETWORK_CONFIG_URL` | This endpoint's public URL, for logs and reports. |
 | `TURN_URLS` | Comma-separated TURN URLs handed to clients. UDP first, TLS second by convention. |
-| `TURN_IDENTITY` | Username suffix in issued credentials (`<expiry>:Dohcord`). |
+| `TURN_IDENTITY` | Username suffix in issued credentials (`<expiry>:Pishcord`). |
 | `CREDENTIAL_TTL` | Lifetime of a TURN credential (default `24h`). |
 | `SECRET_FILE` | File holding the coturn shared secret. Never served, never logged. |
 | `TLS_CERT_FILE`, `TLS_KEY_FILE` | Certificate and key for the HTTPS endpoint. |
@@ -92,7 +92,7 @@ management console (**Network → Change the Network Configuration API port** or
 `sudo pishcord-relay network port`), which updates this file, the firewall and the
 service, then verifies the endpoint before reporting success.
 
-> **Dohcord profile dependency.** The client connects to the full URL stored in
+> **Pishcord profile dependency.** The client connects to the full URL stored in
 > its Custom Profile, including the port. Changing the API port does not change
 > `/network-config`, its JSON, TLS or authentication, but every profile that
 > still names the old port stops working until its Network Configuration URL is
@@ -232,7 +232,7 @@ every relay socket coturn holds.
 Credentials use coturn's REST mechanism:
 
 ```text
-username = "<unix expiry>:Dohcord"
+username = "<unix expiry>:Pishcord"
 password = base64(HMAC-SHA1(shared secret, username))
 ```
 
