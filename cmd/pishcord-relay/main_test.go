@@ -31,10 +31,10 @@ func TestManagerScriptOverride(t *testing.T) {
 }
 
 // TestManagerScriptFromCheckout checks the development fallback: a checkout with
-// deploy/scripts/dohcord-relay-manager.sh resolves from the working directory.
+// deploy/scripts/pishcord-relay-manager.sh resolves from the working directory.
 func TestManagerScriptFromCheckout(t *testing.T) {
 	dir := t.TempDir()
-	script := filepath.Join(dir, "deploy", "scripts", "dohcord-relay-manager.sh")
+	script := filepath.Join(dir, "deploy", "scripts", "pishcord-relay-manager.sh")
 	if err := os.MkdirAll(filepath.Dir(script), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}

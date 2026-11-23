@@ -1,5 +1,5 @@
 [Unit]
-Description=Dohcord Relay TURN server (coturn)
+Description=Pishcord Relay TURN server (coturn)
 Documentation=https://github.com/coturn/coturn
 After=network-online.target
 Wants=network-online.target
@@ -10,9 +10,9 @@ Type=simple
 # unprivileged ports. The certificate copies it reads are group-readable.
 User=turnserver
 Group=turnserver
-RuntimeDirectory=dohcord-relay-coturn
+RuntimeDirectory=pishcord-relay-coturn
 RuntimeDirectoryMode=0750
-ExecStart=@TURN_BINARY@ -c /etc/dohcord-relay/turnserver.conf
+ExecStart=@TURN_BINARY@ -c /etc/pishcord-relay/turnserver.conf
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3s
@@ -35,7 +35,7 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 NoNewPrivileges=true
-ReadWritePaths=/run/dohcord-relay-coturn /var/log/dohcord-relay/turnserver
+ReadWritePaths=/run/pishcord-relay-coturn /var/log/pishcord-relay/turnserver
 
 [Install]
 WantedBy=multi-user.target

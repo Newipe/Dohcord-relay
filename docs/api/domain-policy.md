@@ -5,8 +5,8 @@ authoritative source: Squid's ACLs and the API's routing rules are both generate
 from them.
 
 ```text
-/etc/dohcord-relay/allowed-domains.txt       which host names
-/etc/dohcord-relay/destination-policy.conf   which TCP ports each host may use
+/etc/pishcord-relay/allowed-domains.txt       which host names
+/etc/pishcord-relay/destination-policy.conf   which TCP ports each host may use
 ```
 
 ## allowed-domains.txt
@@ -80,22 +80,22 @@ domains opens the proxy for no benefit.
 ### With the management console
 
 ```bash
-sudo dohcord-relay
+sudo pishcord-relay
 # 4. Domain policy → 1. Add a destination
 ```
 
 The console validates the host name and port list, shows what it will write, backs
-up both files to `/var/backups/dohcord-relay/`, edits them, runs the validator, and
+up both files to `/var/backups/pishcord-relay/`, edits them, runs the validator, and
 restores the backup if the result is rejected. It then offers to apply.
 
 ### By hand
 
 ```bash
-sudoedit /etc/dohcord-relay/allowed-domains.txt
-sudoedit /etc/dohcord-relay/destination-policy.conf
+sudoedit /etc/pishcord-relay/allowed-domains.txt
+sudoedit /etc/pishcord-relay/destination-policy.conf
 
-sudo dohcord-relayd -config /etc/dohcord-relay/config.env -policy-check   # validate
-sudo dohcord-relayd -config /etc/dohcord-relay/config.env -policy-apply   # validate + apply
+sudo pishcord-relayd -config /etc/pishcord-relay/config.env -policy-check   # validate
+sudo pishcord-relayd -config /etc/pishcord-relay/config.env -policy-apply   # validate + apply
 ```
 
 To remove a destination, delete its line from both files. To change ports, edit
@@ -105,7 +105,7 @@ the single port line; the published `from`/`to` values follow the file.
 
 1. parses and cross-validates both files (syntax, no IP literals, no wildcards,
    numeric ports, no duplicates or overlaps, full coverage);
-2. renders `/etc/dohcord-relay/squid-allow.conf`;
+2. renders `/etc/pishcord-relay/squid-allow.conf`;
 3. validates the **whole** Squid configuration with `squid -k parse`;
 4. only if that passes: installs the ACLs, writes `policy.json`, reloads Squid.
 
@@ -116,16 +116,16 @@ about a destination that is not actually enforced.
 ## What gets generated
 
 ```squid
-acl dohcord_domain_0 dstdomain .discord.com
-acl dohcord_ports_0 port 443
-acl dohcord_domain_6 dstdomain discord-attachments-uploads-prd.storage.googleapis.com
-acl dohcord_ports_6 port 443
+acl pishcord_domain_0 dstdomain .discord.com
+acl pishcord_ports_0 port 443
+acl pishcord_domain_6 dstdomain discord-attachments-uploads-prd.storage.googleapis.com
+acl pishcord_ports_6 port 443
 ```
 
 - `suffix` entries become `.host` (host plus subdomains).
 - `exact` entries become `host` (no leading dot).
 - The include is referenced from `squid.conf` by
-  `include /etc/dohcord-relay/squid-allow.conf`; `-policy-apply` refuses to
+  `include /etc/pishcord-relay/squid-allow.conf`; `-policy-apply` refuses to
   install ACLs into a configuration that does not include them.
 
 ## Safety rules
@@ -143,9 +143,9 @@ acl dohcord_ports_6 port 443
 ## Verifying the result
 
 ```bash
-sudo dohcord-relay policy show          # matches the files
-sudo dohcord-relay network              # policy valid + document
-sudo bash /usr/local/lib/dohcord-relay/verify.sh
+sudo pishcord-relay policy show          # matches the files
+sudo pishcord-relay network              # policy valid + document
+sudo bash /usr/local/lib/pishcord-relay/verify.sh
 ```
 
 `verify.sh` re-checks the generated ACLs against both files, confirms the API

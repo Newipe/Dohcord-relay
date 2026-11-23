@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Newipe/Dohcord-relay/internal/config"
-	"github.com/Newipe/Dohcord-relay/internal/policy"
+	"github.com/Newipe/Pishcord-relay/internal/config"
+	"github.com/Newipe/Pishcord-relay/internal/policy"
 )
 
 // serverWithPolicy builds a server whose policy comes from the given file
@@ -26,7 +26,7 @@ func serverWithPolicy(t *testing.T, domains, ports string) (*Server, string, str
 	writeFile(t, domainsPath, domains)
 	writeFile(t, policyPath, ports)
 	secretPath := filepath.Join(dir, "turn-secret")
-	writeFile(t, secretPath, "dohcord-test-secret\n")
+	writeFile(t, secretPath, "pishcord-test-secret\n")
 
 	cfg := config.Default()
 	cfg.SecretFile = secretPath
@@ -122,7 +122,7 @@ func ruleFor(t *testing.T, rules []policy.RoutingRule, host string) policy.Routi
 // endpoint (443, not the 8443 configuration port), the routing rules with their
 // matching mode and ports, and the fields older clients already use.
 func TestRoutingContract(t *testing.T) {
-	srv, _ := testServer(t, "dohcord-test-secret", 24*time.Hour)
+	srv, _ := testServer(t, "pishcord-test-secret", 24*time.Hour)
 	rec, doc := fetchNetworkConfig(t, srv)
 
 	if rec.Code != http.StatusOK {

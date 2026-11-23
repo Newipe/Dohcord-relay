@@ -2,9 +2,9 @@
 //
 // The release workflow sets these values with -ldflags:
 //
-//	-X github.com/Newipe/Dohcord-relay/internal/buildinfo.Version=v1.1.0
-//	-X github.com/Newipe/Dohcord-relay/internal/buildinfo.Commit=<git sha>
-//	-X github.com/Newipe/Dohcord-relay/internal/buildinfo.Date=<commit date>
+//	-X github.com/Newipe/Pishcord-relay/internal/buildinfo.Version=v1.1.0
+//	-X github.com/Newipe/Pishcord-relay/internal/buildinfo.Commit=<git sha>
+//	-X github.com/Newipe/Pishcord-relay/internal/buildinfo.Date=<commit date>
 //
 // Local `go build` runs keep the defaults, so a development binary reports
 // itself as dev rather than pretending to be a release.

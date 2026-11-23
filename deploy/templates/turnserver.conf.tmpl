@@ -1,9 +1,9 @@
-# Dohcord Relay - coturn configuration
+# Pishcord Relay - coturn configuration
 #
 # Rendered by install.sh. Do not edit by hand: re-run the installer with
 # different settings instead, otherwise a renewal or upgrade will overwrite it.
 #
-# Path on the server: /etc/dohcord-relay/turnserver.conf
+# Path on the server: /etc/pishcord-relay/turnserver.conf
 
 # --- Listeners -------------------------------------------------------------
 # Plain TURN/STUN over UDP is the primary transport Dohcord uses.
@@ -39,7 +39,7 @@ server-name=@REALM@
 
 # --- TLS -------------------------------------------------------------------
 # Copies of the Let's Encrypt IP certificate for @PUBLIC_IP@, refreshed by the
-# certbot deploy hook (/usr/local/bin/dohcord-relay-tls-deploy).
+# certbot deploy hook (/usr/local/bin/pishcord-relay-tls-deploy).
 cert=@CERT_FILE@
 pkey=@KEY_FILE@
 # TLS 1.0/1.1 are off; TLS 1.2 and 1.3 stay available. coturn 4.18 renamed these

@@ -13,12 +13,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Newipe/Dohcord-relay/internal/credentials"
+	"github.com/Newipe/Pishcord-relay/internal/credentials"
 )
 
 const (
 	// DefaultPath is where the installer writes the configuration file.
-	DefaultPath = "/etc/dohcord-relay/config.env"
+	DefaultPath = "/etc/pishcord-relay/config.env"
 
 	// DefaultNetworkConfigPort is used when the configuration does not name a
 	// port, including configurations written by older releases.
@@ -86,18 +86,18 @@ func Default() Config {
 	return Config{
 		Identity:              "Dohcord",
 		TTL:                   24 * time.Hour,
-		SecretFile:            "/etc/dohcord-relay/turn-secret",
-		CertFile:              "/etc/dohcord-relay/tls/fullchain.pem",
-		KeyFile:               "/etc/dohcord-relay/tls/privkey.pem",
+		SecretFile:            "/etc/pishcord-relay/turn-secret",
+		CertFile:              "/etc/pishcord-relay/tls/fullchain.pem",
+		KeyFile:               "/etc/pishcord-relay/tls/privkey.pem",
 		NetworkConfigPort:     DefaultNetworkConfigPort,
 		HTTPSListen:           ":8443",
 		HTTPListen:            ":80",
-		ACMEWebroot:           "/var/www/dohcord-relay",
-		AllowedDomainsFile:    "/etc/dohcord-relay/allowed-domains.txt",
-		DestinationPolicyFile: "/etc/dohcord-relay/destination-policy.conf",
-		PolicyStateFile:       "/etc/dohcord-relay/policy.json",
-		SquidConf:             "/etc/dohcord-relay/squid.conf",
-		SquidAllowFile:        "/etc/dohcord-relay/squid-allow.conf",
+		ACMEWebroot:           "/var/www/pishcord-relay",
+		AllowedDomainsFile:    "/etc/pishcord-relay/allowed-domains.txt",
+		DestinationPolicyFile: "/etc/pishcord-relay/destination-policy.conf",
+		PolicyStateFile:       "/etc/pishcord-relay/policy.json",
+		SquidConf:             "/etc/pishcord-relay/squid.conf",
+		SquidAllowFile:        "/etc/pishcord-relay/squid-allow.conf",
 		SquidBinary:           "/usr/sbin/squid",
 		PerIPRate:             DefaultPerIPRate,
 		PerIPBurst:            DefaultPerIPBurst,

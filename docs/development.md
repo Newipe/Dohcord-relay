@@ -14,18 +14,18 @@ changing the source or cutting a release.
 ```bash
 go test ./...                    # unit tests for every package
 go build ./...                   # both commands, development binaries
-make build                       # ./dohcord-relayd and ./dohcord-relay
+make build                       # ./pishcord-relayd and ./pishcord-relay
 ./scripts/check.sh               # formatting, vet, build, tests, shellcheck, integration tests
 ```
 
 `make build` stamps the binaries as `dev`. A development binary reports:
 
 ```text
-dohcord-relayd dev (commit <sha>, built <commit date>, linux/amd64)
-dohcord-relay dev (commit <sha>, built <commit date>, linux/amd64)
+pishcord-relayd dev (commit <sha>, built <commit date>, linux/amd64)
+pishcord-relay dev (commit <sha>, built <commit date>, linux/amd64)
 ```
 
-Check it with `./dohcord-relayd -version` or `./dohcord-relay --build-info`.
+Check it with `./pishcord-relayd -version` or `./pishcord-relay --build-info`.
 
 Integration tests run unprivileged in temporary directories:
 
@@ -64,11 +64,11 @@ git push origin v1.1.0
 
 1. checks out the tagged commit and repeats the validation (format, vet, tests,
    shell checks, integration tests);
-2. builds `dohcord-relayd` and `dohcord-relay` for linux/amd64 and linux/arm64
+2. builds `pishcord-relayd` and `pishcord-relay` for linux/amd64 and linux/arm64
    with `CGO_ENABLED=0`, `-trimpath`, `-buildvcs=false` and the tag, commit and
    commit date injected through `internal/buildinfo`;
 3. packages one archive per architecture:
-   `dohcord-relay_linux_amd64.tar.gz`, `dohcord-relay_linux_arm64.tar.gz`
+   `pishcord-relay_linux_amd64.tar.gz`, `pishcord-relay_linux_arm64.tar.gz`
    (each contains both executables and `README.md`);
 4. checks that each archive really contains both executables;
 5. generates `checksums.txt` with SHA256 for both archives and re-verifies it;
@@ -91,9 +91,9 @@ stable release), maps `uname -m` to `amd64` or `arm64`, downloads the archive an
 the native architecture, that the binary reports the same tag. Only then does it
 back up and replace the executables.
 
-`dohcord-relay update` performs the same verification in the management console,
-backs up the current executables under `/var/backups/dohcord-relay`, restarts
-`dohcord-relay-api.service`, confirms the endpoint answers, and restores the
+`pishcord-relay update` performs the same verification in the management console,
+backs up the current executables under `/var/backups/pishcord-relay`, restarts
+`pishcord-relay-api.service`, confirms the endpoint answers, and restores the
 previous executables if it does not.
 
 Configuration, certificates, destination policy and runtime data are never
@@ -108,7 +108,7 @@ bash scripts/test-release.sh
 ```
 
 To install from a local mirror on a test server, set
-`DOHCORD_RELAY_RELEASE_BASE_URL=file:///path/to/mirror` and
-`DOHCORD_RELAY_VERSION=v1.1.0` before running `deploy/install.sh`. These
+`PISHCORD_RELAY_RELEASE_BASE_URL=file:///path/to/mirror` and
+`PISHCORD_RELAY_VERSION=v1.1.0` before running `deploy/install.sh`. These
 overrides exist for testing; production installations use GitHub Releases over
 HTTPS.

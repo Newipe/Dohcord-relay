@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
-# Dohcord Relay - certbot deploy hook.
+# Pishcord Relay - certbot deploy hook.
 #
 # Runs only after a certificate was successfully issued or renewed. It verifies
 # that the new certificate really covers this relay's public name, publishes
 # copies where the unprivileged services can read them, and reloads every
 # consumer of the certificate.
 #
-# Installed at /usr/local/bin/dohcord-relay-tls-deploy by install.sh.
+# Installed at /usr/local/bin/pishcord-relay-tls-deploy by install.sh.
 set -Eeuo pipefail
 
-MODE="${DOHCORD_RELAY_MODE:-@MODE@}"
-PUBLIC_IP="${DOHCORD_RELAY_PUBLIC_IP:-@PUBLIC_IP@}"
-PUBLIC_HOST="${DOHCORD_RELAY_PUBLIC_HOST:-@PUBLIC_HOST@}"
-CERT_NAME="${DOHCORD_RELAY_CERT_NAME:-dohcord-relay}"
+MODE="${PISHCORD_RELAY_MODE:-@MODE@}"
+PUBLIC_IP="${PISHCORD_RELAY_PUBLIC_IP:-@PUBLIC_IP@}"
+PUBLIC_HOST="${PISHCORD_RELAY_PUBLIC_HOST:-@PUBLIC_HOST@}"
+CERT_NAME="${PISHCORD_RELAY_CERT_NAME:-pishcord-relay}"
 SRC_DIR="/etc/letsencrypt/live/${CERT_NAME}"
-DST_DIR="/etc/dohcord-relay/tls"
-GROUP="dohcord-relay"
-API_UNIT="dohcord-relay-api.service"
-SQUID_UNIT="dohcord-relay-squid.service"
-COTURN_UNIT="${DOHCORD_RELAY_COTURN_UNIT:-dohcord-relay-coturn.service}"
+DST_DIR="/etc/pishcord-relay/tls"
+GROUP="pishcord-relay"
+API_UNIT="pishcord-relay-api.service"
+SQUID_UNIT="pishcord-relay-squid.service"
+COTURN_UNIT="${PISHCORD_RELAY_COTURN_UNIT:-pishcord-relay-coturn.service}"
 
-log() { printf 'dohcord-relay-tls-deploy: %s\n' "$*"; }
-warn() { printf 'dohcord-relay-tls-deploy: warning: %s\n' "$*" >&2; }
+log() { printf 'pishcord-relay-tls-deploy: %s\n' "$*"; }
+warn() { printf 'pishcord-relay-tls-deploy: warning: %s\n' "$*" >&2; }
 die() {
-	printf 'dohcord-relay-tls-deploy: error: %s\n' "$*" >&2
+	printf 'pishcord-relay-tls-deploy: error: %s\n' "$*" >&2
 	exit 1
 }
 

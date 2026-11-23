@@ -1,6 +1,6 @@
 GO ?= go
-DAEMON ?= dohcord-relayd
-CONSOLE ?= dohcord-relay
+DAEMON ?= pishcord-relayd
+CONSOLE ?= pishcord-relay
 
 # Release builds override VERSION with the Git tag. Local builds say "dev" so a
 # development binary can never be mistaken for a published release.
@@ -8,24 +8,24 @@ VERSION ?= dev
 COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell git log -1 --format=%cI 2>/dev/null || echo unknown)
 LDFLAGS := -s -w \
-	-X github.com/Newipe/Dohcord-relay/internal/buildinfo.Version=$(VERSION) \
-	-X github.com/Newipe/Dohcord-relay/internal/buildinfo.Commit=$(COMMIT) \
-	-X github.com/Newipe/Dohcord-relay/internal/buildinfo.Date=$(BUILD_DATE)
+	-X github.com/Newipe/Pishcord-relay/internal/buildinfo.Version=$(VERSION) \
+	-X github.com/Newipe/Pishcord-relay/internal/buildinfo.Commit=$(COMMIT) \
+	-X github.com/Newipe/Pishcord-relay/internal/buildinfo.Date=$(BUILD_DATE)
 
 .PHONY: all build daemon console test vet fmt check clean install
 
 all: check build
 
-# build produces both programs: the server (dohcord-relayd) and the management
-# console (dohcord-relay). Servers normally install the published release
+# build produces both programs: the server (pishcord-relayd) and the management
+# console (pishcord-relay). Servers normally install the published release
 # binaries; these targets are for development and for release packaging.
 build: daemon console
 
 daemon:
-	$(GO) build -trimpath -buildvcs=false -ldflags="$(LDFLAGS)" -o $(DAEMON) ./cmd/dohcord-relayd
+	$(GO) build -trimpath -buildvcs=false -ldflags="$(LDFLAGS)" -o $(DAEMON) ./cmd/pishcord-relayd
 
 console:
-	$(GO) build -trimpath -buildvcs=false -ldflags="$(LDFLAGS)" -o $(CONSOLE) ./cmd/dohcord-relay
+	$(GO) build -trimpath -buildvcs=false -ldflags="$(LDFLAGS)" -o $(CONSOLE) ./cmd/pishcord-relay
 
 test:
 	$(GO) test ./...

@@ -8,8 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/Newipe/Dohcord-relay/internal/config"
-	"github.com/Newipe/Dohcord-relay/internal/policy"
+	"github.com/Newipe/Pishcord-relay/internal/config"
+	"github.com/Newipe/Pishcord-relay/internal/policy"
 )
 
 // applyPolicy validates the two operator files, renders the Squid ACL include,

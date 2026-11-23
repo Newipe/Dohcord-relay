@@ -93,42 +93,42 @@ jobs:
           # time; rebuilding the same tag yields the same metadata.
           build_date="$(git log -1 --format=%cI "${COMMIT}")"
           ldflags="-s -w \
-            -X github.com/Newipe/Dohcord-relay/internal/buildinfo.Version=${VERSION} \
-            -X github.com/Newipe/Dohcord-relay/internal/buildinfo.Commit=${COMMIT} \
-            -X github.com/Newipe/Dohcord-relay/internal/buildinfo.Date=${build_date}"
+            -X github.com/Newipe/Pishcord-relay/internal/buildinfo.Version=${VERSION} \
+            -X github.com/Newipe/Pishcord-relay/internal/buildinfo.Commit=${COMMIT} \
+            -X github.com/Newipe/Pishcord-relay/internal/buildinfo.Date=${build_date}"
 
           mkdir -p "dist/stage"
           CGO_ENABLED=0 GOOS=linux GOARCH="${{ matrix.arch }}" \
             go build -trimpath -buildvcs=false -ldflags="${ldflags}" \
-            -o "dist/stage/dohcord-relayd" ./cmd/dohcord-relayd
+            -o "dist/stage/pishcord-relayd" ./cmd/pishcord-relayd
           CGO_ENABLED=0 GOOS=linux GOARCH="${{ matrix.arch }}" \
             go build -trimpath -buildvcs=false -ldflags="${ldflags}" \
-            -o "dist/stage/dohcord-relay" ./cmd/dohcord-relay
+            -o "dist/stage/pishcord-relay" ./cmd/pishcord-relay
 
           # Fail loudly if either executable is missing or not executable.
-          test -x "dist/stage/dohcord-relayd"
-          test -x "dist/stage/dohcord-relay"
+          test -x "dist/stage/pishcord-relayd"
+          test -x "dist/stage/pishcord-relay"
           cp README.md "dist/stage/README.md"
 
-          archive="dohcord-relay_linux_${{ matrix.arch }}.tar.gz"
+          archive="pishcord-relay_linux_${{ matrix.arch }}.tar.gz"
           # gzip -n keeps the archive reproducible: no timestamp or file name is
           # written into the gzip header, and tar metadata is fixed as well.
           tar --sort=name --owner=0 --group=0 --numeric-owner \
             --mtime="@$(git log -1 --format=%ct "${COMMIT}")" \
             -C "dist/stage" -cf - \
-            dohcord-relay dohcord-relayd README.md |
+            pishcord-relay pishcord-relayd README.md |
             gzip -n -9 >"dist/${archive}"
 
           # The archive must contain both executables before it is uploaded.
           listing="$(tar -tzf "dist/${archive}")"
-          grep -qx 'dohcord-relay' <<<"${listing}"
-          grep -qx 'dohcord-relayd' <<<"${listing}"
+          grep -qx 'pishcord-relay' <<<"${listing}"
+          grep -qx 'pishcord-relayd' <<<"${listing}"
 
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.arch }}
-          path: dist/dohcord-relay_linux_${{ matrix.arch }}.tar.gz
+          path: dist/pishcord-relay_linux_${{ matrix.arch }}.tar.gz
           if-no-files-found: error
           retention-days: 1
 
@@ -157,15 +157,15 @@ jobs:
         run: |
           set -Eeuo pipefail
           cd dist
-          expected=(dohcord-relay_linux_amd64.tar.gz dohcord-relay_linux_arm64.tar.gz)
+          expected=(pishcord-relay_linux_amd64.tar.gz pishcord-relay_linux_arm64.tar.gz)
           for archive in "${expected[@]}"; do
             if [[ ! -s "${archive}" ]]; then
               echo "::error::missing release asset ${archive}"
               exit 1
             fi
             listing="$(tar -tzf "${archive}")"
-            grep -qx 'dohcord-relay' <<<"${listing}"
-            grep -qx 'dohcord-relayd' <<<"${listing}"
+            grep -qx 'pishcord-relay' <<<"${listing}"
+            grep -qx 'pishcord-relayd' <<<"${listing}"
           done
           sha256sum "${expected[@]}" | sort -k2 > checksums.txt
           cat checksums.txt
@@ -178,8 +178,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           assets=(
-            dist/dohcord-relay_linux_amd64.tar.gz
-            dist/dohcord-relay_linux_arm64.tar.gz
+            dist/pishcord-relay_linux_amd64.tar.gz
+            dist/pishcord-relay_linux_arm64.tar.gz
             dist/checksums.txt
           )
           if gh release view "${VERSION}" >/dev/null 2>&1; then
@@ -188,6 +188,6 @@ jobs:
           else
             gh release create "${VERSION}" "${assets[@]}" \
               --verify-tag \
-              --title "Dohcord-relay ${VERSION}" \
+              --title "Pishcord-relay ${VERSION}" \
               --generate-notes
           fi

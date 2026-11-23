@@ -1,47 +1,47 @@
 #!/usr/bin/env bash
-# Dohcord Relay verification suite.
+# Pishcord Relay verification suite.
 #
 # Checks a live installation end to end and prints one line per check. Exits
 # non-zero when any check fails. Nothing here changes configuration; the only
 # side effects are temporary TURN allocations, a short-lived echo peer used by
 # the media test, and TLS connections through the proxy.
 #
-# Run as root (or as a user that can read /etc/dohcord-relay):
+# Run as root (or as a user that can read /etc/pishcord-relay):
 #
 #   sudo deploy/scripts/verify.sh
 #
 # Environment overrides (used by the installer and by local testing):
-#   DOHCORD_RELAY_CONFIG        config.env path
-#   DOHCORD_RELAY_TURNSERVER_CONF, DOHCORD_RELAY_SECRET_FILE, DOHCORD_RELAY_TLS_CERT
-#   DOHCORD_RELAY_SQUID_CONF, DOHCORD_RELAY_SQUID_UNIT, DOHCORD_RELAY_API_UNIT
-#   DOHCORD_RELAY_PROXY_URL, DOHCORD_RELAY_API_URL
-#   DOHCORD_RELAY_SKIP_UNITS, DOHCORD_RELAY_SKIP_RENEW, DOHCORD_RELAY_CERTBOT
-#   DOHCORD_RELAY_PROBE_PEER, DOHCORD_RELAY_PROBE_PEER_PORT
-#   DOHCORD_RELAY_CA_FILE, DOHCORD_RELAY_ENDPOINT
+#   PISHCORD_RELAY_CONFIG        config.env path
+#   PISHCORD_RELAY_TURNSERVER_CONF, PISHCORD_RELAY_SECRET_FILE, PISHCORD_RELAY_TLS_CERT
+#   PISHCORD_RELAY_SQUID_CONF, PISHCORD_RELAY_SQUID_UNIT, PISHCORD_RELAY_API_UNIT
+#   PISHCORD_RELAY_PROXY_URL, PISHCORD_RELAY_API_URL
+#   PISHCORD_RELAY_SKIP_UNITS, PISHCORD_RELAY_SKIP_RENEW, PISHCORD_RELAY_CERTBOT
+#   PISHCORD_RELAY_PROBE_PEER, PISHCORD_RELAY_PROBE_PEER_PORT
+#   PISHCORD_RELAY_CA_FILE, PISHCORD_RELAY_ENDPOINT
 set -uo pipefail
 
-CONFIG="${DOHCORD_RELAY_CONFIG:-/etc/dohcord-relay/config.env}"
-TURN_CONF="${DOHCORD_RELAY_TURNSERVER_CONF:-/etc/dohcord-relay/turnserver.conf}"
-SQUID_CONF="${DOHCORD_RELAY_SQUID_CONF:-/etc/dohcord-relay/squid.conf}"
-SQUID_UNIT="${DOHCORD_RELAY_SQUID_UNIT:-dohcord-relay-squid.service}"
-API_UNIT="${DOHCORD_RELAY_API_UNIT:-dohcord-relay-api.service}"
-SECRET_FILE="${DOHCORD_RELAY_SECRET_FILE:-/etc/dohcord-relay/turn-secret}"
-TLS_CERT="${DOHCORD_RELAY_TLS_CERT:-/etc/dohcord-relay/tls/fullchain.pem}"
-TURN_LOG="${DOHCORD_RELAY_TURN_LOG:-/var/log/dohcord-relay/turnserver/turnserver.log}"
-COTURN_UNIT="${DOHCORD_RELAY_COTURN_UNIT:-dohcord-relay-coturn.service}"
-CERT_NAME="${DOHCORD_RELAY_CERT_NAME:-dohcord-relay}"
-SKIP_UNITS="${DOHCORD_RELAY_SKIP_UNITS:-0}"
-SKIP_RENEW="${DOHCORD_RELAY_SKIP_RENEW:-0}"
-PROBE_PEER="${DOHCORD_RELAY_PROBE_PEER:-}"
-PROBE_PEER_PORT="${DOHCORD_RELAY_PROBE_PEER_PORT:-3480}"
-CA_FILE="${DOHCORD_RELAY_CA_FILE:-}"
+CONFIG="${PISHCORD_RELAY_CONFIG:-/etc/pishcord-relay/config.env}"
+TURN_CONF="${PISHCORD_RELAY_TURNSERVER_CONF:-/etc/pishcord-relay/turnserver.conf}"
+SQUID_CONF="${PISHCORD_RELAY_SQUID_CONF:-/etc/pishcord-relay/squid.conf}"
+SQUID_UNIT="${PISHCORD_RELAY_SQUID_UNIT:-pishcord-relay-squid.service}"
+API_UNIT="${PISHCORD_RELAY_API_UNIT:-pishcord-relay-api.service}"
+SECRET_FILE="${PISHCORD_RELAY_SECRET_FILE:-/etc/pishcord-relay/turn-secret}"
+TLS_CERT="${PISHCORD_RELAY_TLS_CERT:-/etc/pishcord-relay/tls/fullchain.pem}"
+TURN_LOG="${PISHCORD_RELAY_TURN_LOG:-/var/log/pishcord-relay/turnserver/turnserver.log}"
+COTURN_UNIT="${PISHCORD_RELAY_COTURN_UNIT:-pishcord-relay-coturn.service}"
+CERT_NAME="${PISHCORD_RELAY_CERT_NAME:-pishcord-relay}"
+SKIP_UNITS="${PISHCORD_RELAY_SKIP_UNITS:-0}"
+SKIP_RENEW="${PISHCORD_RELAY_SKIP_RENEW:-0}"
+PROBE_PEER="${PISHCORD_RELAY_PROBE_PEER:-}"
+PROBE_PEER_PORT="${PISHCORD_RELAY_PROBE_PEER_PORT:-3480}"
+CA_FILE="${PISHCORD_RELAY_CA_FILE:-}"
 # Certificate authority for the proxy listener. Empty means the system trust
 # store; set it only when testing against a staging certificate.
-PROXY_CA="${DOHCORD_RELAY_PROXY_CA:-}"
-ENDPOINT_OVERRIDE="${DOHCORD_RELAY_ENDPOINT:-}"
-API_URL_OVERRIDE="${DOHCORD_RELAY_API_URL:-}"
-PROXY_URL_OVERRIDE="${DOHCORD_RELAY_PROXY_URL:-}"
-BINARY="${DOHCORD_RELAY_BINARY:-/usr/local/bin/dohcord-relayd}"
+PROXY_CA="${PISHCORD_RELAY_PROXY_CA:-}"
+ENDPOINT_OVERRIDE="${PISHCORD_RELAY_ENDPOINT:-}"
+API_URL_OVERRIDE="${PISHCORD_RELAY_API_URL:-}"
+PROXY_URL_OVERRIDE="${PISHCORD_RELAY_PROXY_URL:-}"
+BINARY="${PISHCORD_RELAY_BINARY:-/usr/local/bin/pishcord-relayd}"
 
 passed=0
 failed=0
@@ -87,11 +87,11 @@ TTL_RAW="$(cfg CREDENTIAL_TTL)"
 PROXY_URL="${PROXY_URL_OVERRIDE:-$(cfg HTTPS_PROXY_URL)}"
 API_URL="${API_URL_OVERRIDE:-$(cfg NETWORK_CONFIG_URL)}"
 ALLOWED_FILE="$(cfg ALLOWED_DOMAINS_FILE)"
-ALLOWED_FILE="${ALLOWED_FILE:-/etc/dohcord-relay/allowed-domains.txt}"
+ALLOWED_FILE="${ALLOWED_FILE:-/etc/pishcord-relay/allowed-domains.txt}"
 POLICY_FILE="$(cfg DESTINATION_POLICY_FILE)"
-POLICY_FILE="${POLICY_FILE:-/etc/dohcord-relay/destination-policy.conf}"
+POLICY_FILE="${POLICY_FILE:-/etc/pishcord-relay/destination-policy.conf}"
 ALLOW_FILE="$(cfg SQUID_ALLOW_FILE)"
-ALLOW_FILE="${ALLOW_FILE:-/etc/dohcord-relay/squid-allow.conf}"
+ALLOW_FILE="${ALLOW_FILE:-/etc/pishcord-relay/squid-allow.conf}"
 
 # split_url URL -> sets URL_HOST URL_PORT
 split_url() {
@@ -216,7 +216,7 @@ fi
 PEER_BIN=""
 [[ -n "${UTILS_DIR:-}" && -x "${UTILS_DIR}/turnutils_peer" ]] && PEER_BIN="${UTILS_DIR}/turnutils_peer"
 
-printf 'Dohcord Relay verification\n'
+printf 'Pishcord Relay verification\n'
 printf '  proxy      %s\n' "${PROXY_URL}"
 printf '  api        %s (configured port %s)\n' "${API_URL}" "${API_PORT}"
 printf '  turn url   %s\n' "${UDP_URL}"
@@ -226,7 +226,7 @@ printf '  identity   %s\n' "${IDENTITY}"
 # --- services ---------------------------------------------------------------
 section "Services"
 if [[ "${SKIP_UNITS}" == "1" ]]; then
-	skip "systemd checks disabled (DOHCORD_RELAY_SKIP_UNITS=1)"
+	skip "systemd checks disabled (PISHCORD_RELAY_SKIP_UNITS=1)"
 else
 	for unit in "${SQUID_UNIT}" "${COTURN_UNIT}" "${API_UNIT}"; do
 		if systemctl is-active --quiet "${unit}"; then
@@ -303,10 +303,10 @@ elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status
 		fail "ufw does not allow the configured API port ${API_PORT}/tcp"
 	fi
 	if [[ "${API_PORT}" != "8443" ]] &&
-		ufw status | grep -qE '^8443/tcp[[:space:]]+ALLOW.*dohcord-relay network config'; then
-		warn "an obsolete ufw rule still opens 8443/tcp for Dohcord-relay"
+		ufw status | grep -qE '^8443/tcp[[:space:]]+ALLOW.*pishcord-relay network config'; then
+		warn "an obsolete ufw rule still opens 8443/tcp for Pishcord-relay"
 	else
-		pass "no obsolete Dohcord-relay API rule for 8443/tcp is open"
+		pass "no obsolete Pishcord-relay API rule for 8443/tcp is open"
 	fi
 elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
 	if firewall-cmd --query-port="${API_PORT}/tcp" >/dev/null 2>&1; then
@@ -378,12 +378,12 @@ if [[ -r "${SQUID_CONF}" ]]; then
 	else
 		pass "no ssl_bump: the Discord TLS session stays end-to-end"
 	fi
-	if grep -qxF 'http_access deny !dohcord_connect' "${SQUID_CONF}" && grep -qxF 'http_access deny all' "${SQUID_CONF}"; then
+	if grep -qxF 'http_access deny !pishcord_connect' "${SQUID_CONF}" && grep -qxF 'http_access deny all' "${SQUID_CONF}"; then
 		pass "CONNECT is the only method and the default action is deny"
 	else
 		fail "CONNECT-only deny rules are missing from ${SQUID_CONF}"
 	fi
-	if grep -q 'dohcord_blocked_dst' "${SQUID_CONF}" && grep -qE '10\.0\.0\.0/8' "${SQUID_CONF}"; then
+	if grep -q 'pishcord_blocked_dst' "${SQUID_CONF}" && grep -qE '10\.0\.0\.0/8' "${SQUID_CONF}"; then
 		pass "resolved destination addresses are checked against private/special ranges"
 	else
 		fail "private destination address filtering is missing from ${SQUID_CONF}"
@@ -456,7 +456,7 @@ for domain, ports in policy.items():
         sys.exit(1)
 for line in allow.splitlines():
     if line.startswith("http_access"):
-        if "dohcord_domain_" not in line or "dohcord_ports_" not in line:
+        if "pishcord_domain_" not in line or "pishcord_ports_" not in line:
             print(f"access rule does not constrain domain and port: {line}")
             sys.exit(1)
 sys.exit(0)
@@ -479,7 +479,7 @@ section "HTTPS CONNECT proxy policy enforcement"
 # proxy_probe URL prints one of: denied, tls, ok, other
 #
 # Probes always verify the proxy's TLS certificate: with the system trust store,
-# or with DOHCORD_RELAY_PROXY_CA when the relay uses a staging certificate.
+# or with PISHCORD_RELAY_PROXY_CA when the relay uses a staging certificate.
 proxy_ca_args=()
 [[ -n "${PROXY_CA}" ]] && proxy_ca_args+=(--proxy-cacert "${PROXY_CA}")
 proxy_probe() {
@@ -711,7 +711,7 @@ try:
         scopes.append(("exact", host) if match == "exact" else ("suffix", "." + host))
     allows = len(re.findall(r"^http_access allow CONNECT", acl, re.M))
     acl_ok = (1 if allows == len(scopes) and all(
-        re.search(r"^acl dohcord_domain_\d+ dstdomain " + re.escape(scope) + r"$", acl, re.M)
+        re.search(r"^acl pishcord_domain_\d+ dstdomain " + re.escape(scope) + r"$", acl, re.M)
         for _, scope in scopes) else 0)
 except OSError:
     acl_ok = 0
@@ -923,7 +923,7 @@ TURN_DOWN_V="${TURN_DOWN_V:-16}"
 TC_IFACE_V="$(cfg TC_INTERFACE)"
 TC_MAX_V="$(cfg TC_MAX_CLIENTS)"
 TC_MAX_V="${TC_MAX_V:-512}"
-TC_SCRIPT="${DOHCORD_RELAY_TC:-/usr/local/lib/dohcord-relay/dohcord-relay-tc}"
+TC_SCRIPT="${PISHCORD_RELAY_TC:-/usr/local/lib/pishcord-relay/pishcord-relay-tc}"
 
 for v in "${PROXY_UP_V}" "${PROXY_DOWN_V}" "${TURN_UP_V}" "${TURN_DOWN_V}"; do
 	if [[ ! "${v}" =~ ^[0-9]{1,6}$ ]]; then
@@ -937,7 +937,7 @@ shaping_configured=0
 if ! command -v tc >/dev/null 2>&1; then
 	if ((shaping_configured)); then
 		fail "tc is not installed, so the configured bandwidth limits are NOT enforced"
-		note "install iproute2 (apt-get install iproute2) and run: dohcord-relay diagnostics"
+		note "install iproute2 (apt-get install iproute2) and run: pishcord-relay diagnostics"
 	else
 		pass "no bandwidth limits configured and tc is not present"
 	fi
@@ -982,7 +982,7 @@ else
 				if printf '%s\n' "${tc_status}" | grep -q '^missing_filter=\|^missing_fallback_filter='; then
 					note "the classification filters are missing, so the classes shape nothing; the shaper's journal says why a rule was refused"
 				fi
-				note "run: sudo systemctl status dohcord-relay-tc.service; sudo journalctl -u dohcord-relay-tc -n 30"
+				note "run: sudo systemctl status pishcord-relay-tc.service; sudo journalctl -u pishcord-relay-tc -n 30"
 				note "then: sudo ${TC_SCRIPT} apply"
 			else
 				pass "no bandwidth limits configured; shaping is inactive"
@@ -1015,10 +1015,10 @@ fi
 
 section "ACME HTTP-01 path"
 ACME_WEBROOT="$(cfg ACME_WEBROOT)"
-ACME_WEBROOT="${ACME_WEBROOT:-/var/www/dohcord-relay}"
+ACME_WEBROOT="${ACME_WEBROOT:-/var/www/pishcord-relay}"
 ACME_DIR="${ACME_WEBROOT}/.well-known/acme-challenge"
-ACME_URL="${DOHCORD_RELAY_ACME_URL:-http://${PROXY_HOST}/.well-known/acme-challenge}"
-acme_token="dohcordverify${RANDOM}${RANDOM}"
+ACME_URL="${PISHCORD_RELAY_ACME_URL:-http://${PROXY_HOST}/.well-known/acme-challenge}"
+acme_token="pishcordverify${RANDOM}${RANDOM}"
 if mkdir -p "${ACME_DIR}" 2>/dev/null && printf 'acme-ok\n' >"${ACME_DIR}/${acme_token}" 2>/dev/null; then
 	acme_body="$(curl -sS --max-time 10 "${ACME_URL}/${acme_token}" 2>/dev/null || true)"
 	rm -f "${ACME_DIR}/${acme_token}"
@@ -1098,24 +1098,24 @@ if [[ "${SKIP_UNITS}" == "1" ]]; then
 	skip "renewal timer checks disabled"
 else
 	for state in enabled active; do
-		if systemctl is-${state} --quiet dohcord-relay-certbot-renew.timer 2>/dev/null; then
-			pass "dohcord-relay-certbot-renew.timer is ${state}"
+		if systemctl is-${state} --quiet pishcord-relay-certbot-renew.timer 2>/dev/null; then
+			pass "pishcord-relay-certbot-renew.timer is ${state}"
 		else
-			fail "dohcord-relay-certbot-renew.timer is not ${state}"
+			fail "pishcord-relay-certbot-renew.timer is not ${state}"
 		fi
 	done
 fi
 
-CERTBOT_BIN="${DOHCORD_RELAY_CERTBOT:-}"
+CERTBOT_BIN="${PISHCORD_RELAY_CERTBOT:-}"
 if [[ -z "${CERTBOT_BIN}" ]]; then
-	if [[ -x /opt/dohcord-relay-certbot/bin/certbot ]]; then
-		CERTBOT_BIN=/opt/dohcord-relay-certbot/bin/certbot
+	if [[ -x /opt/pishcord-relay-certbot/bin/certbot ]]; then
+		CERTBOT_BIN=/opt/pishcord-relay-certbot/bin/certbot
 	elif command -v certbot >/dev/null 2>&1; then
 		CERTBOT_BIN="$(command -v certbot)"
 	fi
 fi
 if [[ "${SKIP_RENEW}" == "1" ]]; then
-	skip "renewal dry-run disabled (DOHCORD_RELAY_SKIP_RENEW=1)"
+	skip "renewal dry-run disabled (PISHCORD_RELAY_SKIP_RENEW=1)"
 elif [[ -z "${CERTBOT_BIN}" ]]; then
 	skip "certbot not found; cannot test renewal"
 else
@@ -1231,7 +1231,7 @@ if [[ -n "${UCLIENT}" && -n "${USERNAME}" && -n "${MEDIA_PEER}" && -n "${PEER_BI
 		fail "media did not traverse the relay (sent=${sent:-0}, received=${recv:-0})"
 	fi
 else
-	skip "media test needs turnutils_peer and a peer address on this host; set DOHCORD_RELAY_PROBE_PEER"
+	skip "media test needs turnutils_peer and a peer address on this host; set PISHCORD_RELAY_PROBE_PEER"
 fi
 
 # --- outbound connectivity --------------------------------------------------

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dohcord Relay - per-client-IP bandwidth enforcement with Linux tc.
+# Pishcord Relay - per-client-IP bandwidth enforcement with Linux tc.
 #
 # The relay enforces bandwidth per *client IP*, not per connection:
 #
@@ -45,13 +45,13 @@
 # Nothing here is per connection or per session, and no protocol is modified.
 set -Eeuo pipefail
 
-readonly PROGRAM="dohcord-relay-tc"
-readonly DEFAULT_CONFIG="/etc/dohcord-relay/config.env"
-readonly DEFAULT_TURN_CONF="/etc/dohcord-relay/turnserver.conf"
+readonly PROGRAM="pishcord-relay-tc"
+readonly DEFAULT_CONFIG="/etc/pishcord-relay/config.env"
+readonly DEFAULT_TURN_CONF="/etc/pishcord-relay/turnserver.conf"
 
-CONFIG="${DOHCORD_RELAY_CONFIG:-${DEFAULT_CONFIG}}"
-TURN_CONF="${DOHCORD_RELAY_TURN_CONF:-${DEFAULT_TURN_CONF}}"
-STATE_DIR="${DOHCORD_RELAY_TC_STATE:-/run/dohcord-relay-tc}"
+CONFIG="${PISHCORD_RELAY_CONFIG:-${DEFAULT_CONFIG}}"
+TURN_CONF="${PISHCORD_RELAY_TURN_CONF:-${DEFAULT_TURN_CONF}}"
+STATE_DIR="${PISHCORD_RELAY_TC_STATE:-/run/pishcord-relay-tc}"
 
 # --- Defaults (mirrored in deploy/templates/config.env.tmpl) ---------------
 PROXY_UPLOAD_LIMIT_MBIT=8
@@ -64,7 +64,7 @@ TC_IDLE_SECONDS=60
 TC_REFRESH_SECONDS=5
 
 IFACE=""
-IFB="dohcord-ifb"
+IFB="pishcord-ifb"
 # How often the TURN socket table is read. A UDP socket dump has to walk every
 # relay socket coturn holds (thousands on a busy relay), so it is the one part of
 # a refresh whose cost grows with load; in between scans the previous list is
@@ -109,7 +109,7 @@ log() { if ((VERBOSE)); then printf '    %s\n' "$*" >&2; fi; }
 
 usage() {
 	cat <<EOF
-${PROGRAM} - per-client-IP bandwidth limits for Dohcord Relay
+${PROGRAM} - per-client-IP bandwidth limits for Pishcord Relay
 
 Usage: ${PROGRAM} <command> [options]
 
@@ -667,9 +667,9 @@ add_hold_filters() {
 # refresh (both directions use the same list).
 discover_clients() {
 	local service="$1"
-	if [[ -n "${DOHCORD_RELAY_TC_FAKE_CLIENTS:-}" ]]; then
+	if [[ -n "${PISHCORD_RELAY_TC_FAKE_CLIENTS:-}" ]]; then
 		# Test hook: a comma separated list stands in for live connections.
-		printf '%s\n' "${DOHCORD_RELAY_TC_FAKE_CLIENTS}" | tr ',' '\n'
+		printf '%s\n' "${PISHCORD_RELAY_TC_FAKE_CLIENTS}" | tr ',' '\n'
 		return 0
 	fi
 
@@ -714,7 +714,7 @@ discover_clients() {
 # remembered by the long-running process and not by a throwaway subshell.
 clients_for() {
 	local service="$1" now="$2" last
-	if [[ -n "${DOHCORD_RELAY_TC_FAKE_CLIENTS:-}" ]]; then
+	if [[ -n "${PISHCORD_RELAY_TC_FAKE_CLIENTS:-}" ]]; then
 		CLIENTS_OUT="$(discover_clients "${service}")"
 		return 0
 	fi

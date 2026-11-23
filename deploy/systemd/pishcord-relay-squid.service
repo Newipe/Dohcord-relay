@@ -1,16 +1,16 @@
 [Unit]
-Description=Dohcord Relay HTTPS CONNECT proxy (Squid)
-Documentation=https://github.com/Newipe/Dohcord-relay
+Description=Pishcord Relay HTTPS CONNECT proxy (Squid)
+Documentation=https://github.com/Newipe/Pishcord-relay
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-RuntimeDirectory=dohcord-relay-squid
+RuntimeDirectory=pishcord-relay-squid
 RuntimeDirectoryMode=0750
 # Squid binds 443 as root and then drops to the unprivileged "proxy" user
 # (cache_effective_user in squid.conf), so it must start as root.
-ExecStart=@SQUID_BINARY@ -N -f /etc/dohcord-relay/squid.conf
+ExecStart=@SQUID_BINARY@ -N -f /etc/pishcord-relay/squid.conf
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=3s
@@ -31,7 +31,7 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 NoNewPrivileges=true
-ReadWritePaths=/run/dohcord-relay-squid /var/log/dohcord-relay/squid
+ReadWritePaths=/run/pishcord-relay-squid /var/log/pishcord-relay/squid
 
 [Install]
 WantedBy=multi-user.target

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dohcord Relay installer.
+# Pishcord Relay installer.
 #
 # Sets up two networking services on one VPS:
 #
@@ -59,7 +59,7 @@ MAX_FDS=8192
 
 # --- Performance and limits -------------------------------------------------
 # Per-client-IP bandwidth limits in Mbit/s, enforced with tc by
-# dohcord-relay-tc. 0 disables that direction. Proxy and TURN are accounted
+# pishcord-relay-tc. 0 disables that direction. Proxy and TURN are accounted
 # separately, and every value is aggregate per client IP, not per connection.
 PROXY_UPLOAD_LIMIT_MBIT=8
 PROXY_DOWNLOAD_LIMIT_MBIT=8
@@ -85,42 +85,42 @@ CLIENT_LIFETIME="4 hours"
 SKIP_RENEW_TEST=0
 SKIP_VERIFY=0
 
-readonly ETC_DIR="/etc/dohcord-relay"
+readonly ETC_DIR="/etc/pishcord-relay"
 readonly TLS_DIR="${ETC_DIR}/tls"
 # Each service gets its own log and runtime directory: they run as different
 # unprivileged users, so a single shared directory would lock one of them out.
-readonly LOG_DIR="/var/log/dohcord-relay"
+readonly LOG_DIR="/var/log/pishcord-relay"
 readonly SQUID_LOG_DIR="${LOG_DIR}/squid"
 readonly TURN_LOG_DIR="${LOG_DIR}/turnserver"
-readonly SQUID_RUN_DIR="/run/dohcord-relay-squid"
-readonly TURN_RUN_DIR="/run/dohcord-relay-coturn"
-readonly WEBROOT="/var/www/dohcord-relay"
-readonly DAEMON="/usr/local/bin/dohcord-relayd"
-readonly CLI="/usr/local/bin/dohcord-relay"
-readonly HOOK="/usr/local/bin/dohcord-relay-tls-deploy"
-readonly MANAGER_ALIAS="/usr/local/bin/dohcord-relay-manager"
-readonly LIB_DIR="/usr/local/lib/dohcord-relay"
+readonly SQUID_RUN_DIR="/run/pishcord-relay-squid"
+readonly TURN_RUN_DIR="/run/pishcord-relay-coturn"
+readonly WEBROOT="/var/www/pishcord-relay"
+readonly DAEMON="/usr/local/bin/pishcord-relayd"
+readonly CLI="/usr/local/bin/pishcord-relay"
+readonly HOOK="/usr/local/bin/pishcord-relay-tls-deploy"
+readonly MANAGER_ALIAS="/usr/local/bin/pishcord-relay-manager"
+readonly LIB_DIR="/usr/local/lib/pishcord-relay"
 readonly MANAGER_SCRIPT="${LIB_DIR}/manager.sh"
 readonly INFO_FILE="${ETC_DIR}/install-info"
-readonly CERT_NAME="dohcord-relay"
-readonly API_UNIT="dohcord-relay-api.service"
-readonly SQUID_UNIT="dohcord-relay-squid.service"
-readonly COTURN_UNIT="dohcord-relay-coturn.service"
-readonly RENEW_SERVICE="dohcord-relay-certbot-renew.service"
-readonly RENEW_TIMER="dohcord-relay-certbot-renew.timer"
-readonly TC_SCRIPT="${LIB_DIR}/dohcord-relay-tc"
-readonly TC_UNIT="dohcord-relay-tc.service"
+readonly CERT_NAME="pishcord-relay"
+readonly API_UNIT="pishcord-relay-api.service"
+readonly SQUID_UNIT="pishcord-relay-squid.service"
+readonly COTURN_UNIT="pishcord-relay-coturn.service"
+readonly RENEW_SERVICE="pishcord-relay-certbot-renew.service"
+readonly RENEW_TIMER="pishcord-relay-certbot-renew.timer"
+readonly TC_SCRIPT="${LIB_DIR}/pishcord-relay-tc"
+readonly TC_UNIT="pishcord-relay-tc.service"
 
 REPO_DIR=""
-# Release selection. An explicit tag (or DOHCORD_RELAY_VERSION) wins; otherwise
-# the latest stable GitHub Release is used. DOHCORD_RELAY_RELEASE_BASE_URL and
-# DOHCORD_RELAY_LATEST_API exist so the download path can be tested against a
+# Release selection. An explicit tag (or PISHCORD_RELAY_VERSION) wins; otherwise
+# the latest stable GitHub Release is used. PISHCORD_RELAY_RELEASE_BASE_URL and
+# PISHCORD_RELAY_LATEST_API exist so the download path can be tested against a
 # local mirror; they are not needed in normal use.
-RELEASE_REQUEST="${DOHCORD_RELAY_VERSION:-}"
+RELEASE_REQUEST="${PISHCORD_RELAY_VERSION:-}"
 RELEASE_TAG=""
 RELEASE_ARCH=""
-RELEASE_BASE_URL="${DOHCORD_RELAY_RELEASE_BASE_URL:-https://github.com/Newipe/Dohcord-relay/releases/download}"
-LATEST_RELEASE_API="${DOHCORD_RELAY_LATEST_API:-https://api.github.com/repos/Newipe/Dohcord-relay/releases/latest}"
+RELEASE_BASE_URL="${PISHCORD_RELAY_RELEASE_BASE_URL:-https://github.com/Newipe/Pishcord-relay/releases/download}"
+LATEST_RELEASE_API="${PISHCORD_RELAY_LATEST_API:-https://api.github.com/repos/Newipe/Pishcord-relay/releases/latest}"
 RELEASE_WORKDIR=""
 RELEASE_ARCHIVE_DIR=""
 BIN_BACKUP_DIR=""
@@ -158,12 +158,12 @@ banner() {
 
 ${C_CYAN}${C_BOLD}  ╭──────────────────────────────────────────────────────╮
   │                                                      │
-  │                   Dohcord-relay                      │
+  │                   Pishcord-relay                      │
   │                   Installation                       │
   │                                                      │
   ╰──────────────────────────────────────────────────────╯${C_RESET}
 
-  Welcome to Dohcord-relay ${INSTALLER_VERSION}.
+  Welcome to Pishcord-relay ${INSTALLER_VERSION}.
 
   This server will host two services for Dohcord:
 
@@ -264,7 +264,7 @@ Usage: sudo deploy/install.sh [options]
 
 Normally you do not run this file directly. Use the one-line installer:
 
-  bash <(curl -fsSL https://raw.githubusercontent.com/Newipe/Dohcord-relay/main/install.sh)
+  bash <(curl -fsSL https://raw.githubusercontent.com/Newipe/Pishcord-relay/main/install.sh)
 
 or, in a checkout of this repository, `bash install.sh` at the top level.
 Both end up here and accept the options below.
@@ -281,7 +281,7 @@ Certificates:
   --staging                Use the Let's Encrypt staging CA (test installs).
 
 Service sizes:
-  --realm NAME             TURN realm (default: the domain, or dohcord.relay).
+  --realm NAME             TURN realm (default: the domain, or pishcord.relay).
   --distro-coturn          Use the distribution coturn package instead of
                            building the pinned upstream release.
   --coturn-version VERSION Upstream coturn release to build (default: 4.18.0).
@@ -460,7 +460,7 @@ parse_args() {
 			die "--api-port must be between 1024 and 65535 (ports below 1024 are reserved for system services)"
 		case "${API_PORT}" in
 		80 | "${PROXY_PORT}" | 3478 | 5349)
-			die "--api-port ${API_PORT} is already used by another Dohcord-relay service"
+			die "--api-port ${API_PORT} is already used by another Pishcord-relay service"
 			;;
 		esac
 	fi
@@ -521,7 +521,7 @@ api_port_problem() {
 	if command -v ss >/dev/null 2>&1 && ss -Hltn "sport = :${port}" 2>/dev/null | grep -q .; then
 		owner="$(api_port_owner "${port}")"
 		# Our own endpoint may hold its configured port on a re-run.
-		[[ "${owner}" == *dohcord-relay* ]] && return 1
+		[[ "${owner}" == *pishcord-relay* ]] && return 1
 		printf 'port %d is already in use%s; stop that service or choose another port' \
 			"${port}" "${owner:+ by ${owner}}"
 		return 0
@@ -996,7 +996,7 @@ EOF
 	else
 		PUBLIC_HOST="${PUBLIC_IP}"
 	fi
-	TURN_REALM="${TURN_REALM:-$( [[ "${MODE}" == "domain" ]] && echo "${DOMAIN}" || echo "dohcord.relay")}"
+	TURN_REALM="${TURN_REALM:-$( [[ "${MODE}" == "domain" ]] && echo "${DOMAIN}" || echo "pishcord.relay")}"
 
 	# Upgrades keep the recorded port; fresh installations choose one here.
 	select_api_port
@@ -1090,9 +1090,9 @@ check_root_and_os() {
 	# The installer no longer compiles anything, but it still needs the
 	# templates, units and helper scripts that ship in the repository archive.
 	[[ -f "${REPO_DIR}/deploy/templates/config.env.tmpl" &&
-		-f "${REPO_DIR}/deploy/systemd/dohcord-relay-api.service" &&
-		-f "${REPO_DIR}/deploy/scripts/dohcord-relay-tls-deploy" ]] ||
-		die "cannot find the installer resources; run this script from a Dohcord-relay release archive"
+		-f "${REPO_DIR}/deploy/systemd/pishcord-relay-api.service" &&
+		-f "${REPO_DIR}/deploy/scripts/pishcord-relay-tls-deploy" ]] ||
+		die "cannot find the installer resources; run this script from a Pishcord-relay release archive"
 
 	command -v systemctl >/dev/null || die "systemd is required"
 	info "repository: ${REPO_DIR}"
@@ -1114,7 +1114,7 @@ install_base_packages() {
 # both busy ports as "ours" and leave the new services unable to start.
 retire_legacy_units() {
 	local unit retired=0
-	local -a legacy=(dohcord-relay-credentials.service)
+	local -a legacy=(pishcord-relay-credentials.service)
 	for unit in "${legacy[@]}"; do
 		[[ -f "/etc/systemd/system/${unit}" ]] || systemctl cat "${unit}" >/dev/null 2>&1 || continue
 		info "found ${unit} from the earlier design; stopping and removing it"
@@ -1124,11 +1124,11 @@ retire_legacy_units() {
 	done
 	if [[ ${retired} -eq 1 ]]; then
 		systemctl daemon-reload >/dev/null 2>&1 || true
-		if [[ -x /usr/local/bin/dohcord-relay-credentials ]]; then
-			info "the old binary /usr/local/bin/dohcord-relay-credentials is kept but no longer runs"
+		if [[ -x /usr/local/bin/pishcord-relay-credentials ]]; then
+			info "the old binary /usr/local/bin/pishcord-relay-credentials is kept but no longer runs"
 		fi
 	else
-		info "no earlier Dohcord-relay service found"
+		info "no earlier Pishcord-relay service found"
 	fi
 }
 
@@ -1145,11 +1145,11 @@ check_ports() {
 		[[ -n "${out}" ]] || return 0
 		# Our own services may already hold the port on a re-run.
 		if [[ "${proto}" == udp ]]; then
-			if ss -Hlunp "sport = :${port}" 2>/dev/null | grep -qE 'turnserver|dohcord-relay'; then
+			if ss -Hlunp "sport = :${port}" 2>/dev/null | grep -qE 'turnserver|pishcord-relay'; then
 				return 0
 			fi
 		else
-			if ss -Hltnp "sport = :${port}" 2>/dev/null | grep -qE 'squid|turnserver|dohcord-relay'; then
+			if ss -Hltnp "sport = :${port}" 2>/dev/null | grep -qE 'squid|turnserver|pishcord-relay'; then
 				return 0
 			fi
 		fi
@@ -1201,13 +1201,13 @@ create_service_users() {
 		useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin turnserver
 		info "created system user turnserver"
 	fi
-	if ! id -u dohcord-relay >/dev/null 2>&1; then
-		useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin dohcord-relay
-		info "created system user dohcord-relay"
+	if ! id -u pishcord-relay >/dev/null 2>&1; then
+		useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin pishcord-relay
+		info "created system user pishcord-relay"
 	fi
-	# coturn reads the certificate copies that belong to dohcord-relay.
-	usermod -aG dohcord-relay turnserver
-	info "turnserver added to the dohcord-relay group"
+	# coturn reads the certificate copies that belong to pishcord-relay.
+	usermod -aG pishcord-relay turnserver
+	info "turnserver added to the pishcord-relay group"
 }
 
 # --- Squid ------------------------------------------------------------------
@@ -1291,21 +1291,21 @@ configure_apparmor() {
 
 	local local_override="/etc/apparmor.d/local/usr.sbin.squid"
 	mkdir -p "$(dirname "${local_override}")"
-	if grep -q 'dohcord-relay' "${local_override}" 2>/dev/null; then
-		info "AppArmor local override already allows the Dohcord-relay paths"
+	if grep -q 'pishcord-relay' "${local_override}" 2>/dev/null; then
+		info "AppArmor local override already allows the Pishcord-relay paths"
 		return 0
 	fi
 	cat >>"${local_override}" <<'EOF'
 
-# Dohcord-relay: configuration, certificate and log paths
-/etc/dohcord-relay/** r,
-/var/log/dohcord-relay/** rw,
-/run/dohcord-relay-squid/** rw,
+# Pishcord-relay: configuration, certificate and log paths
+/etc/pishcord-relay/** r,
+/var/log/pishcord-relay/** rw,
+/run/pishcord-relay-squid/** rw,
 EOF
 	if command -v apparmor_parser >/dev/null 2>&1; then
 		apparmor_parser -r "${profile}" >/dev/null 2>&1 ||
 			warn "could not reload the Squid AppArmor profile; check /etc/apparmor.d/local/usr.sbin.squid if Squid cannot read its configuration"
-		info "extended the Squid AppArmor profile for /etc/dohcord-relay"
+		info "extended the Squid AppArmor profile for /etc/pishcord-relay"
 	else
 		warn "AppArmor profile present but apparmor_parser is missing; Squid may be confined"
 	fi
@@ -1339,7 +1339,7 @@ render_squid_conf() {
 
 install_squid_unit() {
 	sed -e "s|@SQUID_BINARY@|${SQUID_BINARY}|g" \
-		"${REPO_DIR}/deploy/systemd/dohcord-relay-squid.service" >"/etc/systemd/system/${SQUID_UNIT}"
+		"${REPO_DIR}/deploy/systemd/pishcord-relay-squid.service" >"/etc/systemd/system/${SQUID_UNIT}"
 	chmod 0644 "/etc/systemd/system/${SQUID_UNIT}"
 	info "installed /etc/systemd/system/${SQUID_UNIT} (exec ${SQUID_BINARY})"
 }
@@ -1456,8 +1456,8 @@ write_turn_secret() {
 	fi
 	chown root:root "${secret_file}"
 	chmod 0640 "${secret_file}"
-	# The endpoint (group dohcord-relay) and nobody else can read it.
-	chgrp dohcord-relay "${secret_file}"
+	# The endpoint (group pishcord-relay) and nobody else can read it.
+	chgrp pishcord-relay "${secret_file}"
 }
 
 render_turnserver_conf() {
@@ -1494,7 +1494,7 @@ render_turnserver_conf() {
 
 install_coturn_unit() {
 	sed -e "s|@TURN_BINARY@|${TURN_BINARY}|g" \
-		"${REPO_DIR}/deploy/systemd/dohcord-relay-coturn.service" >"/etc/systemd/system/${COTURN_UNIT}"
+		"${REPO_DIR}/deploy/systemd/pishcord-relay-coturn.service" >"/etc/systemd/system/${COTURN_UNIT}"
 	chmod 0644 "/etc/systemd/system/${COTURN_UNIT}"
 	info "installed /etc/systemd/system/${COTURN_UNIT}"
 }
@@ -1593,14 +1593,14 @@ detect_release_arch() {
 		die "release binaries are published for Linux only (this host is $(uname -s))"
 	machine="$(uname -m)"
 	RELEASE_ARCH="$(native_release_arch "${machine}")" ||
-		die "unsupported architecture '${machine}': Dohcord-relay publishes linux/amd64 and linux/arm64 release binaries"
+		die "unsupported architecture '${machine}': Pishcord-relay publishes linux/amd64 and linux/arm64 release binaries"
 	info "release target: linux/${RELEASE_ARCH}"
 }
 
 # migrate_legacy_binary moves a pre-rename server binary out of the way. Older
-# releases installed the daemon as /usr/local/bin/dohcord-relay; that name now
+# releases installed the daemon as /usr/local/bin/pishcord-relay; that name now
 # belongs to the management console, so the existing executable is copied to
-# /usr/local/bin/dohcord-relayd before anything is replaced. Copying (rather than
+# /usr/local/bin/pishcord-relayd before anything is replaced. Copying (rather than
 # moving) also keeps a running service's inode valid until it is restarted.
 migrate_legacy_binary() {
 	[[ -x "${DAEMON}" ]] && return 0
@@ -1616,7 +1616,7 @@ backup_current_binaries() {
 		return 0
 	fi
 	local dir
-	dir="/var/backups/dohcord-relay/binaries-$(date +%Y%m%d-%H%M%S)"
+	dir="/var/backups/pishcord-relay/binaries-$(date +%Y%m%d-%H%M%S)"
 	mkdir -p "${dir}"
 	chmod 0700 "${dir}"
 	[[ -e "${DAEMON}" ]] && cp -a "${DAEMON}" "${dir}/"
@@ -1630,12 +1630,12 @@ backup_current_binaries() {
 restore_previous_binaries() {
 	[[ -n "${BIN_BACKUP_DIR}" && -d "${BIN_BACKUP_DIR}" ]] || return 1
 	local restored=0
-	if [[ -f "${BIN_BACKUP_DIR}/dohcord-relayd" ]]; then
-		install -m 0755 -o root -g root "${BIN_BACKUP_DIR}/dohcord-relayd" "${DAEMON}"
+	if [[ -f "${BIN_BACKUP_DIR}/pishcord-relayd" ]]; then
+		install -m 0755 -o root -g root "${BIN_BACKUP_DIR}/pishcord-relayd" "${DAEMON}"
 		restored=1
 	fi
-	if [[ -f "${BIN_BACKUP_DIR}/dohcord-relay" ]]; then
-		install -m 0755 -o root -g root "${BIN_BACKUP_DIR}/dohcord-relay" "${CLI}"
+	if [[ -f "${BIN_BACKUP_DIR}/pishcord-relay" ]]; then
+		install -m 0755 -o root -g root "${BIN_BACKUP_DIR}/pishcord-relay" "${CLI}"
 		restored=1
 	fi
 	((restored)) || return 1
@@ -1646,11 +1646,11 @@ restore_previous_binaries() {
 download_release_binaries() {
 	local asset base url checksums unpack file magic
 	base="${RELEASE_BASE_URL%/}"
-	asset="dohcord-relay_linux_${RELEASE_ARCH}.tar.gz"
+	asset="pishcord-relay_linux_${RELEASE_ARCH}.tar.gz"
 	url="${base}/${RELEASE_TAG}/${asset}"
 
 	cleanup_release_workdir
-	RELEASE_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/dohcord-relay-release.XXXXXX")"
+	RELEASE_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/pishcord-relay-release.XXXXXX")"
 	info "downloading ${url}"
 	download_release_url "${url}" "${RELEASE_WORKDIR}/${asset}" ||
 		die "cannot download ${asset} for ${RELEASE_TAG}; the installed binaries were not changed"
@@ -1670,7 +1670,7 @@ download_release_binaries() {
 	mkdir -p "${unpack}"
 	tar -xzf "${RELEASE_WORKDIR}/${asset}" -C "${unpack}" --no-same-owner ||
 		die "cannot extract ${asset}; the installed binaries were not changed"
-	for file in dohcord-relayd dohcord-relay; do
+	for file in pishcord-relayd pishcord-relay; do
 		[[ -f "${unpack}/${file}" && ! -L "${unpack}/${file}" ]] ||
 			die "${asset} does not contain a regular ${file} file"
 		magic="$(od -An -tx1 -N4 "${unpack}/${file}" | tr -d ' \n')"
@@ -1681,10 +1681,10 @@ download_release_binaries() {
 	# On the native architecture the binaries can be checked directly. The tag
 	# embedded at build time must match the release being installed.
 	if [[ "${RELEASE_ARCH}" == "$(native_release_arch "$(uname -m)")" ]]; then
-		"${unpack}/dohcord-relayd" -version >"${RELEASE_WORKDIR}/daemon-version" 2>&1 ||
-			die "the downloaded dohcord-relayd cannot run on this host; the installed binaries were not changed"
+		"${unpack}/pishcord-relayd" -version >"${RELEASE_WORKDIR}/daemon-version" 2>&1 ||
+			die "the downloaded pishcord-relayd cannot run on this host; the installed binaries were not changed"
 		grep -Fq " ${RELEASE_TAG} " "${RELEASE_WORKDIR}/daemon-version" ||
-			die "the downloaded dohcord-relayd does not report ${RELEASE_TAG}; refusing a mismatched release"
+			die "the downloaded pishcord-relayd does not report ${RELEASE_TAG}; refusing a mismatched release"
 	fi
 
 	RELEASE_ARCHIVE_DIR="${unpack}"
@@ -1698,8 +1698,8 @@ install_release_binaries() {
 	backup_current_binaries
 
 	# Both executables are staged before either is moved into place.
-	install -m 0755 -o root -g root "${RELEASE_ARCHIVE_DIR}/dohcord-relayd" "${DAEMON}.new"
-	install -m 0755 -o root -g root "${RELEASE_ARCHIVE_DIR}/dohcord-relay" "${CLI}.new"
+	install -m 0755 -o root -g root "${RELEASE_ARCHIVE_DIR}/pishcord-relayd" "${DAEMON}.new"
+	install -m 0755 -o root -g root "${RELEASE_ARCHIVE_DIR}/pishcord-relay" "${CLI}.new"
 	mv -f "${DAEMON}.new" "${DAEMON}"
 	mv -f "${CLI}.new" "${CLI}"
 
@@ -1771,7 +1771,7 @@ render_config_env() {
 		done <"${rendered}"
 		info "updated the public endpoints in ${target}"
 	else
-		chown root:dohcord-relay "${rendered}"
+		chown root:pishcord-relay "${rendered}"
 		chmod 0640 "${rendered}"
 		mv "${rendered}" "${target}"
 		info "wrote ${target}"
@@ -1782,7 +1782,7 @@ render_config_env() {
 	for key in "${PERF_KEYS[@]}"; do
 		set_config_value "${target}" "${key}" "${!key}"
 	done
-	chown root:dohcord-relay "${target}"
+	chown root:pishcord-relay "${target}"
 	chmod 0640 "${target}"
 	info "network and performance limits recorded in ${target}"
 	rm -f "${rendered}"
@@ -1790,7 +1790,7 @@ render_config_env() {
 }
 
 install_api_unit() {
-	install -m 0644 "${REPO_DIR}/deploy/systemd/dohcord-relay-api.service" \
+	install -m 0644 "${REPO_DIR}/deploy/systemd/pishcord-relay-api.service" \
 		"/etc/systemd/system/${API_UNIT}"
 	info "installed /etc/systemd/system/${API_UNIT}"
 }
@@ -1801,18 +1801,18 @@ install_api_unit() {
 # change how traffic is handled; they drive the services installed above.
 install_management_tools() {
 	install -d -m 0755 -o root -g root "${LIB_DIR}"
-	if [[ -f "${REPO_DIR}/deploy/scripts/dohcord-relay-manager.sh" ]]; then
-		install -m 0755 "${REPO_DIR}/deploy/scripts/dohcord-relay-manager.sh" "${MANAGER_SCRIPT}"
+	if [[ -f "${REPO_DIR}/deploy/scripts/pishcord-relay-manager.sh" ]]; then
+		install -m 0755 "${REPO_DIR}/deploy/scripts/pishcord-relay-manager.sh" "${MANAGER_SCRIPT}"
 		info "installed ${MANAGER_SCRIPT}"
-		# dohcord-relay is the console; keep the previous name working as an alias.
+		# pishcord-relay is the console; keep the previous name working as an alias.
 		ln -sfn "${CLI}" "${MANAGER_ALIAS}"
 		info "linked ${MANAGER_ALIAS} -> ${CLI}"
 	else
 		warn "the management console is missing from this checkout; skipping it"
 	fi
 	install -m 0755 "${REPO_DIR}/deploy/scripts/verify.sh" "${LIB_DIR}/verify.sh"
-	if [[ -f "${REPO_DIR}/deploy/scripts/dohcord-relay-tc" ]]; then
-		install -m 0755 "${REPO_DIR}/deploy/scripts/dohcord-relay-tc" "${TC_SCRIPT}"
+	if [[ -f "${REPO_DIR}/deploy/scripts/pishcord-relay-tc" ]]; then
+		install -m 0755 "${REPO_DIR}/deploy/scripts/pishcord-relay-tc" "${TC_SCRIPT}"
 		info "installed ${TC_SCRIPT}"
 	fi
 	if [[ -f "${REPO_DIR}/uninstall.sh" ]]; then
@@ -1829,7 +1829,7 @@ install_management_tools() {
 # secrets: only the public endpoints and how this relay was installed.
 write_install_info() {
 	local ref stamp
-	ref="${DOHCORD_RELAY_REF:-main}"
+	ref="${PISHCORD_RELAY_REF:-main}"
 	if command -v git >/dev/null 2>&1 && [[ -d "${REPO_DIR}/.git" ]]; then
 		ref="$(git -C "${REPO_DIR}" rev-parse --short HEAD 2>/dev/null || printf '%s' "${ref}")"
 	fi
@@ -1892,11 +1892,11 @@ setup_certbot() {
 
 	export DEBIAN_FRONTEND=noninteractive
 	apt-get install -y -qq --no-install-recommends python3-venv python3-pip >/dev/null
-	python3 -m venv /opt/dohcord-relay-certbot
-	/opt/dohcord-relay-certbot/bin/pip install --quiet --upgrade pip >/dev/null
-	/opt/dohcord-relay-certbot/bin/pip install --quiet 'certbot>=5.4,<6' >/dev/null ||
+	python3 -m venv /opt/pishcord-relay-certbot
+	/opt/pishcord-relay-certbot/bin/pip install --quiet --upgrade pip >/dev/null
+	/opt/pishcord-relay-certbot/bin/pip install --quiet 'certbot>=5.4,<6' >/dev/null ||
 		die "cannot install certbot 5.4+ from PyPI"
-	CERTBOT="/opt/dohcord-relay-certbot/bin/certbot"
+	CERTBOT="/opt/pishcord-relay-certbot/bin/certbot"
 	info "installed $("${CERTBOT}" --version)"
 }
 
@@ -1904,7 +1904,7 @@ install_deploy_hook() {
 	sed -e "s|@PUBLIC_IP@|${PUBLIC_IP}|g" \
 		-e "s|@PUBLIC_HOST@|${PUBLIC_HOST}|g" \
 		-e "s|@MODE@|${MODE}|g" \
-		"${REPO_DIR}/deploy/scripts/dohcord-relay-tls-deploy" >"${HOOK}.new"
+		"${REPO_DIR}/deploy/scripts/pishcord-relay-tls-deploy" >"${HOOK}.new"
 	chown root:root "${HOOK}.new"
 	chmod 0755 "${HOOK}.new"
 	mv "${HOOK}.new" "${HOOK}"
@@ -1928,14 +1928,14 @@ responder_answers() {
 	[[ "$(curl -fsS --max-time 2 "http://127.0.0.1/.well-known/acme-challenge/$1" 2>/dev/null || true)" == "ok" ]]
 }
 
-# is_our_binary PID succeeds when PID runs a Dohcord-relay executable. The
+# is_our_binary PID succeeds when PID runs a Pishcord-relay executable. The
 # prefix match also covers the binary shipped by the earlier, credentials-only
-# design (/usr/local/bin/dohcord-relay-credentials), which binds :80 and :443.
+# design (/usr/local/bin/pishcord-relay-credentials), which binds :80 and :443.
 is_our_binary() {
 	[[ -n "$1" && -r "/proc/$1/exe" ]] || return 1
 	local exe
 	exe="$(readlink -f "/proc/$1/exe" 2>/dev/null)" || return 1
-	[[ "$(basename "${exe}")" == dohcord-relay* ]]
+	[[ "$(basename "${exe}")" == pishcord-relay* ]]
 }
 
 start_acme_bootstrap() {
@@ -1956,8 +1956,8 @@ start_acme_bootstrap() {
 		if systemctl is-active --quiet "${API_UNIT}"; then
 			info "port 80 is already served by ${API_UNIT}"
 			return 0
-		elif [[ -n "${holder_unit}" && "${holder_unit}" == dohcord-relay-* && "${holder_unit}" != "${API_UNIT}" ]]; then
-			# An earlier Dohcord-relay service (the credentials-only design) still
+		elif [[ -n "${holder_unit}" && "${holder_unit}" == pishcord-relay-* && "${holder_unit}" != "${API_UNIT}" ]]; then
+			# An earlier Pishcord-relay service (the credentials-only design) still
 			# runs and binds :80 and :443. It is ours, so retire it instead of
 			# asking the operator to hunt it down.
 			info "retiring ${holder_unit} from the earlier design; it holds port 80"
@@ -2114,8 +2114,8 @@ obtain_certificate() {
 
 install_renewal() {
 	sed -e "s|@CERTBOT@|${CERTBOT}|g" \
-		"${REPO_DIR}/deploy/systemd/dohcord-relay-certbot-renew.service" >"/etc/systemd/system/${RENEW_SERVICE}"
-	install -m 0644 "${REPO_DIR}/deploy/systemd/dohcord-relay-certbot-renew.timer" "/etc/systemd/system/${RENEW_TIMER}"
+		"${REPO_DIR}/deploy/systemd/pishcord-relay-certbot-renew.service" >"/etc/systemd/system/${RENEW_SERVICE}"
+	install -m 0644 "${REPO_DIR}/deploy/systemd/pishcord-relay-certbot-renew.timer" "/etc/systemd/system/${RENEW_TIMER}"
 	systemctl daemon-reload
 	systemctl enable --now "${RENEW_TIMER}" >/dev/null
 	info "renewal timer enabled: ${RENEW_TIMER} (every 6h; certbot decides if a renewal is due)"
@@ -2133,7 +2133,7 @@ install_renewal() {
 ufw_api_rule_numbers() {
 	local port="$1"
 	ufw status numbered 2>/dev/null |
-		awk -v want="${port}/tcp" -v tag="dohcord-relay network config" '
+		awk -v want="${port}/tcp" -v tag="pishcord-relay network config" '
 			index($0, want) && index($0, tag) {
 				line = $0
 				sub(/^\[[[:space:]]*/, "", line)
@@ -2182,15 +2182,15 @@ firewall_verify_api_port() {
 configure_firewall() {
 	local changed=0 verify=2
 	if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
-		ufw allow 80/tcp comment 'dohcord-relay ACME' >/dev/null
-		ufw allow "${PROXY_PORT}/tcp" comment 'dohcord-relay HTTPS CONNECT proxy' >/dev/null
+		ufw allow 80/tcp comment 'pishcord-relay ACME' >/dev/null
+		ufw allow "${PROXY_PORT}/tcp" comment 'pishcord-relay HTTPS CONNECT proxy' >/dev/null
 		# Retire the previous API rule before opening the selected port, so 8443
 		# is not left open when a different port was chosen.
 		firewall_remove_old_api_port "${PREVIOUS_API_PORT}"
-		ufw allow "${API_PORT}/tcp" comment 'dohcord-relay network config' >/dev/null
-		ufw allow 3478/udp comment 'dohcord-relay TURN' >/dev/null
-		ufw allow 5349/tcp comment 'dohcord-relay TURN TLS' >/dev/null
-		ufw allow 49152:65535/udp comment 'dohcord-relay media' >/dev/null
+		ufw allow "${API_PORT}/tcp" comment 'pishcord-relay network config' >/dev/null
+		ufw allow 3478/udp comment 'pishcord-relay TURN' >/dev/null
+		ufw allow 5349/tcp comment 'pishcord-relay TURN TLS' >/dev/null
+		ufw allow 49152:65535/udp comment 'pishcord-relay media' >/dev/null
 		changed=1
 		info "opened the required ports in ufw (existing rules untouched)"
 		firewall_verify_api_port "${API_PORT}"
@@ -2262,15 +2262,15 @@ shaping_enabled() {
 # proves the limits are actually active. A shaping failure never silently
 # disables the limits: it is reported and fails verification.
 install_shaping() {
-	if [[ ! -f "${REPO_DIR}/deploy/scripts/dohcord-relay-tc" ]]; then
+	if [[ ! -f "${REPO_DIR}/deploy/scripts/pishcord-relay-tc" ]]; then
 		warn "the traffic-shaping helper is missing from this checkout; bandwidth limits cannot be enforced"
 		SHAPING_RC=1
 		step_failed
 		return 0
 	fi
-	install -m 0755 "${REPO_DIR}/deploy/scripts/dohcord-relay-tc" "${TC_SCRIPT}"
+	install -m 0755 "${REPO_DIR}/deploy/scripts/pishcord-relay-tc" "${TC_SCRIPT}"
 	sed -e "s|@TC_SCRIPT@|${TC_SCRIPT}|g" \
-		"${REPO_DIR}/deploy/systemd/dohcord-relay-tc.service" >"/etc/systemd/system/${TC_UNIT}"
+		"${REPO_DIR}/deploy/systemd/pishcord-relay-tc.service" >"/etc/systemd/system/${TC_UNIT}"
 	chmod 0644 "/etc/systemd/system/${TC_UNIT}"
 	systemctl daemon-reload
 
@@ -2293,9 +2293,9 @@ install_shaping() {
 	if ! modprobe ifb >/dev/null 2>&1 && [[ ! -d /sys/module/ifb ]]; then
 		warn "the ifb kernel module is unavailable; per-client-IP upload limits cannot be enforced"
 	fi
-	if [[ -d /etc/modules-load.d && ! -e /etc/modules-load.d/dohcord-relay-ifb.conf ]]; then
-		printf '# Dohcord-relay: upload shaping mirrors relay traffic onto an ifb device.\nifb\n' \
-			>/etc/modules-load.d/dohcord-relay-ifb.conf 2>/dev/null ||
+	if [[ -d /etc/modules-load.d && ! -e /etc/modules-load.d/pishcord-relay-ifb.conf ]]; then
+		printf '# Pishcord-relay: upload shaping mirrors relay traffic onto an ifb device.\nifb\n' \
+			>/etc/modules-load.d/pishcord-relay-ifb.conf 2>/dev/null ||
 			warn "could not persist the ifb module for the next boot"
 	fi
 
@@ -2358,8 +2358,8 @@ run_verification() {
 		warn "skipping HTTPS checks: a staging certificate is not publicly trusted"
 		return 0
 	fi
-	if ! DOHCORD_RELAY_SKIP_RENEW="${SKIP_RENEW_TEST}" \
-		DOHCORD_RELAY_CERTBOT="${CERTBOT}" bash "${REPO_DIR}/deploy/scripts/verify.sh"; then
+	if ! PISHCORD_RELAY_SKIP_RENEW="${SKIP_RENEW_TEST}" \
+		PISHCORD_RELAY_CERTBOT="${CERTBOT}" bash "${REPO_DIR}/deploy/scripts/verify.sh"; then
 		warn "one or more checks failed; see the output above"
 		return 1
 	fi
@@ -2378,7 +2378,7 @@ print_report() { # print_report VERIFY_RC
 	cat <<EOF
 
 ==========================================================================
-Dohcord-relay ${heading}
+Pishcord-relay ${heading}
 ==========================================================================
 Server address       ${PUBLIC_HOST} (${PUBLIC_IP}), mode: ${MODE}
 
@@ -2412,10 +2412,10 @@ Firewall ports       80/tcp, ${PROXY_PORT}/tcp, ${API_PORT}/tcp,
 
 Services             systemctl status ${SQUID_UNIT} ${COTURN_UNIT} ${API_UNIT}
 Bandwidth shaper     "${TC_SCRIPT}" status
-Management console   sudo dohcord-relay
-Re-check any time    sudo dohcord-relay diagnostics
-Uninstall safely     sudo dohcord-relay  (option 10)
-Server daemon        ${DAEMON} (dohcord-relay-api.service)
+Management console   sudo pishcord-relay
+Re-check any time    sudo pishcord-relay diagnostics
+Uninstall safely     sudo pishcord-relay  (option 10)
+Server daemon        ${DAEMON} (pishcord-relay-api.service)
                      keeps configuration and certificates unless you purge
 
 In Dohcord: Settings -> Custom Profile -> add this server:

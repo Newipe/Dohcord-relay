@@ -1,6 +1,6 @@
 # Security model
 
-Dohcord-relay is a **selective forwarder**, not a tunnel into a network. This
+Pishcord-relay is a **selective forwarder**, not a tunnel into a network. This
 document describes what it protects, how, and what it explicitly does not do.
 
 ## Threat model
@@ -11,7 +11,7 @@ document describes what it protects, how, and what it explicitly does not do.
 | A modified or hostile client | Cannot widen the policy: destinations, ports and address checks are enforced on the server |
 | A DNS answer controlled by an attacker (rebinding) | Allowlisted names that resolve to private/loopback/link-local/CGNAT addresses are refused *after* resolution |
 | Someone who obtains an issued TURN credential | Can allocate TURN sessions until it expires (default 24 h), within per-credential and total quotas |
-| A local unprivileged user on the server | Cannot read the TURN secret, the private key, or the policy snapshot; services run as `dohcord-relay`, `proxy`, `turnserver` |
+| A local unprivileged user on the server | Cannot read the TURN secret, the private key, or the policy snapshot; services run as `pishcord-relay`, `proxy`, `turnserver` |
 
 Not defended against: an adversary who controls the server itself, an adversary
 who controls your client machine, or a network that blocks the relay's address
@@ -65,7 +65,7 @@ network by controlling DNS.
 | `TC_MAX_CLIENTS` (512), forget after 60 s idle | A flood of unique addresses cannot grow kernel state without bound |
 
 The bandwidth shaper only creates and deletes its own qdisc handles and the
-`dohcord-ifb` device; it never flushes the firewall or an administrator's
+`pishcord-ifb` device; it never flushes the firewall or an administrator's
 traffic-control rules, and it refuses to replace a root qdisc it does not
 manage.
 
@@ -73,17 +73,17 @@ manage.
 
 - TURN credentials are HMAC-SHA1 over the username with a shared secret, carrying
   an expiry. Only the HMAC is published.
-- The shared secret lives in `/etc/dohcord-relay/turn-secret` (`0640
-  root:dohcord-relay`), is read by the API and coturn, and is never logged, never
+- The shared secret lives in `/etc/pishcord-relay/turn-secret` (`0640
+  root:pishcord-relay`), is read by the API and coturn, and is never logged, never
   served and never printed by the installer.
 - The API never logs credentials; it logs the client address, destination count
   and expiry.
-- Private keys are `0640 root:dohcord-relay`; the Squid bundle is a concatenation
+- Private keys are `0640 root:pishcord-relay`; the Squid bundle is a concatenation
   readable only by the groups that need it.
 
 ## Service hardening
 
-All three units run unprivileged (`dohcord-relay`, `proxy`, `turnserver`), with
+All three units run unprivileged (`pishcord-relay`, `proxy`, `turnserver`), with
 `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`,
 `PrivateDevices`, and a small capability set where a privileged port is needed
 (`CAP_NET_BIND_SERVICE` for the API's port 80 ACME responder).
@@ -107,5 +107,5 @@ A cloud security group is outside its reach and must be configured separately.
 
 ## Reporting a problem
 
-Include the output of `dohcord-relay diagnostics` and `verify.sh`.
+Include the output of `pishcord-relay diagnostics` and `verify.sh`.
 Never include `turn-secret`, `privkey.pem`, or issued TURN credentials.

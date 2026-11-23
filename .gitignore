@@ -1,6 +1,6 @@
 # Built binary and local build output
-/dohcord-relay
-/dohcord-relay-credentials
+/pishcord-relay
+/pishcord-relay-credentials
 /dist/
 *.log
 
@@ -12,6 +12,6 @@ policy.json
 squid-allow.conf
 *.pem
 *.key
-/Dohcord-relay
-/dohcord-relayd
+/Pishcord-relay
+/pishcord-relayd
 *.test

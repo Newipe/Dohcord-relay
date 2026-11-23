@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Dohcord-relay management console.
+# Pishcord-relay management console.
 #
-# Installed as /usr/local/lib/dohcord-relay/manager.sh and started by the
-# dohcord-relay binary, the command users run. /usr/local/bin/dohcord-relay-manager
+# Installed as /usr/local/lib/pishcord-relay/manager.sh and started by the
+# pishcord-relay binary, the command users run. /usr/local/bin/pishcord-relay-manager
 # remains as a compatibility alias for the previous name. It is a front-end for
-# the components that already exist: the systemd units, the dohcord-relayd daemon
+# the components that already exist: the systemd units, the pishcord-relayd daemon
 # and its -policy-apply/-policy-check commands, certbot, and verify.sh (installed
-# at /usr/local/lib/dohcord-relay/verify.sh).
+# at /usr/local/lib/pishcord-relay/verify.sh).
 #
 # It never re-implements networking logic and never edits Squid or coturn
 # configuration itself: policy changes go through the binary, which validates
@@ -16,7 +16,7 @@ set -Eeuo pipefail
 MANAGER_VERSION="1.0.0"
 
 # --- Paths (overridable for testing) ---------------------------------------
-ETC_DIR="${DOHCORD_RELAY_ETC_DIR:-/etc/dohcord-relay}"
+ETC_DIR="${PISHCORD_RELAY_ETC_DIR:-/etc/pishcord-relay}"
 TLS_DIR="${ETC_DIR}/tls"
 CONFIG_FILE="${ETC_DIR}/config.env"
 INFO_FILE="${ETC_DIR}/install-info"
@@ -25,27 +25,27 @@ POLICY_FILE="${ETC_DIR}/destination-policy.conf"
 ALLOW_FILE="${ETC_DIR}/squid-allow.conf"
 SQUID_CONF="${ETC_DIR}/squid.conf"
 TURNSERVER_CONF="${ETC_DIR}/turnserver.conf"
-LOG_DIR="/var/log/dohcord-relay"
-LIB_DIR="${DOHCORD_RELAY_LIB_DIR:-/usr/local/lib/dohcord-relay}"
-BIN="${DOHCORD_RELAY_BIN:-/usr/local/bin/dohcord-relayd}"
-CONSOLE_BIN="${DOHCORD_RELAY_CONSOLE_BIN:-/usr/local/bin/dohcord-relay}"
-# The name shown in help and errors. The binary is called dohcord-relay; the
-# previous dohcord-relay-manager name stays valid as an alias.
-PROGRAM="${DOHCORD_RELAY_PROGRAM:-dohcord-relay}"
-HOOK="/usr/local/bin/dohcord-relay-tls-deploy"
-CERTBOT="/opt/dohcord-relay-certbot/bin/certbot"
-CERT_NAME="dohcord-relay"
+LOG_DIR="/var/log/pishcord-relay"
+LIB_DIR="${PISHCORD_RELAY_LIB_DIR:-/usr/local/lib/pishcord-relay}"
+BIN="${PISHCORD_RELAY_BIN:-/usr/local/bin/pishcord-relayd}"
+CONSOLE_BIN="${PISHCORD_RELAY_CONSOLE_BIN:-/usr/local/bin/pishcord-relay}"
+# The name shown in help and errors. The binary is called pishcord-relay; the
+# previous pishcord-relay-manager name stays valid as an alias.
+PROGRAM="${PISHCORD_RELAY_PROGRAM:-pishcord-relay}"
+HOOK="/usr/local/bin/pishcord-relay-tls-deploy"
+CERTBOT="/opt/pishcord-relay-certbot/bin/certbot"
+CERT_NAME="pishcord-relay"
 
-API_UNIT="dohcord-relay-api.service"
-SQUID_UNIT="dohcord-relay-squid.service"
-COTURN_UNIT="dohcord-relay-coturn.service"
-RENEW_TIMER="dohcord-relay-certbot-renew.timer"
+API_UNIT="pishcord-relay-api.service"
+SQUID_UNIT="pishcord-relay-squid.service"
+COTURN_UNIT="pishcord-relay-coturn.service"
+RENEW_TIMER="pishcord-relay-certbot-renew.timer"
 UNITS=("${API_UNIT}" "${SQUID_UNIT}" "${COTURN_UNIT}")
-REPO_SLUG="Newipe/Dohcord-relay"
-TC_SCRIPT="${DOHCORD_RELAY_TC:-${LIB_DIR}/dohcord-relay-tc}"
-SQUID_BIN="${DOHCORD_RELAY_SQUID_BIN:-/usr/sbin/squid}"
+REPO_SLUG="Newipe/Pishcord-relay"
+TC_SCRIPT="${PISHCORD_RELAY_TC:-${LIB_DIR}/pishcord-relay-tc}"
+SQUID_BIN="${PISHCORD_RELAY_SQUID_BIN:-/usr/sbin/squid}"
 LIMITS_PENDING="${ETC_DIR}/pending"
-LIMITS_BACKUP_ROOT="${DOHCORD_RELAY_BACKUP_DIR:-/var/backups/dohcord-relay}"
+LIMITS_BACKUP_ROOT="${PISHCORD_RELAY_BACKUP_DIR:-/var/backups/pishcord-relay}"
 readonly LIMIT_KEYS=(PROXY_UPLOAD_LIMIT_MBIT PROXY_DOWNLOAD_LIMIT_MBIT TURN_UPLOAD_LIMIT_MBIT TURN_DOWNLOAD_LIMIT_MBIT PER_IP_RATE_PER_MINUTE PER_IP_BURST GLOBAL_RATE_PER_MINUTE GLOBAL_BURST TC_MAX_CLIENTS TC_REFRESH_SECONDS)
 LAST_POLICY_BACKUP=""
 
@@ -93,7 +93,7 @@ unit_state() { # unit_state UNIT -> active|inactive|failed|unknown
 }
 
 unit_short() { # unit_short UNIT -> api|squid|coturn|timer
-	local s="${1#dohcord-relay-}"
+	local s="${1#pishcord-relay-}"
 	printf '%s' "${s%.service}"
 }
 
@@ -129,7 +129,7 @@ turn_urls() { config_value TURN_URLS; }
 installed() { [[ -x "${BIN}" && -r "${CONFIG_FILE}" ]]; }
 
 require_install() {
-	installed || die "Dohcord-relay is not installed on this server (missing ${BIN} or ${CONFIG_FILE})"
+	installed || die "Pishcord-relay is not installed on this server (missing ${BIN} or ${CONFIG_FILE})"
 }
 
 confirm() { # confirm PROMPT [default-yes]
@@ -244,7 +244,7 @@ api_port_conflict() {
 	esac
 	if port_listening "${port}"; then
 		owner="$(ss -Hltnp "( sport = :${port} )" 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -1)"
-		[[ "${owner}" == *dohcord-relay* ]] && return 1
+		[[ "${owner}" == *pishcord-relay* ]] && return 1
 		printf 'port %d is already in use%s' "${port}" "${owner:+ by ${owner}}"
 		return 0
 	fi
@@ -478,7 +478,7 @@ service_menu() {
 network_info() {
 	heading "Network configuration"
 	if ! installed; then
-		warn "Dohcord-relay is not installed yet"
+		warn "Pishcord-relay is not installed yet"
 		return 0
 	fi
 	printf '  %-24s %s\n' "Mode" "$(info_value MODE)"
@@ -655,7 +655,7 @@ validate_ports() {
 	return 0
 }
 
-policy_backup_dir() { printf '%s' "${POLICY_BACKUP_DIR:-/var/backups/dohcord-relay}"; }
+policy_backup_dir() { printf '%s' "${POLICY_BACKUP_DIR:-/var/backups/pishcord-relay}"; }
 
 backup_policy_files() {
 	local dir
@@ -1066,7 +1066,7 @@ diagnostics() {
 			local script="${LIB_DIR}/verify.sh"
 			[[ -x "${script}" ]] || script="${PWD}/deploy/scripts/verify.sh"
 			say ""
-			DOHCORD_RELAY_SKIP_RENEW=1 bash "${script}" || true
+			PISHCORD_RELAY_SKIP_RENEW=1 bash "${script}" || true
 		fi
 	fi
 }
@@ -1556,11 +1556,11 @@ release_arch() {
 }
 
 release_api_url() {
-	printf '%s' "${DOHCORD_RELAY_LATEST_API:-https://api.github.com/repos/${REPO_SLUG}/releases/latest}"
+	printf '%s' "${PISHCORD_RELAY_LATEST_API:-https://api.github.com/repos/${REPO_SLUG}/releases/latest}"
 }
 
 release_download_base() {
-	printf '%s' "${DOHCORD_RELAY_RELEASE_BASE_URL:-https://github.com/${REPO_SLUG}/releases/download}"
+	printf '%s' "${PISHCORD_RELAY_RELEASE_BASE_URL:-https://github.com/${REPO_SLUG}/releases/download}"
 }
 
 # release_fetch URL DEST accepts HTTPS, plus file:// and loopback HTTP for tests.
@@ -1647,7 +1647,7 @@ release_download_archive() {
 		bad "unsupported architecture '$(uname -m)': releases exist for linux/amd64 and linux/arm64"
 		return 1
 	}
-	asset="dohcord-relay_linux_${arch}.tar.gz"
+	asset="pishcord-relay_linux_${arch}.tar.gz"
 	base="$(release_download_base)"
 	base="${base%/}"
 	mkdir -p "${dir}"
@@ -1675,7 +1675,7 @@ release_download_archive() {
 		bad "cannot extract ${asset}; the installed binaries were not changed"
 		return 1
 	fi
-	for file in dohcord-relayd dohcord-relay; do
+	for file in pishcord-relayd pishcord-relay; do
 		if [[ ! -f "${dir}/unpacked/${file}" || -L "${dir}/unpacked/${file}" ]]; then
 			bad "${asset} does not contain a regular ${file} file"
 			return 1
@@ -1687,8 +1687,8 @@ release_download_archive() {
 		fi
 	done
 	if [[ "${arch}" == "$(release_arch "$(uname -m)")" ]]; then
-		if ! "${dir}/unpacked/dohcord-relayd" -version 2>/dev/null | grep -Fq " ${tag} "; then
-			bad "the downloaded dohcord-relayd does not report ${tag}; refusing a mismatched release"
+		if ! "${dir}/unpacked/pishcord-relayd" -version 2>/dev/null | grep -Fq " ${tag} "; then
+			bad "the downloaded pishcord-relayd does not report ${tag}; refusing a mismatched release"
 			return 1
 		fi
 	fi
@@ -1700,7 +1700,7 @@ release_download_archive() {
 update_menu() {
 	need_root
 	require_install
-	heading "Update Dohcord-relay"
+	heading "Update Pishcord-relay"
 
 	local current latest requested target arch dir backup
 	current="$(installed_release_version)"
@@ -1731,7 +1731,7 @@ update_menu() {
 
 	say ""
 	say "  This will:"
-	info "download dohcord-relay_linux_${arch}.tar.gz for ${target}"
+	info "download pishcord-relay_linux_${arch}.tar.gz for ${target}"
 	info "verify it against the release's checksums.txt"
 	info "back up the current executables"
 	info "replace ${BIN} and ${CONSOLE_BIN}, then restart ${API_UNIT}"
@@ -1740,7 +1740,7 @@ update_menu() {
 	say ""
 	confirm "Install ${target}?" || die "cancelled; nothing was changed"
 
-	dir="$(mktemp -d "${TMPDIR:-/tmp}/dohcord-relay-update.XXXXXX")"
+	dir="$(mktemp -d "${TMPDIR:-/tmp}/pishcord-relay-update.XXXXXX")"
 	# shellcheck disable=SC2064
 	trap "rm -rf -- '${dir}'" RETURN
 	if ! release_download_archive "${target}" "${dir}"; then
@@ -1758,12 +1758,12 @@ update_menu() {
 
 	rollback_update() {
 		local restored=0
-		if [[ -f "${backup}/dohcord-relayd" ]]; then
-			install -m 0755 "${backup}/dohcord-relayd" "${BIN}"
+		if [[ -f "${backup}/pishcord-relayd" ]]; then
+			install -m 0755 "${backup}/pishcord-relayd" "${BIN}"
 			restored=1
 		fi
-		if [[ -f "${backup}/dohcord-relay" ]]; then
-			install -m 0755 "${backup}/dohcord-relay" "${CONSOLE_BIN}"
+		if [[ -f "${backup}/pishcord-relay" ]]; then
+			install -m 0755 "${backup}/pishcord-relay" "${CONSOLE_BIN}"
 			restored=1
 		fi
 		((restored)) || return 1
@@ -1775,11 +1775,11 @@ update_menu() {
 		fi
 	}
 
-	install -m 0755 "${RELEASE_UNPACK}/dohcord-relayd" "${BIN}.new" || {
+	install -m 0755 "${RELEASE_UNPACK}/pishcord-relayd" "${BIN}.new" || {
 		rollback_update
 		die "cannot stage the new daemon; the previous executables were kept"
 	}
-	install -m 0755 "${RELEASE_UNPACK}/dohcord-relay" "${CONSOLE_BIN}.new" || {
+	install -m 0755 "${RELEASE_UNPACK}/pishcord-relay" "${CONSOLE_BIN}.new" || {
 		rm -f "${BIN}.new"
 		rollback_update
 		die "cannot stage the new console; the previous executables were kept"
@@ -1858,7 +1858,7 @@ repair_menu() {
 		keymode="$(stat -c '%a' "${TLS_DIR}/privkey.pem")"
 		if (( (8#${keymode} & 8#007) != 0 )); then
 			if confirm "${TLS_DIR}/privkey.pem is mode ${keymode}. Restrict it to 0640?" yes; then
-				chown root:dohcord-relay "${TLS_DIR}/privkey.pem" 2>/dev/null || true
+				chown root:pishcord-relay "${TLS_DIR}/privkey.pem" 2>/dev/null || true
 				chmod 0640 "${TLS_DIR}/privkey.pem"
 				ok "fixed permissions on the private key"
 				fixed=1
@@ -1926,7 +1926,7 @@ repair_menu() {
 # --- Uninstall --------------------------------------------------------------
 uninstall_menu() {
 	need_root
-	heading "Uninstall Dohcord-relay"
+	heading "Uninstall Pishcord-relay"
 	local script="${LIB_DIR}/uninstall.sh"
 	[[ -f "${script}" ]] || script="${PWD}/uninstall.sh"
 	if [[ ! -f "${script}" ]]; then
@@ -1956,7 +1956,7 @@ banner() {
 	printf '\n%s' "${C_CYAN}${C_BOLD}"
 	box_top
 	box_line ""
-	box_center "Dohcord-relay"
+	box_center "Pishcord-relay"
 	box_center "Management"
 	box_line ""
 	printf '  ├%s┤%s\n' "$(box_rule)" "${C_RESET}"
@@ -2088,7 +2088,7 @@ firewall_api_state() {
 ufw_api_rule_numbers() {
 	local port="$1"
 	ufw status numbered 2>/dev/null |
-		awk -v want="${port}/tcp" -v tag="dohcord-relay network config" '
+		awk -v want="${port}/tcp" -v tag="pishcord-relay network config" '
 			index($0, want) && index($0, tag) {
 				line = $0
 				sub(/^\[[[:space:]]*/, "", line)
@@ -2109,7 +2109,7 @@ firewall_set_api_port() { # OLD NEW
 				ufw --force delete "${n}" >/dev/null || warn "could not remove the old ufw rule for ${old}/tcp"
 			done < <(ufw_api_rule_numbers "${old}")
 		fi
-		ufw allow "${new}/tcp" comment 'dohcord-relay network config' >/dev/null || return 1
+		ufw allow "${new}/tcp" comment 'pishcord-relay network config' >/dev/null || return 1
 		[[ "$(firewall_api_state "${new}")" == "allowed" ]]
 		return
 	fi
@@ -2296,7 +2296,7 @@ network_menu() {
 # --- Dispatch ---------------------------------------------------------------
 usage() {
 	cat <<EOF
-Dohcord-relay management console ${MANAGER_VERSION}
+Pishcord-relay management console ${MANAGER_VERSION}
 
 Usage: ${PROGRAM} [command]
 
@@ -2316,7 +2316,7 @@ Usage: ${PROGRAM} [command]
   diagnostics           Health checks (optionally runs verify.sh)
   update                Download and install the newest version
   repair                Fix permissions, directories, stopped services
-  uninstall             Remove Dohcord-relay (as uninstall.sh)
+  uninstall             Remove Pishcord-relay (as uninstall.sh)
   version               Print the version
   help                  This text
 

@@ -12,7 +12,7 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/dohcord-relay-port-test.XXXXXX")"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/pishcord-relay-port-test.XXXXXX")"
 trap 'rm -rf -- "${TMP}"' EXIT
 
 for tool in go openssl curl python3; do
@@ -44,11 +44,11 @@ PY
 # Installer function library: the real script with its ETC_DIR/WEBROOT pointed at
 # the fixture, the root-only directory creation removed and the final main call
 # dropped.
-sed -e "s|readonly ETC_DIR=\"/etc/dohcord-relay\"|readonly ETC_DIR=\"${TMP}/etc\"|" \
-	-e "s|readonly WEBROOT=\"/var/www/dohcord-relay\"|readonly WEBROOT=\"${TMP}/webroot\"|" \
+sed -e "s|readonly ETC_DIR=\"/etc/pishcord-relay\"|readonly ETC_DIR=\"${TMP}/etc\"|" \
+	-e "s|readonly WEBROOT=\"/var/www/pishcord-relay\"|readonly WEBROOT=\"${TMP}/webroot\"|" \
 	-e '$d' "${REPO}/deploy/install.sh" >"${TMP}/install-lib.sh"
 sed -i 's|^[[:space:]]*install -d -m 0755 -o root -g root "${WEBROOT}"$|:|' "${TMP}/install-lib.sh"
-sed -e "s|^main \"\$@\"$||" "${REPO}/deploy/scripts/dohcord-relay-manager.sh" >"${TMP}/manager-lib.sh"
+sed -e "s|^main \"\$@\"$||" "${REPO}/deploy/scripts/pishcord-relay-manager.sh" >"${TMP}/manager-lib.sh"
 mkdir -p "${TMP}/etc"
 
 # --- installer: fresh default -------------------------------------------------
@@ -195,7 +195,7 @@ else
 fi
 
 # --- manager: port resolution, dashboard and config rewrite ------------------
-BIN="${TMP}/fake-dohcord-relayd"
+BIN="${TMP}/fake-pishcord-relayd"
 printf '#!/bin/sh\nexit 0\n' >"${BIN}"
 chmod +x "${BIN}"
 mkdir -p "${TMP}/mgr/etc"
@@ -216,9 +216,9 @@ API_PORT=9443
 EOF
 out="$(bash -c '
 set -Eeuo pipefail
-export DOHCORD_RELAY_ETC_DIR="'"${TMP}"'/mgr/etc"
-export DOHCORD_RELAY_BIN="'"${BIN}"'"
-export DOHCORD_RELAY_LIB_DIR="'"${TMP}"'/mgr/lib"
+export PISHCORD_RELAY_ETC_DIR="'"${TMP}"'/mgr/etc"
+export PISHCORD_RELAY_BIN="'"${BIN}"'"
+export PISHCORD_RELAY_LIB_DIR="'"${TMP}"'/mgr/lib"
 export NO_COLOR=1
 source "'"${TMP}"'/manager-lib.sh"
 printf "PORT=%s\n" "$(api_port)"
@@ -243,7 +243,7 @@ fi
 # --- manager: validation -----------------------------------------------------
 out="$(bash -c '
 set -Eeuo pipefail
-export DOHCORD_RELAY_ETC_DIR="'"${TMP}"'/mgr/etc"
+export PISHCORD_RELAY_ETC_DIR="'"${TMP}"'/mgr/etc"
 export NO_COLOR=1
 source "'"${TMP}"'/manager-lib.sh"
 for p in 80 443 3478 5349 70000 abc; do
@@ -261,7 +261,7 @@ fi
 
 # --- daemon: /network-config on the configured custom port -------------------
 (
-	cd "${REPO}" && CGO_ENABLED=0 go build -o "${TMP}/dohcord-relayd" ./cmd/dohcord-relayd
+	cd "${REPO}" && CGO_ENABLED=0 go build -o "${TMP}/pishcord-relayd" ./cmd/pishcord-relayd
 ) || bad "daemon build failed"
 PORT="$(pick_port)"
 D="${TMP}/daemon"
@@ -288,7 +288,7 @@ SQUID_CONF=${D}/squid.conf
 SQUID_ALLOW_FILE=${D}/squid-allow.conf
 SQUID_BINARY=/usr/sbin/squid
 EOF
-"${TMP}/dohcord-relayd" -config "${D}/etc/config.env" >"${D}/daemon.log" 2>&1 &
+"${TMP}/pishcord-relayd" -config "${D}/etc/config.env" >"${D}/daemon.log" 2>&1 &
 pid=$!
 ready=0
 for _ in $(seq 1 40); do
@@ -317,7 +317,7 @@ wait "${pid}" 2>/dev/null
 
 # --- daemon: legacy configuration without NETWORK_CONFIG_PORT ---------------
 sed -i '/^NETWORK_CONFIG_PORT=/d' "${D}/etc/config.env"
-"${TMP}/dohcord-relayd" -config "${D}/etc/config.env" -print-config >"${D}/printed" 2>&1
+"${TMP}/pishcord-relayd" -config "${D}/etc/config.env" -print-config >"${D}/printed" 2>&1
 if grep -q "^NETWORK_CONFIG_PORT=${PORT}$" "${D}/printed"; then
 	ok "-print-config derives the port from HTTPS_LISTEN for an older configuration"
 else

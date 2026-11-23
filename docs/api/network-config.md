@@ -171,5 +171,5 @@ Dohcord build is needed.
 ```bash
 curl -sS https://relay.example.com:8443/network-config | python3 -m json.tool
 curl -sSI https://relay.example.com:8443/network-config | grep -i cache-control
-sudo dohcord-relay network
+sudo pishcord-relay network
 ```

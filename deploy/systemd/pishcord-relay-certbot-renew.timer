@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically renew the Pishcord Relay IP certificate
+Documentation=https://github.com/Newipe/Pishcord-relay
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+RandomizedDelaySec=30min
+Persistent=true
+Unit=pishcord-relay-certbot-renew.service
+
+[Install]
+WantedBy=timers.target

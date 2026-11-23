@@ -1,12 +1,12 @@
-// Command dohcord-relay is the management console for a Dohcord relay server,
+// Command pishcord-relay is the management console for a Pishcord relay server,
 // and the command users are expected to run.
 //
 // The console itself is the Bash application installed as
-// /usr/local/lib/dohcord-relay/manager.sh: it drives the systemd units, the
+// /usr/local/lib/pishcord-relay/manager.sh: it drives the systemd units, the
 // daemon's -policy-check/-policy-apply commands, certbot and the verification
 // suite. This binary only locates and runs it, so the command name stays stable
 // even though the console is a script. Inside a checkout, running
-// `go run ./cmd/dohcord-relay` finds the same script under deploy/scripts/.
+// `go run ./cmd/pishcord-relay` finds the same script under deploy/scripts/.
 package main
 
 import (
@@ -16,33 +16,33 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/Newipe/Dohcord-relay/internal/buildinfo"
+	"github.com/Newipe/Pishcord-relay/internal/buildinfo"
 )
 
 const (
 	// systemManager is where the installer puts the console.
-	systemManager = "/usr/local/lib/dohcord-relay/manager.sh"
+	systemManager = "/usr/local/lib/pishcord-relay/manager.sh"
 	// managerEnv overrides the console path (used by tests and by checkouts).
-	managerEnv = "DOHCORD_RELAY_MANAGER"
+	managerEnv = "PISHCORD_RELAY_MANAGER"
 	// bash runs the console; it is the same interpreter the installer uses.
 	bash = "/bin/bash"
 	// devManager is the console's path inside a source checkout.
-	devManager = "deploy/scripts/dohcord-relay-manager.sh"
+	devManager = "deploy/scripts/pishcord-relay-manager.sh"
 )
 
 func main() {
 	// The console owns "version"; this flag reports the binary's own build
 	// provenance without starting the script.
 	if len(os.Args) == 2 && (os.Args[1] == "--build-info" || os.Args[1] == "-build-info") {
-		fmt.Println(buildinfo.String("dohcord-relay"))
+		fmt.Println(buildinfo.String("pishcord-relay"))
 		return
 	}
 
 	script, err := managerScript()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "dohcord-relay: %v\n", err)
-		fmt.Fprintln(os.Stderr, "dohcord-relay: reinstall with the one-line installer from the README")
-		fmt.Fprintln(os.Stderr, "dohcord-relay: development builds are documented in docs/development.md")
+		fmt.Fprintf(os.Stderr, "pishcord-relay: %v\n", err)
+		fmt.Fprintln(os.Stderr, "pishcord-relay: reinstall with the one-line installer from the README")
+		fmt.Fprintln(os.Stderr, "pishcord-relay: development builds are documented in docs/development.md")
 		os.Exit(1)
 	}
 
@@ -54,7 +54,7 @@ func main() {
 		if errors.As(err, &exitErr) {
 			os.Exit(exitErr.ExitCode())
 		}
-		fmt.Fprintf(os.Stderr, "dohcord-relay: run %s: %v\n", script, err)
+		fmt.Fprintf(os.Stderr, "pishcord-relay: run %s: %v\n", script, err)
 		os.Exit(1)
 	}
 }

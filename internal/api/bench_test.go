@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Newipe/Dohcord-relay/internal/config"
+	"github.com/Newipe/Pishcord-relay/internal/config"
 )
 
 // benchServer builds the same server the tests use, with the request limits

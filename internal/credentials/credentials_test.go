@@ -38,7 +38,7 @@ func TestParseTURNUsername(t *testing.T) {
 }
 
 func TestValidateIdentity(t *testing.T) {
-	for _, ok := range []string{"Dohcord", "dohcord-relay"} {
+	for _, ok := range []string{"Dohcord", "pishcord-relay"} {
 		if err := ValidateIdentity(ok); err != nil {
 			t.Errorf("ValidateIdentity(%q) = %v, want nil", ok, err)
 		}

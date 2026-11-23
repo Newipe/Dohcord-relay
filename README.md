@@ -1,8 +1,8 @@
-# Dohcord-relay
+# Pishcord-relay
 
 **A private HTTPS proxy and TURN relay for [Dohcord](https://github.com/Newipe/Dohcord), on your own server.**
 
-Dohcord-relay gives Dohcord a way to reach Discord's HTTPS, WebSocket and voice
+Pishcord-relay gives Dohcord a way to reach Discord's HTTPS, WebSocket and voice
 endpoints through a server you control, without a VPN and without decrypting
 anything. It runs two well-known pieces of software, Squid and coturn, behind a
 small HTTPS endpoint that tells the client exactly how to connect.
@@ -28,7 +28,7 @@ small HTTPS endpoint that tells the client exactly how to connect.
 
 Dohcord is a Discord client. Discord's traffic has two halves: ordinary HTTPS
 and WebSocket connections to a handful of domains, and WebRTC media for voice
-and video. Dohcord-relay provides a server-side rendezvous for both:
+and video. Pishcord-relay provides a server-side rendezvous for both:
 
 - an **HTTPS CONNECT proxy** (Squid) that accepts encrypted connections and
   forwards them to a **short, server-enforced list of destinations**;
@@ -64,7 +64,7 @@ for destinations the relay has been told to allow.
 | **Per-client-IP bandwidth limits** | Independent upload/download ceilings for the proxy and the TURN relay, enforced with Linux `tc` and shared by every connection from the same address. |
 | **Measured profile loading** | The API allows 60 requests/minute per address with a burst of 30, so several profiles load at once without a `429`. |
 | **Automated certificates** | certbot with a deploy hook and a systemd timer, including IP certificates for address-only installs. |
-| **Management console** | `dohcord-relay` for status, limits, policy, certificates, updates, repair and uninstall. |
+| **Management console** | `pishcord-relay` for status, limits, policy, certificates, updates, repair and uninstall. |
 | **Idempotent installer** | Re-running it keeps your configuration, policy and certificates. |
 
 ---
@@ -74,7 +74,7 @@ for destinations the relay has been told to allow.
 On a fresh Debian 12 or Ubuntu 22.04+ server, as a user with `sudo`:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Newipe/Dohcord-relay/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Newipe/Pishcord-relay/main/install.sh)
 ```
 
 That single command:
@@ -102,15 +102,15 @@ https://relay.example.com:8443/network-config
 and a management console:
 
 ```bash
-sudo dohcord-relay
+sudo pishcord-relay
 ```
 
-`dohcord-relay` is the management command; the previous `dohcord-relay-manager`
-name remains installed as an alias. The background server is `dohcord-relayd`,
-run by `dohcord-relay-api.service`; you do not normally start it yourself.
+`pishcord-relay` is the management command; the previous `pishcord-relay-manager`
+name remains installed as an alias. The background server is `pishcord-relayd`,
+run by `pishcord-relay-api.service`; you do not normally start it yourself.
 
 **No compiler is required on the server.** The installer downloads
-`dohcord-relay_linux_amd64.tar.gz` or `dohcord-relay_linux_arm64.tar.gz` from
+`pishcord-relay_linux_amd64.tar.gz` or `pishcord-relay_linux_arm64.tar.gz` from
 the matching GitHub Release, verifies it against the release's `checksums.txt`,
 and only then installs the two executables. Supported targets are **linux/amd64**
 and **linux/arm64**; any other architecture stops with a clear error. `--version
@@ -197,7 +197,7 @@ requires an A record pointing at the server before the installer runs.
 
 ## Configuration
 
-Everything lives under `/etc/dohcord-relay`:
+Everything lives under `/etc/pishcord-relay`:
 
 | File | Purpose |
 |---|---|
@@ -238,7 +238,7 @@ Two independent groups of limits keep one client from affecting everyone else:
 - Change them during installation (the installer asks for each one, and accepts
   `--proxy-upload-limit`, `--turn-download-limit`, `--api-per-ip-burst`, … for
   automation) or afterwards in the console: **Limits & performance**
-  (`sudo dohcord-relay limits`).
+  (`sudo pishcord-relay limits`).
 - Upgrades never overwrite configured values: only keys that are missing are
   added, with their defaults.
 
@@ -288,16 +288,16 @@ incomplete policy. Full schema and error behaviour:
 The allowlist is two plain text files, and the same workflow serves every change:
 
 ```bash
-sudoedit /etc/dohcord-relay/allowed-domains.txt        # add: cdn.example.com
-sudoedit /etc/dohcord-relay/destination-policy.conf    # add: cdn.example.com  443
-sudo dohcord-relayd -config /etc/dohcord-relay/config.env -policy-check
-sudo dohcord-relayd -config /etc/dohcord-relay/config.env -policy-apply
+sudoedit /etc/pishcord-relay/allowed-domains.txt        # add: cdn.example.com
+sudoedit /etc/pishcord-relay/destination-policy.conf    # add: cdn.example.com  443
+sudo pishcord-relayd -config /etc/pishcord-relay/config.env -policy-check
+sudo pishcord-relayd -config /etc/pishcord-relay/config.env -policy-apply
 ```
 
 Or without touching files:
 
 ```bash
-sudo dohcord-relay        # Domain policy → Add a destination
+sudo pishcord-relay        # Domain policy → Add a destination
 ```
 
 `-policy-check` validates both files and the whole Squid configuration;
@@ -318,13 +318,13 @@ Format, matching rules and safety notes: [docs/api/domain-policy.md](docs/api/do
 ## Management
 
 ```bash
-sudo dohcord-relay
+sudo pishcord-relay
 ```
 
 ```text
   ╭──────────────────────────────────────────────────────╮
   │                                                      │
-  │                    Dohcord-relay                     │
+  │                    Pishcord-relay                     │
   │                      Management                      │
   │                                                      │
   ├──────────────────────────────────────────────────────┤
@@ -343,26 +343,26 @@ Every menu entry is also a subcommand, for scripts and headless use:
 
 | Command | What it does |
 |---|---|
-| `dohcord-relay dashboard` | Services, certificate, endpoints, listeners, load, policy state |
-| `dohcord-relay network` | Addresses, files, policy validity, and the document clients receive |
-| `dohcord-relay services status` | The three relay units and the renewal timer |
-| `dohcord-relay services restart dohcord-relay-squid.service` | Restart one unit |
-| `dohcord-relay policy show` | Every destination with its match type and ports |
-| `dohcord-relay cert status` | Issuer, validity, days remaining, renewal timer |
-| `dohcord-relay diagnostics` | Health checks, optionally the full verification suite |
-| `dohcord-relay update` | Download and verify a release, back up the executables, replace, restart and verify |
-| `dohcord-relay repair` | Fix permissions, directories, stopped units |
-| `dohcord-relay uninstall` | Remove the relay (see below) |
+| `pishcord-relay dashboard` | Services, certificate, endpoints, listeners, load, policy state |
+| `pishcord-relay network` | Addresses, files, policy validity, and the document clients receive |
+| `pishcord-relay services status` | The three relay units and the renewal timer |
+| `pishcord-relay services restart pishcord-relay-squid.service` | Restart one unit |
+| `pishcord-relay policy show` | Every destination with its match type and ports |
+| `pishcord-relay cert status` | Issuer, validity, days remaining, renewal timer |
+| `pishcord-relay diagnostics` | Health checks, optionally the full verification suite |
+| `pishcord-relay update` | Download and verify a release, back up the executables, replace, restart and verify |
+| `pishcord-relay repair` | Fix permissions, directories, stopped units |
+| `pishcord-relay uninstall` | Remove the relay (see below) |
 
 Prefer plain systemctl? Nothing depends on the console:
 
 ```bash
-systemctl status  dohcord-relay-api dohcord-relay-squid dohcord-relay-coturn
-systemctl restart dohcord-relay-squid
-journalctl -u dohcord-relay-api -f
+systemctl status  pishcord-relay-api pishcord-relay-squid pishcord-relay-coturn
+systemctl restart pishcord-relay-squid
+journalctl -u pishcord-relay-api -f
 ```
 
-> The relay's proxy is its **own** unit, `dohcord-relay-squid.service`. The
+> The relay's proxy is its **own** unit, `pishcord-relay-squid.service`. The
 > distribution's `squid.service` is a different service and is neither used nor
 > touched.
 
@@ -371,19 +371,19 @@ journalctl -u dohcord-relay-api -f
 ## Updating
 
 ```bash
-sudo dohcord-relay        # Update
+sudo pishcord-relay        # Update
 ```
 
 On an upgrade from a release that installed the server as
-`/usr/local/bin/dohcord-relay`, the installer copies that binary to
-`/usr/local/bin/dohcord-relayd` before installing the console under the old
+`/usr/local/bin/pishcord-relay`, the installer copies that binary to
+`/usr/local/bin/pishcord-relayd` before installing the console under the old
 name. The systemd unit keeps its name and is rewritten to the new executable.
 
 `Update` shows the installed and latest release versions, asks which version to
 install (the latest by default), downloads the archive for this architecture,
 verifies it against `checksums.txt`, backs up the current executables to
-`/var/backups/dohcord-relay`, replaces them, restarts
-`dohcord-relay-api.service` and confirms the endpoint answers. If the new binary
+`/var/backups/pishcord-relay`, replaces them, restarts
+`pishcord-relay-api.service` and confirms the endpoint answers. If the new binary
 does not come up, it restores the previous executables automatically.
 
 Configuration, domain policy, certificates and private keys are never touched by
@@ -397,19 +397,19 @@ preserves them, and is always safe to repeat.
 Start with the built-in checks:
 
 ```bash
-sudo dohcord-relay diagnostics
+sudo pishcord-relay diagnostics
 curl -sS https://relay.example.com:8443/network-config | python3 -m json.tool
 ```
 
 | Symptom | First thing to check |
 |---|---|
-| Installer stops at ports | Something already listens on 80/443/8443/3478/5349 (or your chosen API port) — `sudo dohcord-relay dashboard` |
+| Installer stops at ports | Something already listens on 80/443/8443/3478/5349 (or your chosen API port) — `sudo pishcord-relay dashboard` |
 | Certificate issuance fails | Port 80 reachable, A record points here, no AAAA record without IPv6 |
 | Let's Encrypt rate limit | The existing certificate is kept; wait for the stated reset. Do not retry in a loop |
-| Dohcord cannot connect | `curl` the config URL; check `dohcord-relay-api` and the firewall |
+| Dohcord cannot connect | `curl` the config URL; check `pishcord-relay-api` and the firewall |
 | Proxy returns 403 | The host is not in the policy, or the port is not allowed for it |
 | Voice fails, text works | TURN ports/security group, or coturn is down (`services status`) |
-| Squid will not start | `dohcord-relay policy check`, then `services validate` |
+| Squid will not start | `pishcord-relay policy check`, then `services validate` |
 
 Detailed causes and commands: [docs/operations/troubleshooting.md](docs/operations/troubleshooting.md).
 
@@ -418,14 +418,14 @@ Detailed causes and commands: [docs/operations/troubleshooting.md](docs/operatio
 ## Uninstalling
 
 ```bash
-sudo bash uninstall.sh            # or: dohcord-relay → Uninstall
+sudo bash uninstall.sh            # or: pishcord-relay → Uninstall
 ```
 
 It stops and removes the services, units, binaries and runtime directories, then
 asks before deleting anything that is expensive to recreate.
 
 ```text
-  Kept by default:  /etc/dohcord-relay (configuration, policy, certificates)
+  Kept by default:  /etc/pishcord-relay (configuration, policy, certificates)
   --purge:          also removes that directory and the service user
   --purge-cert:     also deletes the Let's Encrypt certificate lineage
 ```
@@ -462,8 +462,8 @@ the relay's own address is blocked. The threat model and its limits are in
 ## Repository layout
 
 ```text
-cmd/dohcord-relay/      management console entry point (runs the console script)
-cmd/dohcord-relayd/     server entry point (flags and startup only)
+cmd/pishcord-relay/      management console entry point (runs the console script)
+cmd/pishcord-relayd/     server entry point (flags and startup only)
 internal/app/           startup wiring and the -policy-check/-policy-apply commands
 internal/api/           /network-config, /turn-credentials, ACME responder, limits
 internal/config/        config.env parsing, validation, effective-config output
@@ -496,7 +496,7 @@ never need Go.
 
 ```bash
 ./scripts/check.sh                            # gofmt, go vet, build, tests, shell and integration tests
-make build                                    # dohcord-relayd and dohcord-relay
+make build                                    # pishcord-relayd and pishcord-relay
 go test ./...                                 # policy, routing, API, credentials
 bash -n install.sh uninstall.sh deploy/install.sh deploy/scripts/*.sh
 sudo bash deploy/scripts/verify.sh            # end-to-end checks on a live relay
@@ -509,7 +509,7 @@ workflow, release process and local release testing.
 `deploy/scripts/verify.sh` verifies the services, listeners, certificate chain, the
 generated ACLs against the policy files, real CONNECT allow/deny behaviour, the
 API document, TURN credentials and media, and renewal. It is read-only apart from
-a certbot dry run (skip it with `DOHCORD_RELAY_SKIP_RENEW=1`).
+a certbot dry run (skip it with `PISHCORD_RELAY_SKIP_RENEW=1`).
 
 ---
 

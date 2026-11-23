@@ -3,8 +3,8 @@
 //
 // Two operator-editable files define what the relay may connect to:
 //
-//	/etc/dohcord-relay/allowed-domains.txt        one domain per line
-//	/etc/dohcord-relay/destination-policy.conf    <domain> <port>[,<port>|<from>-<to> ...]
+//	/etc/pishcord-relay/allowed-domains.txt        one domain per line
+//	/etc/pishcord-relay/destination-policy.conf    <domain> <port>[,<port>|<from>-<to> ...]
 //
 // Both are validated strictly and cross-checked, and the same parsed policy
 // produces the Squid ACL include, the routing contract published by

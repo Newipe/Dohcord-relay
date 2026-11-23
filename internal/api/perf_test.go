@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Newipe/Dohcord-relay/internal/ratelimit"
+	"github.com/Newipe/Pishcord-relay/internal/ratelimit"
 )
 
 // profileLoad runs one /network-config request from addr and returns the status.

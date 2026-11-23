@@ -10,7 +10,7 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/dohcord-relay-release-test.XXXXXX")"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/pishcord-relay-release-test.XXXXXX")"
 trap 'rm -rf -- "${TMP}"' EXIT
 
 if ! command -v go >/dev/null 2>&1; then
@@ -34,15 +34,15 @@ bad() {
 # Installer function library with fixture paths. The real script is used; only
 # ownership flags, fixed install paths and the final main call are adjusted so
 # the tests can run unprivileged.
-sed -e "s|readonly ETC_DIR=\"/etc/dohcord-relay\"|readonly ETC_DIR=\"${TMP}/etc\"|" \
-	-e "s|readonly WEBROOT=\"/var/www/dohcord-relay\"|readonly WEBROOT=\"${TMP}/webroot\"|" \
-	-e "s|readonly DAEMON=\"/usr/local/bin/dohcord-relayd\"|readonly DAEMON=\"${TMP}/bin/dohcord-relayd\"|" \
-	-e "s|readonly CLI=\"/usr/local/bin/dohcord-relay\"|readonly CLI=\"${TMP}/bin/dohcord-relay\"|" \
-	-e "s|/var/backups/dohcord-relay|${TMP}/backups|g" \
+sed -e "s|readonly ETC_DIR=\"/etc/pishcord-relay\"|readonly ETC_DIR=\"${TMP}/etc\"|" \
+	-e "s|readonly WEBROOT=\"/var/www/pishcord-relay\"|readonly WEBROOT=\"${TMP}/webroot\"|" \
+	-e "s|readonly DAEMON=\"/usr/local/bin/pishcord-relayd\"|readonly DAEMON=\"${TMP}/bin/pishcord-relayd\"|" \
+	-e "s|readonly CLI=\"/usr/local/bin/pishcord-relay\"|readonly CLI=\"${TMP}/bin/pishcord-relay\"|" \
+	-e "s|/var/backups/pishcord-relay|${TMP}/backups|g" \
 	-e 's/-o root -g root //g' \
 	-e '$d' "${REPO}/deploy/install.sh" >"${TMP}/install-lib.sh"
 sed -i 's|^[[:space:]]*install -d -m 0755 -o root -g root "${WEBROOT}"$|:|' "${TMP}/install-lib.sh"
-sed -e "s|^main \"\$@\"$||" "${REPO}/deploy/scripts/dohcord-relay-manager.sh" >"${TMP}/manager-lib.sh"
+sed -e "s|^main \"\$@\"$||" "${REPO}/deploy/scripts/pishcord-relay-manager.sh" >"${TMP}/manager-lib.sh"
 mkdir -p "${TMP}/etc" "${TMP}/bin"
 
 # --- build both supported architectures -------------------------------------
@@ -51,16 +51,16 @@ build_bins() { # build_bins ARCH DEST [VERSION]
 	mkdir -p "${dest}"
 	CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -buildvcs=false \
 		-ldflags "-s -w \
-			-X github.com/Newipe/Dohcord-relay/internal/buildinfo.Version=${version} \
-			-X github.com/Newipe/Dohcord-relay/internal/buildinfo.Commit=testsha \
-			-X github.com/Newipe/Dohcord-relay/internal/buildinfo.Date=2026-01-01T00:00:00Z" \
-		-o "${dest}/dohcord-relayd" ./cmd/dohcord-relayd || return 1
+			-X github.com/Newipe/Pishcord-relay/internal/buildinfo.Version=${version} \
+			-X github.com/Newipe/Pishcord-relay/internal/buildinfo.Commit=testsha \
+			-X github.com/Newipe/Pishcord-relay/internal/buildinfo.Date=2026-01-01T00:00:00Z" \
+		-o "${dest}/pishcord-relayd" ./cmd/pishcord-relayd || return 1
 	CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" go build -trimpath -buildvcs=false \
 		-ldflags "-s -w \
-			-X github.com/Newipe/Dohcord-relay/internal/buildinfo.Version=${version} \
-			-X github.com/Newipe/Dohcord-relay/internal/buildinfo.Commit=testsha \
-			-X github.com/Newipe/Dohcord-relay/internal/buildinfo.Date=2026-01-01T00:00:00Z" \
-		-o "${dest}/dohcord-relay" ./cmd/dohcord-relay || return 1
+			-X github.com/Newipe/Pishcord-relay/internal/buildinfo.Version=${version} \
+			-X github.com/Newipe/Pishcord-relay/internal/buildinfo.Commit=testsha \
+			-X github.com/Newipe/Pishcord-relay/internal/buildinfo.Date=2026-01-01T00:00:00Z" \
+		-o "${dest}/pishcord-relay" ./cmd/pishcord-relay || return 1
 	cp "${REPO}/README.md" "${dest}/README.md"
 }
 
@@ -70,14 +70,14 @@ built=0
 for arch in amd64 arm64; do
 	stage="${TMP}/stage-${arch}"
 	if build_bins "${arch}" "${stage}"; then
-		tar -C "${stage}" -czf "${REL}/dohcord-relay_linux_${arch}.tar.gz" \
-			dohcord-relay dohcord-relayd README.md
-		listing="$(tar -tzf "${REL}/dohcord-relay_linux_${arch}.tar.gz")"
-		if grep -qx dohcord-relayd <<<"${listing}"; then
+		tar -C "${stage}" -czf "${REL}/pishcord-relay_linux_${arch}.tar.gz" \
+			pishcord-relay pishcord-relayd README.md
+		listing="$(tar -tzf "${REL}/pishcord-relay_linux_${arch}.tar.gz")"
+		if grep -qx pishcord-relayd <<<"${listing}"; then
 			ok "built linux/${arch} archive with both executables"
 			built=$((built + 1))
 		else
-			bad "linux/${arch} archive is missing dohcord-relayd"
+			bad "linux/${arch} archive is missing pishcord-relayd"
 		fi
 	else
 		bad "linux/${arch} cross-build failed"
@@ -147,7 +147,7 @@ else
 fi
 
 printf '{"tag_name": "v1.2.3"}\n' >"${TMP}/latest.json"
-if out="$(DOHCORD_RELAY_LATEST_API="file://${TMP}/latest.json" bash -c '
+if out="$(PISHCORD_RELAY_LATEST_API="file://${TMP}/latest.json" bash -c '
 set -Eeuo pipefail
 source "'"${TMP}"'/install-lib.sh"
 resolve_release_tag
@@ -158,7 +158,7 @@ else
 	bad "latest release resolution: ${out}"
 fi
 
-if DOHCORD_RELAY_LATEST_API="file://${TMP}/does-not-exist.json" bash -c '
+if PISHCORD_RELAY_LATEST_API="file://${TMP}/does-not-exist.json" bash -c '
 set -Eeuo pipefail
 source "'"${TMP}"'/install-lib.sh"
 RELEASE_REQUEST=not-a-version
@@ -178,7 +178,7 @@ RELEASE_BASE_URL="file://'"${TMP}"'/releases"
 install_release_binaries
 printf "TAG=%s ARCH=%s\n" "${RELEASE_TAG}" "${RELEASE_ARCH}"
 ')" && grep -q '^TAG=v1.2.3 ARCH=amd64$' <<<"${out}" &&
-	"${TMP}/bin/dohcord-relayd" -version | grep -q ' v1.2.3 '; then
+	"${TMP}/bin/pishcord-relayd" -version | grep -q ' v1.2.3 '; then
 	ok "installer downloads, verifies and installs the release binaries"
 else
 	bad "release install: ${out}"
@@ -195,11 +195,11 @@ fi
 # the working binary must stay byte-for-byte identical.
 BAD="${TMP}/releases/v1.2.4"
 mkdir -p "${BAD}"
-cp "${REL}/dohcord-relay_linux_amd64.tar.gz" "${BAD}/"
-cp "${REL}/dohcord-relay_linux_arm64.tar.gz" "${BAD}/"
+cp "${REL}/pishcord-relay_linux_amd64.tar.gz" "${BAD}/"
+cp "${REL}/pishcord-relay_linux_arm64.tar.gz" "${BAD}/"
 (cd "${BAD}" && sha256sum ./*.tar.gz | sed 's|\./||' >checksums.txt)
-printf 'corrupted\n' >>"${BAD}/dohcord-relay_linux_amd64.tar.gz"
-before="$(sha256sum "${TMP}/bin/dohcord-relayd" | cut -d' ' -f1)"
+printf 'corrupted\n' >>"${BAD}/pishcord-relay_linux_amd64.tar.gz"
+before="$(sha256sum "${TMP}/bin/pishcord-relayd" | cut -d' ' -f1)"
 if bash -c '
 set -Eeuo pipefail
 source "'"${TMP}"'/install-lib.sh"
@@ -209,7 +209,7 @@ install_release_binaries
 ' >/dev/null 2>&1; then
 	bad "a corrupted archive was installed"
 else
-	after="$(sha256sum "${TMP}/bin/dohcord-relayd" | cut -d' ' -f1)"
+	after="$(sha256sum "${TMP}/bin/pishcord-relayd" | cut -d' ' -f1)"
 	if [[ "${before}" == "${after}" ]]; then
 		ok "checksum failure leaves the installed binary untouched"
 	else
@@ -227,19 +227,19 @@ PUBLIC_HOST=relay.example.test
 EOF
 if out="$(bash -c '
 set -Eeuo pipefail
-export DOHCORD_RELAY_ETC_DIR="'"${TMP}"'/etc"
-export DOHCORD_RELAY_BIN="'"${TMP}"'/bin/dohcord-relayd"
-export DOHCORD_RELAY_CONSOLE_BIN="'"${TMP}"'/bin/dohcord-relay"
-export DOHCORD_RELAY_RELEASE_BASE_URL="file://'"${TMP}"'/releases"
+export PISHCORD_RELAY_ETC_DIR="'"${TMP}"'/etc"
+export PISHCORD_RELAY_BIN="'"${TMP}"'/bin/pishcord-relayd"
+export PISHCORD_RELAY_CONSOLE_BIN="'"${TMP}"'/bin/pishcord-relay"
+export PISHCORD_RELAY_RELEASE_BASE_URL="file://'"${TMP}"'/releases"
 export NO_COLOR=1
 source "'"${TMP}"'/manager-lib.sh"
 printf "INSTALLED=%s\n" "$(installed_release_version)"
 release_download_archive v1.2.3 "'"${TMP}"'/manager-download"
-test -x "${RELEASE_UNPACK}/dohcord-relayd" && printf "UNPACKED=%s\n" "${RELEASE_ASSET}"
+test -x "${RELEASE_UNPACK}/pishcord-relayd" && printf "UNPACKED=%s\n" "${RELEASE_ASSET}"
 record_release_version v1.2.3 amd64
 printf "RECORDED=%s\n" "$(info_value RELEASE_VERSION)"
 ')" && grep -q '^INSTALLED=v1.0.0$' <<<"${out}" &&
-	grep -q '^UNPACKED=dohcord-relay_linux_amd64.tar.gz$' <<<"${out}" &&
+	grep -q '^UNPACKED=pishcord-relay_linux_amd64.tar.gz$' <<<"${out}" &&
 	grep -q '^RECORDED=v1.2.3$' <<<"${out}"; then
 	ok "management console resolves, downloads and records releases"
 else
@@ -252,8 +252,8 @@ mkdir -p "${REL2}"
 for arch in amd64 arm64; do
 	stage="${TMP}/stage130-${arch}"
 	if build_bins "${arch}" "${stage}" v1.3.0; then
-		tar -C "${stage}" -czf "${REL2}/dohcord-relay_linux_${arch}.tar.gz" \
-			dohcord-relay dohcord-relayd README.md
+		tar -C "${stage}" -czf "${REL2}/pishcord-relay_linux_${arch}.tar.gz" \
+			pishcord-relay pishcord-relayd README.md
 	else
 		bad "linux/${arch} v1.3.0 build failed"
 	fi
@@ -266,8 +266,8 @@ printf '{"tag_name": "v1.3.0"}\n' >"${TMP}/latest130.json"
 
 MGR="${TMP}/mgrflow"
 mkdir -p "${MGR}/etc" "${MGR}/bin" "${MGR}/fakebin"
-cp "${TMP}/stage-amd64/dohcord-relayd" "${MGR}/bin/"
-cp "${TMP}/stage-amd64/dohcord-relay" "${MGR}/bin/"
+cp "${TMP}/stage-amd64/pishcord-relayd" "${MGR}/bin/"
+cp "${TMP}/stage-amd64/pishcord-relay" "${MGR}/bin/"
 cat >"${MGR}/etc/config.env" <<'EOF'
 HTTPS_PROXY_URL=https://relay.example.test:443
 NETWORK_CONFIG_PORT=8443
@@ -295,11 +295,11 @@ chmod +x "${MGR}/fakebin/systemctl" "${MGR}/fakebin/journalctl"
 run_update() { # run_update REACHABLE VERSION -> updates the fixture
 	local reachable="$1" version="$2"
 	PATH="${MGR}/fakebin:${PATH}" \
-		DOHCORD_RELAY_ETC_DIR="${MGR}/etc" \
-		DOHCORD_RELAY_BIN="${MGR}/bin/dohcord-relayd" \
-		DOHCORD_RELAY_CONSOLE_BIN="${MGR}/bin/dohcord-relay" \
-		DOHCORD_RELAY_RELEASE_BASE_URL="file://${TMP}/releases" \
-		DOHCORD_RELAY_LATEST_API="file://${TMP}/latest130.json" \
+		PISHCORD_RELAY_ETC_DIR="${MGR}/etc" \
+		PISHCORD_RELAY_BIN="${MGR}/bin/pishcord-relayd" \
+		PISHCORD_RELAY_CONSOLE_BIN="${MGR}/bin/pishcord-relay" \
+		PISHCORD_RELAY_RELEASE_BASE_URL="file://${TMP}/releases" \
+		PISHCORD_RELAY_LATEST_API="file://${TMP}/latest130.json" \
 		NO_COLOR=1 \
 		bash -c '
 set -Eeuo pipefail
@@ -314,29 +314,29 @@ update_menu <<< "'"${version}"'"; printf "UPDATED\n"
 }
 
 if out="$(run_update 0 v1.3.0 2>&1)" && grep -q '^UPDATED$' <<<"${out}" &&
-	"${MGR}/bin/dohcord-relayd" -version | grep -q ' v1.3.0 ' &&
+	"${MGR}/bin/pishcord-relayd" -version | grep -q ' v1.3.0 ' &&
 	grep -q '^RELEASE_VERSION=v1.3.0$' "${MGR}/etc/install-info"; then
 	ok "updater replaces the executables, records the version and verifies the API"
 else
 	bad "updater success path: ${out}"
 fi
 backup_dir="$(echo "${MGR}"/backups/binaries-*)"
-if [[ -f "${backup_dir}/dohcord-relayd" ]] &&
-	"${backup_dir}/dohcord-relayd" -version | grep -q ' v1.2.3 '; then
+if [[ -f "${backup_dir}/pishcord-relayd" ]] &&
+	"${backup_dir}/pishcord-relayd" -version | grep -q ' v1.2.3 '; then
 	ok "updater backs up the previous executables"
 else
 	bad "updater did not back up the previous executables"
 fi
 
 # A new binary that never answers must be rolled back to the old one.
-cp "${TMP}/stage-amd64/dohcord-relayd" "${MGR}/bin/dohcord-relayd"
-cp "${TMP}/stage-amd64/dohcord-relay" "${MGR}/bin/dohcord-relay"
+cp "${TMP}/stage-amd64/pishcord-relayd" "${MGR}/bin/pishcord-relayd"
+cp "${TMP}/stage-amd64/pishcord-relay" "${MGR}/bin/pishcord-relay"
 sed -i 's/^RELEASE_VERSION=.*/RELEASE_VERSION=v1.2.3/' "${MGR}/etc/install-info"
-before="$(sha256sum "${MGR}/bin/dohcord-relayd" | cut -d' ' -f1)"
+before="$(sha256sum "${MGR}/bin/pishcord-relayd" | cut -d' ' -f1)"
 if run_update 1 v1.3.0 >/dev/null 2>&1; then
 	bad "a release that never answers was accepted"
 else
-	after="$(sha256sum "${MGR}/bin/dohcord-relayd" | cut -d' ' -f1)"
+	after="$(sha256sum "${MGR}/bin/pishcord-relayd" | cut -d' ' -f1)"
 	if [[ "${before}" == "${after}" ]] &&
 		grep -q '^RELEASE_VERSION=v1.2.3$' "${MGR}/etc/install-info"; then
 		ok "a failed restart rolls the executables back"

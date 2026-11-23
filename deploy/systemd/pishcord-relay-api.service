@@ -1,14 +1,14 @@
 [Unit]
-Description=Dohcord Relay network configuration and TURN credential endpoint
-Documentation=https://github.com/Newipe/Dohcord-relay
+Description=Pishcord Relay network configuration and TURN credential endpoint
+Documentation=https://github.com/Newipe/Pishcord-relay
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=dohcord-relay
-Group=dohcord-relay
-ExecStart=/usr/local/bin/dohcord-relayd -config /etc/dohcord-relay/config.env
+User=pishcord-relay
+Group=pishcord-relay
+ExecStart=/usr/local/bin/pishcord-relayd -config /etc/pishcord-relay/config.env
 # Certificate renewal and secret rotation reload in place via SIGHUP.
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure

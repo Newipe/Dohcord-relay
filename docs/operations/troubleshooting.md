@@ -3,7 +3,7 @@
 Start here:
 
 ```bash
-sudo dohcord-relay diagnostics
+sudo pishcord-relay diagnostics
 curl -sS https://relay.example.com:8443/network-config | python3 -m json.tool
 ```
 
@@ -40,7 +40,7 @@ Check, in order:
 ```bash
 curl -I http://relay.example.com/.well-known/acme-challenge/test   # from outside
 sudo ss -Hltnp 'sport = :80'                                        # who listens
-sudo dohcord-relay services status
+sudo pishcord-relay services status
 ```
 
 - Port 80 must be open in the host firewall **and** the cloud security group.
@@ -62,7 +62,7 @@ The existing certificate is never deleted on failure; it keeps being served.
 ### Certificate exists but clients reject it
 
 ```bash
-openssl x509 -in /etc/dohcord-relay/tls/fullchain.pem -noout -subject -issuer -dates
+openssl x509 -in /etc/pishcord-relay/tls/fullchain.pem -noout -subject -issuer -dates
 openssl s_client -connect relay.example.com:443 -servername relay.example.com </dev/null 2>/dev/null | grep -E '^ *[0-9]+ s:'
 ```
 
@@ -77,22 +77,22 @@ openssl s_client -connect relay.example.com:443 -servername relay.example.com </
 |---|---|
 | `CONNECT tunnel failed, response 403` | Denied by policy: the host is not listed, or that port is not allowed for it |
 | `CONNECT tunnel failed, response 503` | The proxy is up but cannot reach the destination (DNS or outbound failure) |
-| `empty reply from server` on the proxy port | Nothing is listening; check `dohcord-relay-squid` |
+| `empty reply from server` on the proxy port | Nothing is listening; check `pishcord-relay-squid` |
 | TLS handshake errors to a random host | Expected: only policy destinations are reachable |
 
 ```bash
-sudo dohcord-relay policy show
-sudo dohcord-relay services status
-sudo tail -f /var/log/dohcord-relay/squid/cache.log
-grep TCP_DENIED /var/log/dohcord-relay/squid/access.log | tail
+sudo pishcord-relay policy show
+sudo pishcord-relay services status
+sudo tail -f /var/log/pishcord-relay/squid/cache.log
+grep TCP_DENIED /var/log/pishcord-relay/squid/access.log | tail
 ```
 
 ### Squid will not start
 
 ```bash
-sudo dohcord-relay policy check          # policy files valid?
-sudo dohcord-relay services validate dohcord-relay-squid.service
-sudo journalctl -u dohcord-relay-squid -n 50 --no-pager
+sudo pishcord-relay policy check          # policy files valid?
+sudo pishcord-relay services validate pishcord-relay-squid.service
+sudo journalctl -u pishcord-relay-squid -n 50 --no-pager
 ```
 
 Almost always a policy or certificate problem:
@@ -106,14 +106,14 @@ Almost always a policy or certificate problem:
 
 Voice connects but nobody hears anyone, or voice does not connect at all:
 
-1. `sudo dohcord-relay services status` — is `dohcord-relay-coturn` running?
+1. `sudo pishcord-relay services status` — is `pishcord-relay-coturn` running?
 2. Open `3478/udp`, `5349/tcp` and `49152-65535/udp` in the host firewall and the
    cloud security group. The relay range is mandatory; TURN cannot fall back.
 3. Check the realm and the secret:
 
    ```bash
-   sudo grep -E '^(realm|listening-port|tls-listening-port|min-port|max-port)' /etc/dohcord-relay/turnserver.conf
-   sudo ls -l /etc/dohcord-relay/turn-secret
+   sudo grep -E '^(realm|listening-port|tls-listening-port|min-port|max-port)' /etc/pishcord-relay/turnserver.conf
+   sudo ls -l /etc/pishcord-relay/turn-secret
    ```
 
 4. `curl -sS https://relay.example.com:8443/network-config | python3 -m json.tool`
@@ -129,8 +129,8 @@ coturn reads differ. They are the same file; re-run the installer to re-render
 
 | Symptom | Cause |
 |---|---|
-| `connection refused` on 8443 | `dohcord-relay-api` is down, or the port is closed |
-| `connection refused` after changing the API port | The Dohcord profile still names the old port; run `sudo dohcord-relay diagnostics` and update the profile to the configured port |
+| `connection refused` on 8443 | `pishcord-relay-api` is down, or the port is closed |
+| `connection refused` after changing the API port | The Dohcord profile still names the old port; run `sudo pishcord-relay diagnostics` and update the profile to the configured port |
 | `502`/`504` from a reverse proxy in front | You have something in front of it; the API expects to be reached directly |
 | `503 destination policy unavailable` | No valid policy/snapshot; run `-policy-check` |
 | `503 turn configuration unavailable` | `turn-secret` missing or shorter than 16 bytes |
@@ -138,8 +138,8 @@ coturn reads differ. They are the same file; re-run the installer to re-render
 | Clients get old data | A caching proxy in front of 8443 — the API itself sends `no-store` |
 
 ```bash
-sudo journalctl -u dohcord-relay-api -n 50 --no-pager
-sudo dohcord-relay services validate dohcord-relay-api.service
+sudo journalctl -u pishcord-relay-api -n 50 --no-pager
+sudo pishcord-relay services validate pishcord-relay-api.service
 ```
 
 ## Updates
@@ -149,18 +149,18 @@ sudo dohcord-relay services validate dohcord-relay-api.service
 | `cannot download …` during install or update | github.com is unreachable, or the tag does not exist; nothing was replaced |
 | `SHA256 verification failed` | The archive does not match the release checksums; the installed binaries were kept |
 | `unsupported architecture` | Releases exist for linux/amd64 and linux/arm64 only |
-| Service does not start after an update | The updater restores the previous executables automatically; check `journalctl -u dohcord-relay-api` |
+| Service does not start after an update | The updater restores the previous executables automatically; check `journalctl -u pishcord-relay-api` |
 
 ```bash
-sudo dohcord-relay update        # latest, or enter a specific vX.Y.Z
-sudo dohcord-relay dashboard     # installed release and service state
+sudo pishcord-relay update        # latest, or enter a specific vX.Y.Z
+sudo pishcord-relay dashboard     # installed release and service state
 ```
 
 ## Firewall
 
 ```bash
-sudo dohcord-relay firewall
-sudo dohcord-relay diagnostics
+sudo pishcord-relay firewall
+sudo pishcord-relay diagnostics
 sudo ufw status numbered
 ```
 
@@ -181,9 +181,9 @@ sudo ufw allow 22/tcp     # adjust if sshd uses another port
 ## systemd
 
 ```bash
-systemctl status dohcord-relay-api dohcord-relay-squid dohcord-relay-coturn
-journalctl -u dohcord-relay-squid -n 100 --no-pager
-systemd-analyze verify dohcord-relay-api.service
+systemctl status pishcord-relay-api pishcord-relay-squid pishcord-relay-coturn
+journalctl -u pishcord-relay-squid -n 100 --no-pager
+systemd-analyze verify pishcord-relay-api.service
 ```
 
 | State | Meaning |
@@ -193,22 +193,22 @@ systemd-analyze verify dohcord-relay-api.service
 | `inactive (dead)` after enable | Not started; `systemctl start` it |
 
 Do not touch the distribution's `squid.service`; the relay runs
-`dohcord-relay-squid.service` with its own configuration.
+`pishcord-relay-squid.service` with its own configuration.
 
 ## Permissions
 
 Symptoms: `permission denied` in logs, services unable to read the key or secret.
 
 ```bash
-sudo ls -l /etc/dohcord-relay /etc/dohcord-relay/tls
+sudo ls -l /etc/pishcord-relay /etc/pishcord-relay/tls
 ```
 
 Expected: `config.env`, `turnserver.conf`, `turn-secret`, `privkey.pem`,
-`squid.pem` are `0640 root:dohcord-relay`; `fullchain.pem` is `0644`;
-`turnserver` is a member of the `dohcord-relay` group.
+`squid.pem` are `0640 root:pishcord-relay`; `fullchain.pem` is `0644`;
+`turnserver` is a member of the `pishcord-relay` group.
 
 ```bash
-sudo dohcord-relay repair
+sudo pishcord-relay repair
 ```
 
 fixes these modes individually after asking.
@@ -216,43 +216,43 @@ fixes these modes individually after asking.
 ## Collecting a report
 
 ```bash
-sudo dohcord-relay dashboard
-sudo dohcord-relay diagnostics
-sudo bash /usr/local/lib/dohcord-relay/verify.sh
-sudo journalctl -u dohcord-relay-api -u dohcord-relay-squid -u dohcord-relay-coturn --since '1 hour ago' --no-pager
+sudo pishcord-relay dashboard
+sudo pishcord-relay diagnostics
+sudo bash /usr/local/lib/pishcord-relay/verify.sh
+sudo journalctl -u pishcord-relay-api -u pishcord-relay-squid -u pishcord-relay-coturn --since '1 hour ago' --no-pager
 ```
 
-Do not paste `/etc/dohcord-relay/turn-secret` or `tls/privkey.pem` into an issue.
+Do not paste `/etc/pishcord-relay/turn-secret` or `tls/privkey.pem` into an issue.
 
 ## Bandwidth limits are not being enforced
 
-`dohcord-relay diagnostics`, `verify.sh` and `dohcord-relay-tc status` all report
+`pishcord-relay diagnostics`, `verify.sh` and `pishcord-relay-tc status` all report
 this explicitly; a configured limit that is not active is a failure, never a
 success.
 
 ```bash
-sudo dohcord-relay-tc status
-sudo systemctl status dohcord-relay-tc.service
-sudo journalctl -u dohcord-relay-tc -n 50 --no-pager
+sudo pishcord-relay-tc status
+sudo systemctl status pishcord-relay-tc.service
+sudo journalctl -u pishcord-relay-tc -n 50 --no-pager
 ```
 
 | Symptom | Cause and fix |
 |---|---|
-| `shaping=inactive`, log says the root qdisc is not managed | The interface already carries an administrator's qdisc (`cake`, `tbf`, a foreign `htb`, …). The relay refuses to overwrite it: remove it, or set `TC_INTERFACE` to an interface whose root qdisc is a kernel default (`mq`, `fq_codel`, `pfifo_fast`), then `sudo dohcord-relay-tc apply` |
-| `egress_qdisc=mq` in `status` | The interface is multiqueue (common on AWS ENA and 10G+ NICs) and its default `mq` root is still in place: the `dohcord-relay-tc` service failed to start. Run `sudo journalctl -u dohcord-relay-tc -n 30` for the reason, fix it, then `sudo systemctl restart dohcord-relay-tc` |
+| `shaping=inactive`, log says the root qdisc is not managed | The interface already carries an administrator's qdisc (`cake`, `tbf`, a foreign `htb`, …). The relay refuses to overwrite it: remove it, or set `TC_INTERFACE` to an interface whose root qdisc is a kernel default (`mq`, `fq_codel`, `pfifo_fast`), then `sudo pishcord-relay-tc apply` |
+| `egress_qdisc=mq` in `status` | The interface is multiqueue (common on AWS ENA and 10G+ NICs) and its default `mq` root is still in place: the `pishcord-relay-tc` service failed to start. Run `sudo journalctl -u pishcord-relay-tc -n 30` for the reason, fix it, then `sudo systemctl restart pishcord-relay-tc` |
 | `tc is not installed` | `sudo apt-get install iproute2` |
-| `no network interface detected` | Set `TC_INTERFACE` in `/etc/dohcord-relay/config.env` (the default route could not be read) |
-| `ingress_qdisc=missing` | Upload shaping needs the `ifb` kernel module: `sudo modprobe ifb`, then restart `dohcord-relay-tc`. The installer loads it and records it in `/etc/modules-load.d/dohcord-relay-ifb.conf`; the service itself cannot autoload modules |
+| `no network interface detected` | Set `TC_INTERFACE` in `/etc/pishcord-relay/config.env` (the default route could not be read) |
+| `ingress_qdisc=missing` | Upload shaping needs the `ifb` kernel module: `sudo modprobe ifb`, then restart `pishcord-relay-tc`. The installer loads it and records it in `/etc/modules-load.d/pishcord-relay-ifb.conf`; the service itself cannot autoload modules |
 | `shaped_addresses=0` | No client has its own class yet; traffic is still limited by the service's fallback class, and the table fills within `TC_REFRESH_SECONDS` (up to 30 s for TURN) |
-| `missing_filter=…` or `missing_fallback_filter=…` | The class exists but the `u32` filter that steers traffic into it does not, so that traffic is unshaped. The kernel refused the filter (often a kernel without `cls_u32`): `sudo journalctl -u dohcord-relay-tc -n 30` then `sudo dohcord-relay-tc apply` |
+| `missing_filter=…` or `missing_fallback_filter=…` | The class exists but the `u32` filter that steers traffic into it does not, so that traffic is unshaped. The kernel refused the filter (often a kernel without `cls_u32`): `sudo journalctl -u pishcord-relay-tc -n 30` then `sudo pishcord-relay-tc apply` |
 | A client is not limited | It may be above `TC_MAX_CLIENTS`; the shaper logs which address was skipped and diagnostics reports it. Raise the limit or reduce concurrent addresses |
 | New connections share one allowance briefly | Expected: an address without its own class uses its service's fallback class (same rate as the per-IP limit) until the next refresh, so several new addresses share one allowance for at most `TC_REFRESH_SECONDS` (5 s by default; up to 30 s for TURN). Lower it for a tighter bound |
-| `dohcord-relay-tc` shows noticeable CPU | A refresh reads one socket table per service, so its cost grows with the number of sockets on the host, not with the number of shaped clients. `ss -s` shows that count; coturn's socket table is read at most every 30 s for the same reason |
-| Rates look different from the configuration | `sudo dohcord-relay-tc apply` re-applies the current `config.env`; `status` prints any `rate_mismatch` |
+| `pishcord-relay-tc` shows noticeable CPU | A refresh reads one socket table per service, so its cost grows with the number of sockets on the host, not with the number of shaped clients. `ss -s` shows that count; coturn's socket table is read at most every 30 s for the same reason |
+| Rates look different from the configuration | `sudo pishcord-relay-tc apply` re-applies the current `config.env`; `status` prints any `rate_mismatch` |
 
 The shaper only ever deletes its own qdisc handles (`1:` on the interface,
 `2:` on the IFB device, the `ffff:` ingress hook and the IFB device itself).
-`dohcord-relay-tc stop` removes them and restores the root qdisc kind that was
+`pishcord-relay-tc stop` removes them and restores the root qdisc kind that was
 there before.
 
 ## Profiles load slowly or are rate limited
@@ -261,13 +261,13 @@ A profile load is one `GET /network-config`; it should take milliseconds.
 
 ```bash
 curl -sS -o /dev/null -w '%{http_code} %{time_total}s
-' "$(sed -n 's/^NETWORK_CONFIG_URL=//p' /etc/dohcord-relay/config.env)"
-sudo journalctl -u dohcord-relay-api --since '-1 hour' | grep -c 'rate limited'
+' "$(sed -n 's/^NETWORK_CONFIG_URL=//p' /etc/pishcord-relay/config.env)"
+sudo journalctl -u pishcord-relay-api --since '-1 hour' | grep -c 'rate limited'
 ```
 
 - `429` with a `Retry-After` header means the burst was genuinely exhausted:
   raise `PER_IP_BURST` (default 30) or `PER_IP_RATE_PER_MINUTE` (default 60) with
-  `sudo dohcord-relay limits` (**Limits & performance**), then reload/restart.
+  `sudo pishcord-relay limits` (**Limits & performance**), then reload/restart.
 - No `429` at all means the limit was never the problem; check the endpoint's
   latency and the API unit's log.
 - A `503` is a configuration problem (policy or TURN secret), not a limit.

@@ -11,7 +11,7 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/dohcord-relay-conn-test.XXXXXX")"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/pishcord-relay-conn-test.XXXXXX")"
 trap 'rm -rf -- "${TMP}"' EXIT
 
 fail=0
@@ -23,7 +23,7 @@ bad() {
 
 # Installer function library: the real script with ETC_DIR pointed at the
 # fixture and the final main call dropped.
-sed -e "s|readonly ETC_DIR=\"/etc/dohcord-relay\"|readonly ETC_DIR=\"${TMP}/etc\"|" \
+sed -e "s|readonly ETC_DIR=\"/etc/pishcord-relay\"|readonly ETC_DIR=\"${TMP}/etc\"|" \
 	-e '$d' "${REPO}/deploy/install.sh" >"${TMP}/install-lib.sh"
 mkdir -p "${TMP}/etc"
 

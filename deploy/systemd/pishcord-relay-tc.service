@@ -1,7 +1,7 @@
 [Unit]
-Description=Dohcord Relay per-client-IP bandwidth shaping (tc)
-Documentation=https://github.com/Newipe/Dohcord-relay
-After=network-online.target dohcord-relay-squid.service dohcord-relay-coturn.service
+Description=Pishcord Relay per-client-IP bandwidth shaping (tc)
+Documentation=https://github.com/Newipe/Pishcord-relay
+After=network-online.target pishcord-relay-squid.service pishcord-relay-coturn.service
 Wants=network-online.target
 
 [Service]
@@ -13,7 +13,7 @@ ExecStart=@TC_SCRIPT@ watch
 ExecStopPost=@TC_SCRIPT@ stop
 Restart=on-failure
 RestartSec=5s
-RuntimeDirectory=dohcord-relay-tc
+RuntimeDirectory=pishcord-relay-tc
 RuntimeDirectoryMode=0700
 
 # tc, ip link and the IFB device need the network admin capability; the shaping
@@ -33,7 +33,7 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 UMask=0077
-ReadWritePaths=/run/dohcord-relay-tc
+ReadWritePaths=/run/pishcord-relay-tc
 
 [Install]
 WantedBy=multi-user.target

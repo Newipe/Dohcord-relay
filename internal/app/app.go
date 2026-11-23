@@ -8,13 +8,13 @@ import (
 	"log"
 	"os"
 
-	"github.com/Newipe/Dohcord-relay/internal/api"
-	"github.com/Newipe/Dohcord-relay/internal/buildinfo"
-	"github.com/Newipe/Dohcord-relay/internal/config"
-	"github.com/Newipe/Dohcord-relay/internal/policy"
+	"github.com/Newipe/Pishcord-relay/internal/api"
+	"github.com/Newipe/Pishcord-relay/internal/buildinfo"
+	"github.com/Newipe/Pishcord-relay/internal/config"
+	"github.com/Newipe/Pishcord-relay/internal/policy"
 )
 
-// Main runs the dohcord-relay command and exits non-zero on failure.
+// Main runs the pishcord-relay command and exits non-zero on failure.
 func Main() {
 	var (
 		configPath     = flag.String("config", config.DefaultPath, "path to the configuration file")
@@ -28,11 +28,11 @@ func Main() {
 	flag.Parse()
 
 	if *printVersion {
-		fmt.Println(buildinfo.String("dohcord-relayd"))
+		fmt.Println(buildinfo.String("pishcord-relayd"))
 		return
 	}
 
-	logger := log.New(os.Stderr, "dohcord-relay: ", log.LstdFlags)
+	logger := log.New(os.Stderr, "pishcord-relay: ", log.LstdFlags)
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {

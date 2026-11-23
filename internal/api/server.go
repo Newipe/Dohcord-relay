@@ -28,10 +28,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Newipe/Dohcord-relay/internal/config"
-	"github.com/Newipe/Dohcord-relay/internal/credentials"
-	"github.com/Newipe/Dohcord-relay/internal/policy"
-	"github.com/Newipe/Dohcord-relay/internal/ratelimit"
+	"github.com/Newipe/Pishcord-relay/internal/config"
+	"github.com/Newipe/Pishcord-relay/internal/credentials"
+	"github.com/Newipe/Pishcord-relay/internal/policy"
+	"github.com/Newipe/Pishcord-relay/internal/ratelimit"
 )
 
 type Server struct {
@@ -250,7 +250,7 @@ func (s *Server) ACMERoutes() http.Handler {
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusNotFound)
-		fmt.Fprintln(w, "dohcord-relay: HTTPS only")
+		fmt.Fprintln(w, "pishcord-relay: HTTPS only")
 	})
 	return mux
 }

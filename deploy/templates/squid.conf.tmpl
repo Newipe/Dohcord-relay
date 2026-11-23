@@ -1,7 +1,7 @@
-# Dohcord-relay - Squid HTTPS CONNECT proxy
+# Pishcord-relay - Squid HTTPS CONNECT proxy
 #
 # Rendered by install.sh. Do not edit by hand: re-run the installer instead.
-# Path on the server: /etc/dohcord-relay/squid.conf
+# Path on the server: /etc/pishcord-relay/squid.conf
 #
 # This is a TLS-enabled FORWARD proxy. Dohcord opens a TLS connection to this
 # port, sends "CONNECT host:port" inside it, and this proxy opens a plain TCP
@@ -78,9 +78,9 @@ htcp_port 0
 # --- Access control --------------------------------------------------------
 # CONNECT is the only method this relay serves. Everything else is denied
 # before any destination lookup happens.
-acl dohcord_connect method CONNECT
+acl pishcord_connect method CONNECT
 http_access deny manager
-http_access deny !dohcord_connect
+http_access deny !pishcord_connect
 
 # Defence in depth: even if a permitted domain resolved to an internal address,
 # Squid refuses to tunnel to loopback, private, link-local, multicast and
@@ -90,16 +90,16 @@ http_access deny !dohcord_connect
 # IPv4-mapped IPv6 (::ffff:0:0/96) is deliberately not listed: Squid folds it into
 # the IPv4 table, where it becomes 0.0.0.0/0 and would deny every destination.
 # Mapped addresses are handled as plain IPv4 and are covered by the v4 ranges.
-acl dohcord_blocked_dst dst \
+acl pishcord_blocked_dst dst \
 	0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
 	172.16.0.0/12 192.0.0.0/24 192.0.2.0/24 192.168.0.0/16 198.18.0.0/15 \
 	198.51.100.0/24 203.0.113.0/24 224.0.0.0/4 240.0.0.0/4 \
 	::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8 \
 	@BLOCKED_IP@
-http_access deny dohcord_connect dohcord_blocked_dst
+http_access deny pishcord_connect pishcord_blocked_dst
 
 # The domain-and-port allowlist. This include is generated from
-# allowed-domains.txt and destination-policy.conf by `dohcord-relay
+# allowed-domains.txt and destination-policy.conf by `pishcord-relay
 # -policy-apply`, which validates the whole configuration before reloading.
 include @ALLOW_FILE@
 

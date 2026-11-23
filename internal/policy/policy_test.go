@@ -134,12 +134,12 @@ func TestSquidACL(t *testing.T) {
 	out := policy.SquidACL()
 
 	for _, want := range []string{
-		"acl dohcord_domain_0 dstdomain .discord.com",
-		"acl dohcord_ports_0 port 443",
-		"http_access allow CONNECT dohcord_domain_0 dohcord_ports_0",
-		"acl dohcord_domain_1 dstdomain .discord.media",
-		"acl dohcord_ports_1 port 443 1024-65535",
-		"http_access allow CONNECT dohcord_domain_1 dohcord_ports_1",
+		"acl pishcord_domain_0 dstdomain .discord.com",
+		"acl pishcord_ports_0 port 443",
+		"http_access allow CONNECT pishcord_domain_0 pishcord_ports_0",
+		"acl pishcord_domain_1 dstdomain .discord.media",
+		"acl pishcord_ports_1 port 443 1024-65535",
+		"http_access allow CONNECT pishcord_domain_1 pishcord_ports_1",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("generated ACL is missing %q\n%s", want, out)
@@ -150,14 +150,14 @@ func TestSquidACL(t *testing.T) {
 		t.Error("generated ACL contains an unconditional allow")
 	}
 	for _, line := range strings.Split(out, "\n") {
-		if strings.HasPrefix(line, "http_access allow") && !strings.Contains(line, "dohcord_domain_") {
+		if strings.HasPrefix(line, "http_access allow") && !strings.Contains(line, "pishcord_domain_") {
 			t.Errorf("unexpected allow rule: %q", line)
 		}
 	}
 	// Every allow rule must constrain both the domain and the port.
 	for _, line := range strings.Split(out, "\n") {
 		if strings.HasPrefix(line, "http_access allow") {
-			if !strings.Contains(line, "dohcord_domain_") || !strings.Contains(line, "dohcord_ports_") {
+			if !strings.Contains(line, "pishcord_domain_") || !strings.Contains(line, "pishcord_ports_") {
 				t.Errorf("allow rule does not constrain domain and port: %q", line)
 			}
 		}

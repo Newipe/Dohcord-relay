@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Dohcord-relay one-line installer.
+# Pishcord-relay one-line installer.
 #
-#   bash <(curl -fsSL https://raw.githubusercontent.com/Newipe/Dohcord-relay/main/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/Newipe/Pishcord-relay/main/install.sh)
 #
 # This is a small bootstrap: it checks the machine, downloads the release
 # archive of this repository over HTTPS into a private temporary directory,
@@ -15,12 +15,12 @@
 # /tmp until the installer itself starts.
 set -Eeuo pipefail
 
-readonly REPO_SLUG="Newipe/Dohcord-relay"
+readonly REPO_SLUG="Newipe/Pishcord-relay"
 readonly DEFAULT_REF="main"
 BOOTSTRAP_VERSION="1.0.0"
 
-REF="${DOHCORD_RELAY_REF:-${DEFAULT_REF}}"
-ARCHIVE_URL="${DOHCORD_RELAY_ARCHIVE_URL:-https://codeload.github.com/${REPO_SLUG}/tar.gz/refs/heads/${REF}}"
+REF="${PISHCORD_RELAY_REF:-${DEFAULT_REF}}"
+ARCHIVE_URL="${PISHCORD_RELAY_ARCHIVE_URL:-https://codeload.github.com/${REPO_SLUG}/tar.gz/refs/heads/${REF}}"
 WORKDIR=""
 
 # --- output -----------------------------------------------------------------
@@ -45,12 +45,12 @@ banner() {
 
 ${C_CYAN}${C_BOLD}  ╭──────────────────────────────────────────────────────╮
   │                                                      │
-  │                   Dohcord-relay                      │
+  │                   Pishcord-relay                      │
   │                   Installation                       │
   │                                                      │
   ╰──────────────────────────────────────────────────────╯${C_RESET}
 
-  Welcome to Dohcord-relay.
+  Welcome to Pishcord-relay.
 
   This sets up a private HTTPS proxy and TURN relay for Dohcord on
   this server. The installer checks the machine first, explains what
@@ -67,7 +67,7 @@ trap cleanup EXIT
 
 usage() {
 	cat <<EOF
-Dohcord-relay bootstrap ${BOOTSTRAP_VERSION}
+Pishcord-relay bootstrap ${BOOTSTRAP_VERSION}
 
 Usage: bash <(curl -fsSL https://raw.githubusercontent.com/${REPO_SLUG}/main/install.sh) [installer options]
 
@@ -103,8 +103,8 @@ The installer downloads precompiled, checksum-verified binaries from GitHub
 Releases; no Go compiler is needed on the server.
 
 Environment (optional):
-  DOHCORD_RELAY_REF           Branch or tag to install (default: main).
-  DOHCORD_RELAY_ARCHIVE_URL   Full archive URL override (mirrors, tests).
+  PISHCORD_RELAY_REF           Branch or tag to install (default: main).
+  PISHCORD_RELAY_ARCHIVE_URL   Full archive URL override (mirrors, tests).
   NO_COLOR                    Disable colour output.
 
 Requirements: Linux with systemd, root via sudo, bash, curl, tar, and outbound
@@ -130,7 +130,7 @@ run_installer() {
 
 	say ""
 	say "  ${C_BOLD}Administrator access${C_RESET}"
-	info "Dohcord-relay installs system services, so the installer needs root."
+	info "Pishcord-relay installs system services, so the installer needs root."
 	info "You will be asked for ${USER}'s password by sudo, and only this"
 	info "downloaded installer is run with those privileges."
 	say ""
@@ -216,12 +216,12 @@ main() {
 	info "kernel $(uname -r), $(uname -m)"
 	info "bash ${BASH_VERSION%%(*}"
 
-	WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/dohcord-relay.XXXXXX")" ||
+	WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/pishcord-relay.XXXXXX")" ||
 		die "cannot create a temporary directory"
 	chmod 0700 "${WORKDIR}"
 
 	say ""
-	say "  ${C_BOLD}Downloading Dohcord-relay${C_RESET}"
+	say "  ${C_BOLD}Downloading Pishcord-relay${C_RESET}"
 	fetch_archive "${WORKDIR}/repo.tar.gz"
 
 	# sed reads the whole listing; `head` would close the pipe early and, with
@@ -236,8 +236,8 @@ main() {
 
 	local repo="${WORKDIR}/src/${top}"
 	[[ -f "${repo}/deploy/install.sh" && -f "${repo}/go.mod" &&
-		-f "${repo}/cmd/dohcord-relay/main.go" && -f "${repo}/cmd/dohcord-relayd/main.go" ]] ||
-		die "the archive does not look like Dohcord-relay (expected deploy/install.sh and the cmd/ entry points); nothing was installed"
+		-f "${repo}/cmd/pishcord-relay/main.go" && -f "${repo}/cmd/pishcord-relayd/main.go" ]] ||
+		die "the archive does not look like Pishcord-relay (expected deploy/install.sh and the cmd/ entry points); nothing was installed"
 	ok "archive looks complete"
 	# The installer runs as root in a moment; it only needs to read this tree.
 	chmod -R a+rX "${WORKDIR}/src"

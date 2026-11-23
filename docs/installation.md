@@ -20,11 +20,11 @@ Normal installations use precompiled binaries published on GitHub Releases.
 
 | Asset | Architecture |
 |---|---|
-| `dohcord-relay_linux_amd64.tar.gz` | Linux x86-64 (`x86_64`, `amd64`) |
-| `dohcord-relay_linux_arm64.tar.gz` | Linux ARM64 (`aarch64`, `arm64`) |
+| `pishcord-relay_linux_amd64.tar.gz` | Linux x86-64 (`x86_64`, `amd64`) |
+| `pishcord-relay_linux_arm64.tar.gz` | Linux ARM64 (`aarch64`, `arm64`) |
 | `checksums.txt` | SHA256 for every archive |
 
-Each archive contains `dohcord-relay` (management console), `dohcord-relayd`
+Each archive contains `pishcord-relay` (management console), `pishcord-relayd`
 (daemon) and `README.md`. The installer maps `uname -m` to one of these assets,
 downloads the archive and `checksums.txt` from the selected release, verifies the
 SHA256 before extracting anything, and stops with an error on any unsupported
@@ -53,15 +53,15 @@ install a specific one.
 ## One-line install
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Newipe/Dohcord-relay/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Newipe/Pishcord-relay/main/install.sh)
 ```
 
 What the bootstrap does, in order:
 
 1. prints the banner and the machine it detected;
-2. downloads `https://codeload.github.com/Newipe/Dohcord-relay/tar.gz/refs/heads/main`
+2. downloads `https://codeload.github.com/Newipe/Pishcord-relay/tar.gz/refs/heads/main`
    into a `0700` temporary directory, refusing empty or non-gzip responses;
-3. checks the extracted tree for `deploy/install.sh`, `go.mod`, `cmd/dohcord-relay/main.go` and `cmd/dohcord-relayd/main.go`;
+3. checks the extracted tree for `deploy/install.sh`, `go.mod`, `cmd/pishcord-relay/main.go` and `cmd/pishcord-relayd/main.go`;
 4. re-runs the installer with `sudo` when you are not root — always as an
    explicit file on disk, never through the process-substitution descriptor;
 5. removes the temporary directory afterwards.
@@ -72,8 +72,8 @@ never piped into a shell.
 ### From a checkout
 
 ```bash
-git clone https://github.com/Newipe/Dohcord-relay
-cd Dohcord-relay
+git clone https://github.com/Newipe/Pishcord-relay
+cd Pishcord-relay
 sudo bash deploy/install.sh
 ```
 
@@ -90,7 +90,7 @@ downloading anything, so local changes are what gets installed.
 | `--email ADDRESS` | Optional Let's Encrypt contact address. |
 | `--staging` | Use the staging CA for a throwaway test install. |
 | `--yes` | Do not ask for confirmation (still needs `--mode`). |
-| `--realm NAME` | TURN realm (default: the domain, or `dohcord.relay`). |
+| `--realm NAME` | TURN realm (default: the domain, or `pishcord.relay`). |
 | `--distro-coturn` | Use the distribution's coturn instead of the pinned upstream build. |
 | `--coturn-version V` | Upstream coturn release to build (default `4.18.0`, SHA-256 checked). |
 | `--user-quota N` | Allocations per credential (default 12). |
@@ -112,7 +112,7 @@ downloading anything, so local changes are what gets installed.
 Non-interactive install, fully specified:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Newipe/Dohcord-relay/main/install.sh) \
+bash <(curl -fsSL https://raw.githubusercontent.com/Newipe/Pishcord-relay/main/install.sh) \
   --mode domain --domain relay.example.com --email you@example.com \
   --api-port 8443 --version v1.1.0 --yes
 ```
@@ -124,7 +124,7 @@ the current value as the default, and `--yes` or a non-interactive run keeps the
 configured port without asking.
 
 Omitting `--max-connections` uses `100` on a fresh install and keeps the limit
-recorded in `/etc/dohcord-relay/squid.conf` when re-running. Interactive
+recorded in `/etc/pishcord-relay/squid.conf` when re-running. Interactive
 installs always ask for it too, with the current value as the default, so the
 per-client connection ceiling can be changed without editing the template.
 
@@ -160,13 +160,13 @@ defaults.
 
 | Step | Effect |
 |---|---|
-| Packages | Installs Squid (the OpenSSL build, required so the proxy sends the full certificate chain), coturn, a private certbot ≥ 5.4 in `/opt/dohcord-relay-certbot`, base tools |
-| Users | Creates `dohcord-relay` and `turnserver` system users |
-| Binaries | Downloads the release archive for this architecture, verifies it against `checksums.txt`, and installs `/usr/local/bin/dohcord-relayd` (server) and `/usr/local/bin/dohcord-relay` (management console); no compiler is installed |
-| Files | Writes `/etc/dohcord-relay/*`, the `dohcord-relay-manager` alias, `/usr/local/bin/dohcord-relay-tls-deploy`, `/usr/local/lib/dohcord-relay/*` |
-| Units | Installs and enables `dohcord-relay-api`, `dohcord-relay-squid`, `dohcord-relay-coturn`, `dohcord-relay-tc` (bandwidth shaping) and the renewal timer every 6 h |
+| Packages | Installs Squid (the OpenSSL build, required so the proxy sends the full certificate chain), coturn, a private certbot ≥ 5.4 in `/opt/pishcord-relay-certbot`, base tools |
+| Users | Creates `pishcord-relay` and `turnserver` system users |
+| Binaries | Downloads the release archive for this architecture, verifies it against `checksums.txt`, and installs `/usr/local/bin/pishcord-relayd` (server) and `/usr/local/bin/pishcord-relay` (management console); no compiler is installed |
+| Files | Writes `/etc/pishcord-relay/*`, the `pishcord-relay-manager` alias, `/usr/local/bin/pishcord-relay-tls-deploy`, `/usr/local/lib/pishcord-relay/*` |
+| Units | Installs and enables `pishcord-relay-api`, `pishcord-relay-squid`, `pishcord-relay-coturn`, `pishcord-relay-tc` (bandwidth shaping) and the renewal timer every 6 h |
 | Firewall | Opens the relay ports in `ufw` or `firewalld` if one is active, including the selected API port; removes an obsolete API port rule from a previous run, never resets unrelated rules, and warns if SSH is not allowed |
-| Certificates | Requests one certificate for the domain or address, installs it into `/etc/dohcord-relay/tls` through a deploy hook |
+| Certificates | Requests one certificate for the domain or address, installs it into `/etc/pishcord-relay/tls` through a deploy hook |
 | Policy | Validates the bundled destination policy and generates the Squid ACLs |
 
 It does **not**: change SSH configuration, replace your web server, stop
@@ -190,11 +190,11 @@ The installer is safe to repeat:
 ## After installation
 
 ```bash
-sudo dohcord-relay          # management console
+sudo pishcord-relay          # management console
 curl -sS https://relay.example.com:8443/network-config | python3 -m json.tool
 ```
 
-To upgrade later, run `sudo dohcord-relay update` (or the one-line installer); the
+To upgrade later, run `sudo pishcord-relay update` (or the one-line installer); the
 updater downloads and verifies the new release and rolls back the executables if
 the service does not start. Configuration, certificates and policy are untouched.
 

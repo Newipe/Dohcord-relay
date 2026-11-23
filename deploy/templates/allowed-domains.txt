@@ -1,6 +1,6 @@
-# Dohcord-relay - domains the HTTPS CONNECT proxy may reach
+# Pishcord-relay - domains the HTTPS CONNECT proxy may reach
 #
-# Path on the server: /etc/dohcord-relay/allowed-domains.txt
+# Path on the server: /etc/pishcord-relay/allowed-domains.txt
 #
 # One domain per line. '#' starts a comment. A domain here allows that domain
 # AND its subdomains: "discord.com" covers "gateway.discord.com" and
@@ -11,7 +11,7 @@
 # have a port policy in destination-policy.conf, and the proxy allows only
 # those ports. After editing either file run:
 #
-#   sudo dohcord-relay -policy-apply -config /etc/dohcord-relay/config.env
+#   sudo pishcord-relay -policy-apply -config /etc/pishcord-relay/config.env
 #
 # which validates both files, checks the whole Squid configuration and only
 # then reloads Squid. Domains must be plain host names: no scheme, no port, no

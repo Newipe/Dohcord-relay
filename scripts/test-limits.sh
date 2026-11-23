@@ -12,7 +12,7 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/dohcord-relay-limits-test.XXXXXX")"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/pishcord-relay-limits-test.XXXXXX")"
 trap 'rm -rf -- "${TMP}"' EXIT
 
 fail=0
@@ -24,7 +24,7 @@ bad() {
 skip() { printf 'SKIP  %s\n' "$*"; }
 
 # --- installer harness --------------------------------------------------------
-sed -e "s|readonly ETC_DIR=\"/etc/dohcord-relay\"|readonly ETC_DIR=\"${TMP}/etc\"|" \
+sed -e "s|readonly ETC_DIR=\"/etc/pishcord-relay\"|readonly ETC_DIR=\"${TMP}/etc\"|" \
 	-e '$d' "${REPO}/deploy/install.sh" >"${TMP}/install-lib.sh"
 mkdir -p "${TMP}/etc"
 
@@ -211,7 +211,7 @@ else
 fi
 
 # --- 8. traffic shaping: the generated rules --------------------------------
-TC="${REPO}/deploy/scripts/dohcord-relay-tc"
+TC="${REPO}/deploy/scripts/pishcord-relay-tc"
 cat >"${TMP}/tc.env" <<'EOF'
 HTTPS_PROXY_URL=https://relay.example.test:443
 PROXY_UPLOAD_LIMIT_MBIT=8
@@ -223,15 +223,15 @@ TC_IDLE_SECONDS=60
 TC_REFRESH_SECONDS=5
 EOF
 tc_render() { # [clients] [config]
-	DOHCORD_RELAY_TC_STATE="${TMP}/tcstate" \
-		DOHCORD_RELAY_TC_FAKE_CLIENTS="${1:-203.0.113.5}" \
+	PISHCORD_RELAY_TC_STATE="${TMP}/tcstate" \
+		PISHCORD_RELAY_TC_FAKE_CLIENTS="${1:-203.0.113.5}" \
 		bash "${TC}" apply --dry-run --interface eth0 --config "${2:-${TMP}/tc.env}" 2>&1
 }
 
 out="$(tc_render)"
 if grep -q 'tc qdisc replace dev eth0 root handle 1: htb default 999' <<<"${out}" &&
-	grep -q 'ip link add dohcord-ifb type ifb' <<<"${out}" &&
-	grep -q 'tc qdisc replace dev dohcord-ifb root handle 2: htb default 999' <<<"${out}"; then
+	grep -q 'ip link add pishcord-ifb type ifb' <<<"${out}" &&
+	grep -q 'tc qdisc replace dev pishcord-ifb root handle 2: htb default 999' <<<"${out}"; then
 	ok "shaping builds an HTB tree for download and an IFB tree for upload"
 else
 	bad "shaping roots: ${out}"
@@ -285,7 +285,7 @@ else
 fi
 
 if grep -q 'filter add dev eth0 parent 1: protocol ip prio 1 u32 match ip dst 203.0.113.5/32 match ip sport 443 0xffff flowid 1:' <<<"${out}" &&
-	grep -q 'filter add dev dohcord-ifb parent 2: protocol ip prio 1 u32 match ip src 203.0.113.5/32 match ip dport 443 0xffff flowid 2:' <<<"${out}"; then
+	grep -q 'filter add dev pishcord-ifb parent 2: protocol ip prio 1 u32 match ip src 203.0.113.5/32 match ip dport 443 0xffff flowid 2:' <<<"${out}"; then
 	ok "proxy download and upload are classified by the client address and port 443"
 else
 	bad "proxy filters: ${out}"
@@ -300,8 +300,8 @@ else
 	bad "turn filters: ${out}"
 fi
 
-if grep -q 'filter add dev eth0 parent ffff:.*mirror\|filter add dev eth0 parent ffff:.*redirect dev dohcord-ifb' <<<"${out}" &&
-	grep -q 'match ip dport 3478 0xffff action mirred egress redirect dev dohcord-ifb' <<<"${out}" &&
+if grep -q 'filter add dev eth0 parent ffff:.*mirror\|filter add dev eth0 parent ffff:.*redirect dev pishcord-ifb' <<<"${out}" &&
+	grep -q 'match ip dport 3478 0xffff action mirred egress redirect dev pishcord-ifb' <<<"${out}" &&
 	! grep -q 'match ip dport 22 ' <<<"${out}"; then
 	ok "only relay traffic is mirrored for upload shaping; unrelated traffic is untouched"
 else
@@ -352,7 +352,7 @@ chmod +x "${TMP}/faketc/tc"
 
 fake_apply() { # qdisc state-dir
 	PATH="${TMP}/faketc:${PATH}" FAKE_ROOT_QDISC="$1" \
-		DOHCORD_RELAY_TC_STATE="$2" \
+		PISHCORD_RELAY_TC_STATE="$2" \
 		bash "${TC}" apply --dry-run --interface eth0 --config "${TMP}/tc.env" 2>&1
 }
 
@@ -372,7 +372,7 @@ fi
 
 mkdir -p "${TMP}/tcstate-stop"
 printf 'mq\n' >"${TMP}/tcstate-stop/previous-root"
-if out="$(DOHCORD_RELAY_TC_STATE="${TMP}/tcstate-stop" \
+if out="$(PISHCORD_RELAY_TC_STATE="${TMP}/tcstate-stop" \
 	bash "${TC}" stop --dry-run --interface eth0 --config "${TMP}/tc.env" 2>&1)" &&
 	grep -q 'tc qdisc replace dev eth0 root mq' <<<"${out}"; then
 	ok "stopping restores the mq root qdisc that was there before"
@@ -405,7 +405,7 @@ EOF
 chmod +x "${TMP}/fakess/ss"
 : >"${TMP}/ss.log"
 out="$(PATH="${TMP}/fakess:${PATH}" FAKE_SS_LOG="${TMP}/ss.log" \
-	DOHCORD_RELAY_TC_STATE="${TMP}/tcstate-scan" \
+	PISHCORD_RELAY_TC_STATE="${TMP}/tcstate-scan" \
 	bash "${TC}" refresh --dry-run --interface eth0 --config "${TMP}/tc.env" 2>&1)"
 scans="$(wc -l <"${TMP}/ss.log")"
 if [[ "${scans}" == "2" ]]; then
@@ -443,7 +443,7 @@ done
 # A stale class (last seen a minute ago) must be removed on the next refresh.
 mkdir -p "${TMP}/state-stale"
 printf 'download proxy 5 198.51.100.9 1\n' >"${TMP}/state-stale/classes"
-out="$(DOHCORD_RELAY_TC_STATE="${TMP}/state-stale" DOHCORD_RELAY_TC_FAKE_CLIENTS=203.0.113.5 \
+out="$(PISHCORD_RELAY_TC_STATE="${TMP}/state-stale" PISHCORD_RELAY_TC_FAKE_CLIENTS=203.0.113.5 \
 	bash "${TC}" apply --dry-run --interface eth0 --config "${TMP}/tc.env" 2>&1)"
 if grep -q 'tc class del dev eth0 classid 1:5' <<<"${out}"; then
 	ok "an address with no traffic is removed from the shaper"
@@ -453,7 +453,7 @@ fi
 
 # A capped table refuses to track more addresses than TC_MAX_CLIENTS.
 sed -e 's/^TC_MAX_CLIENTS=.*/TC_MAX_CLIENTS=2/' "${TMP}/tc.env" >"${TMP}/tc-max.env"
-out="$(DOHCORD_RELAY_TC_STATE="${TMP}/state-max" DOHCORD_RELAY_TC_FAKE_CLIENTS='203.0.113.1,203.0.113.2,203.0.113.3' \
+out="$(PISHCORD_RELAY_TC_STATE="${TMP}/state-max" PISHCORD_RELAY_TC_FAKE_CLIENTS='203.0.113.1,203.0.113.2,203.0.113.3' \
 	bash "${TC}" apply --dry-run --interface eth0 --config "${TMP}/tc-max.env" 2>&1)"
 if grep -q '203.0.113.3 is not limited' <<<"${out}"; then
 	ok "the class table is bounded: extra addresses are reported as not limited"
@@ -488,7 +488,7 @@ sed -e 's/^PROXY_UPLOAD_LIMIT_MBIT=.*/PROXY_UPLOAD_LIMIT_MBIT=0/' \
 	-e 's/^TURN_UPLOAD_LIMIT_MBIT=.*/TURN_UPLOAD_LIMIT_MBIT=0/' \
 	-e 's/^TURN_DOWNLOAD_LIMIT_MBIT=.*/TURN_DOWNLOAD_LIMIT_MBIT=0/' "${TMP}/tc.env" >"${TMP}/tc-download-only.env"
 out="$(tc_render 203.0.113.5 "${TMP}/tc-download-only.env")"
-if ! grep -q 'dohcord-ifb\|parent ffff:' <<<"${out}" &&
+if ! grep -q 'pishcord-ifb\|parent ffff:' <<<"${out}" &&
 	grep -q 'classid 1:2040 htb rate 8mbit' <<<"${out}" &&
 	grep -q 'flowid 1:2040' <<<"${out}"; then
 	ok "download-only limits add no IFB device and still install the fallback class"
@@ -516,7 +516,7 @@ chmod +x "${TMP}/faketc-fail/tc"
 if command -v unshare >/dev/null 2>&1 && unshare -Ur true 2>/dev/null; then
 	rc=0
 	out="$(unshare -Ur env PATH="${TMP}/faketc-fail:${PATH}" \
-		DOHCORD_RELAY_TC_STATE="${TMP}/tcstate-fail" \
+		PISHCORD_RELAY_TC_STATE="${TMP}/tcstate-fail" \
 		bash "${TC}" apply --interface eth0 --config "${TMP}/tc-download-only.env" 2>&1)" || rc=$?
 	if ((rc != 0)) && grep -q 'tc filter add .* failed' <<<"${out}" &&
 		! grep -q 'bandwidth limits are installed' <<<"${out}"; then
@@ -548,14 +548,14 @@ for a in "$@"; do
 done
 case "${1:-} ${2:-}" in
 "qdisc show")
-	if [[ "${dev}" == "dohcord-ifb" ]]; then
+	if [[ "${dev}" == "pishcord-ifb" ]]; then
 		printf 'qdisc htb 2: root refcnt 2 r2q 10 default 999 direct_packets_stat 0\n'
 	else
 		printf 'qdisc htb 1: root refcnt 2 r2q 10 default 999 direct_packets_stat 0\n'
 	fi
 	;;
 "class show")
-	if [[ "${dev}" == "dohcord-ifb" ]]; then
+	if [[ "${dev}" == "pishcord-ifb" ]]; then
 		cat <<'CL'
 class htb 2:999 root prio 0 rate 10Gbit ceil 10Gbit burst 1680b cburst 1680b
 class htb 2:2040 root prio 0 rate 8Mbit ceil 8Mbit burst 50000b cburst 50000b
@@ -579,7 +579,7 @@ CL
 		printf 'filter parent 2: protocol ip pref 1 u32 fh 800::800 order 2048 key ht 800 bkt 0 flowid 2:7\n'
 		printf 'filter parent 2: protocol ip pref 2 u32 fh 801::800 order 2048 key ht 801 bkt 0 flowid 2:2040\n'
 		printf 'filter parent 2: protocol ip pref 2 u32 fh 802::800 order 2048 key ht 802 bkt 0 flowid 2:2041\n'
-		printf 'filter parent ffff: protocol ip pref 1 u32 ht 800: action order 1: mirred (Egress Redirect to device dohcord-ifb) stolen\n'
+		printf 'filter parent ffff: protocol ip pref 1 u32 ht 800: action order 1: mirred (Egress Redirect to device pishcord-ifb) stolen\n'
 	fi
 	;;
 esac
@@ -591,7 +591,7 @@ printf 'download proxy 7 203.0.113.5 %s\nupload proxy 7 203.0.113.5 %s\n' \
 
 status_render() { # filters-present(yes|no)
 	PATH="${TMP}/faketc-status:${TMP}/fakeip:${PATH}" FAKE_FILTERS="$1" \
-		DOHCORD_RELAY_TC_STATE="${TMP}/tcstate-status" \
+		PISHCORD_RELAY_TC_STATE="${TMP}/tcstate-status" \
 		bash "${TC}" status --interface eth0 --config "${TMP}/tc.env" 2>&1
 }
 
@@ -608,7 +608,7 @@ fi
 rc=0
 out="$(status_render yes)" || rc=$?
 if ((rc == 0)) && grep -q '^shaping=active' <<<"${out}" &&
-	grep -q '^ingress_redirect=dohcord-ifb' <<<"${out}"; then
+	grep -q '^ingress_redirect=pishcord-ifb' <<<"${out}"; then
 	ok "status reports shaping as active only when the classes and their filters are both installed"
 else
 	bad "active tree: rc=${rc} ${out}"
@@ -616,7 +616,7 @@ fi
 
 # --- 12. manager console: limits validation ----------------------------------
 sed -e "s|^ETC_DIR=.*|ETC_DIR=\"${TMP}/mgr\"|" -e '$d' \
-	"${REPO}/deploy/scripts/dohcord-relay-manager.sh" >"${TMP}/manager-lib.sh"
+	"${REPO}/deploy/scripts/pishcord-relay-manager.sh" >"${TMP}/manager-lib.sh"
 mkdir -p "${TMP}/mgr"
 cat >"${TMP}/mgr/config.env" <<'EOF'
 PROXY_UPLOAD_LIMIT_MBIT=8
@@ -673,7 +673,7 @@ fi
 # Regression: the helper once parsed coturn's ports as 10#min/10#max, which bash
 # rejects as an invalid number, so apply exited before shaping anything.
 printf 'min-port=50000\nmax-port=50100\nlistening-port=3478\ntls-listening-port=5349\n' >"${TMP}/turnserver.conf"
-out="$(DOHCORD_RELAY_TURN_CONF="${TMP}/turnserver.conf" DOHCORD_RELAY_TC_STATE="${TMP}/tcstate2" \
+out="$(PISHCORD_RELAY_TURN_CONF="${TMP}/turnserver.conf" PISHCORD_RELAY_TC_STATE="${TMP}/tcstate2" \
 	bash "${TC}" status --config "${TMP}/tc.env" 2>&1)" || true
 if grep -q 'value too great' <<<"${out}"; then
 	bad "reading coturn's ports produced an arithmetic error: ${out}"
@@ -682,7 +682,7 @@ elif grep -q 'shaping=' <<<"${out}"; then
 else
 	bad "status with a coturn configuration: ${out}"
 fi
-if DOHCORD_RELAY_TURN_CONF="${TMP}/turnserver.conf" DOHCORD_RELAY_TC_STATE="${TMP}/tcstate2" \
+if PISHCORD_RELAY_TURN_CONF="${TMP}/turnserver.conf" PISHCORD_RELAY_TC_STATE="${TMP}/tcstate2" \
 	bash "${TC}" apply --dry-run --interface eth0 --config "${TMP}/tc.env" >/dev/null 2>&1; then
 	ok "applying the limits succeeds with a coturn configuration present"
 else

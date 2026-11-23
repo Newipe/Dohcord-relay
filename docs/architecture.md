@@ -6,8 +6,8 @@ runtime; everything in `deploy/` is either executed by the installer or copied t
 the server.
 
 ```text
-cmd/dohcord-relay/          the management console's entry point (runs manager.sh)
-cmd/dohcord-relayd/         the background server's entry point (flags, startup)
+cmd/pishcord-relay/          the management console's entry point (runs manager.sh)
+cmd/pishcord-relayd/         the background server's entry point (flags, startup)
 internal/app/               startup wiring and the one-shot maintenance commands
 internal/buildinfo/         version, commit and build date injected with -ldflags
 internal/api/               HTTP endpoints, request limits, secret and certificate reloading
@@ -27,15 +27,15 @@ scripts/test-release.sh     release packaging, installer and updater tests
 
 ## The service
 
-The two commands have separate jobs. `cmd/dohcord-relayd` is the background
+The two commands have separate jobs. `cmd/pishcord-relayd` is the background
 server: it calls `app.Main`, which parses the flags, loads `config.env`,
 dispatches the maintenance modes (`-policy-check`, `-policy-apply`,
 `-print-config`, `-acme-only`) and otherwise starts the API.
 
-`cmd/dohcord-relay` is the management console users run. It locates and runs the
-console application installed as `/usr/local/lib/dohcord-relay/manager.sh`
-(`deploy/scripts/dohcord-relay-manager.sh` in a checkout) and forwards its
-arguments and exit status. `/usr/local/bin/dohcord-relay-manager` is a symlink to
+`cmd/pishcord-relay` is the management console users run. It locates and runs the
+console application installed as `/usr/local/lib/pishcord-relay/manager.sh`
+(`deploy/scripts/pishcord-relay-manager.sh` in a checkout) and forwards its
+arguments and exit status. `/usr/local/bin/pishcord-relay-manager` is a symlink to
 it, kept for compatibility with the previous command name.
 
 `internal/api` owns the two public endpoints and the ACME responder. It holds no
@@ -54,18 +54,18 @@ rules, and writes the state file that records what Squid is enforcing.
 | Path | Installed as |
 |---|---|
 | `deploy/systemd/*.service`, `*.timer` | `/etc/systemd/system/` |
-| `deploy/templates/config.env.tmpl` | `/etc/dohcord-relay/config.env` (rendered) |
-| `deploy/templates/squid.conf.tmpl` | `/etc/dohcord-relay/squid.conf` (rendered) |
-| `deploy/templates/turnserver.conf.tmpl` | `/etc/dohcord-relay/turnserver.conf` (rendered) |
-| `deploy/templates/allowed-domains.txt` | `/etc/dohcord-relay/allowed-domains.txt` (first install only) |
-| `deploy/templates/destination-policy.conf` | `/etc/dohcord-relay/destination-policy.conf` (first install only) |
-| `deploy/scripts/dohcord-relay-manager.sh` | `/usr/local/lib/dohcord-relay/manager.sh` (run by `dohcord-relay`) |
-| `cmd/dohcord-relayd` (built) | `/usr/local/bin/dohcord-relayd` |
-| `cmd/dohcord-relay` (built) | `/usr/local/bin/dohcord-relay`, with `/usr/local/bin/dohcord-relay-manager` as a symlink |
-| `deploy/scripts/verify.sh` | `/usr/local/lib/dohcord-relay/verify.sh` |
-| `deploy/scripts/dohcord-relay-tls-deploy` | `/usr/local/bin/dohcord-relay-tls-deploy` |
-| `uninstall.sh` | `/usr/local/lib/dohcord-relay/uninstall.sh` |
-| `install.sh` | `/usr/local/lib/dohcord-relay/bootstrap.sh` |
+| `deploy/templates/config.env.tmpl` | `/etc/pishcord-relay/config.env` (rendered) |
+| `deploy/templates/squid.conf.tmpl` | `/etc/pishcord-relay/squid.conf` (rendered) |
+| `deploy/templates/turnserver.conf.tmpl` | `/etc/pishcord-relay/turnserver.conf` (rendered) |
+| `deploy/templates/allowed-domains.txt` | `/etc/pishcord-relay/allowed-domains.txt` (first install only) |
+| `deploy/templates/destination-policy.conf` | `/etc/pishcord-relay/destination-policy.conf` (first install only) |
+| `deploy/scripts/pishcord-relay-manager.sh` | `/usr/local/lib/pishcord-relay/manager.sh` (run by `pishcord-relay`) |
+| `cmd/pishcord-relayd` (built) | `/usr/local/bin/pishcord-relayd` |
+| `cmd/pishcord-relay` (built) | `/usr/local/bin/pishcord-relay`, with `/usr/local/bin/pishcord-relay-manager` as a symlink |
+| `deploy/scripts/verify.sh` | `/usr/local/lib/pishcord-relay/verify.sh` |
+| `deploy/scripts/pishcord-relay-tls-deploy` | `/usr/local/bin/pishcord-relay-tls-deploy` |
+| `uninstall.sh` | `/usr/local/lib/pishcord-relay/uninstall.sh` |
+| `install.sh` | `/usr/local/lib/pishcord-relay/bootstrap.sh` |
 
 The root `install.sh` URL is part of the documented one-line install and is kept
 stable: it downloads the repository archive, checks the tree, and runs
@@ -97,7 +97,7 @@ client IP --(relay ports)--> ingress mirror --> IFB --> HTB (upload)
                                                        one class per client IP and service
 ```
 
-`dohcord-relay-tc` (a small systemd service, no packet-path component) refreshes
+`pishcord-relay-tc` (a small systemd service, no packet-path component) refreshes
 the class table from live connections and is the only thing that touches
 traffic-control state. The refresh is built to stay cheap under load: one socket
 scan per service (shared by both directions), parsing in `awk` rather than a

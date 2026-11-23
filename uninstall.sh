@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Dohcord-relay uninstaller.
+# Pishcord-relay uninstaller.
 #
 # Removes the services, units, binaries and runtime files this project installs.
 # Your configuration, domain policy and TLS certificates are kept unless you ask
@@ -11,31 +11,31 @@
 #   sudo bash uninstall.sh --yes        # no interactive confirmation
 set -Eeuo pipefail
 
-ETC_DIR="/etc/dohcord-relay"
-LOG_DIR="/var/log/dohcord-relay"
-WEBROOT="/var/www/dohcord-relay"
-LIB_DIR="/usr/local/lib/dohcord-relay"
-DAEMON="/usr/local/bin/dohcord-relayd"
-CLI="/usr/local/bin/dohcord-relay"
-MANAGER="/usr/local/bin/dohcord-relay-manager"
-HOOK="/usr/local/bin/dohcord-relay-tls-deploy"
-CERT_NAME="dohcord-relay"
-CERTBOT="/opt/dohcord-relay-certbot/bin/certbot"
+ETC_DIR="/etc/pishcord-relay"
+LOG_DIR="/var/log/pishcord-relay"
+WEBROOT="/var/www/pishcord-relay"
+LIB_DIR="/usr/local/lib/pishcord-relay"
+DAEMON="/usr/local/bin/pishcord-relayd"
+CLI="/usr/local/bin/pishcord-relay"
+MANAGER="/usr/local/bin/pishcord-relay-manager"
+HOOK="/usr/local/bin/pishcord-relay-tls-deploy"
+CERT_NAME="pishcord-relay"
+CERTBOT="/opt/pishcord-relay-certbot/bin/certbot"
 
 UNIT_DIR="/etc/systemd/system"
 UNITS=(
-	dohcord-relay-api.service
-	dohcord-relay-squid.service
-	dohcord-relay-coturn.service
-	dohcord-relay-tc.service
-	dohcord-relay-certbot-renew.timer
-	dohcord-relay-certbot-renew.service
-	dohcord-relay-credentials.service
+	pishcord-relay-api.service
+	pishcord-relay-squid.service
+	pishcord-relay-coturn.service
+	pishcord-relay-tc.service
+	pishcord-relay-certbot-renew.timer
+	pishcord-relay-certbot-renew.service
+	pishcord-relay-credentials.service
 )
 RUN_DIRS=(
-	/run/dohcord-relay-squid
-	/run/dohcord-relay-coturn
-	/run/dohcord-relay-tc
+	/run/pishcord-relay-squid
+	/run/pishcord-relay-coturn
+	/run/pishcord-relay-tc
 )
 
 PURGE=0
@@ -59,7 +59,7 @@ die() {
 
 usage() {
 	cat <<EOF
-Dohcord-relay uninstaller
+Pishcord-relay uninstaller
 
 Usage: sudo bash uninstall.sh [options]
 
@@ -94,11 +94,11 @@ done
 banner=$(
 	cat <<EOF
 
-${C_CYAN}${C_BOLD}  ── Dohcord-relay uninstall ──${C_RESET}
+${C_CYAN}${C_BOLD}  ── Pishcord-relay uninstall ──${C_RESET}
 
   This will remove:
 
-    · the services ${C_BOLD}dohcord-relay-api${C_RESET}, ${C_BOLD}dohcord-relay-squid${C_RESET}, ${C_BOLD}dohcord-relay-coturn${C_RESET} and ${C_BOLD}dohcord-relay-tc${C_RESET}
+    · the services ${C_BOLD}pishcord-relay-api${C_RESET}, ${C_BOLD}pishcord-relay-squid${C_RESET}, ${C_BOLD}pishcord-relay-coturn${C_RESET} and ${C_BOLD}pishcord-relay-tc${C_RESET}
     · their systemd units and the certificate renewal timer
     · ${DAEMON} and ${CLI}
     · ${MANAGER} (compatibility alias)
@@ -114,7 +114,7 @@ if [[ ${PURGE_CERT} -eq 1 ]]; then
 	banner+=$'\n'"    · the Let's Encrypt certificate \"${CERT_NAME}\" and its account lineage"
 fi
 banner+=$'\n\n'"  Kept: the squid and coturn packages, firewall rules, and the"
-banner+=$'\n'"  system user dohcord-relay (removed only with --purge)."
+banner+=$'\n'"  system user pishcord-relay (removed only with --purge)."
 if [[ ${PURGE} -eq 0 ]]; then
 	banner+=$'\n\n'"  ${C_YELLOW}Your configuration, policy and certificates are kept.${C_RESET} A re-install"
 	banner+=$'\n'"  reuses them, so the relay comes back with the same identity."
@@ -150,7 +150,7 @@ for unit in "${UNITS[@]}"; do
 		ok "removed ${UNIT_DIR}/${unit}"
 	fi
 done
-[[ ${removed_unit} -eq 1 ]] || info "no Dohcord-relay units were installed"
+[[ ${removed_unit} -eq 1 ]] || info "no Pishcord-relay units were installed"
 systemctl daemon-reload
 systemctl reset-failed >/dev/null 2>&1 || true
 
@@ -183,9 +183,9 @@ if [[ -d "${WEBROOT}" ]]; then
 	rm -rf -- "${WEBROOT}"
 	ok "removed ${WEBROOT} (ACME challenge directory)"
 fi
-if [[ -f /etc/modules-load.d/dohcord-relay-ifb.conf ]]; then
-	rm -f /etc/modules-load.d/dohcord-relay-ifb.conf
-	ok "removed /etc/modules-load.d/dohcord-relay-ifb.conf"
+if [[ -f /etc/modules-load.d/pishcord-relay-ifb.conf ]]; then
+	rm -f /etc/modules-load.d/pishcord-relay-ifb.conf
+	ok "removed /etc/modules-load.d/pishcord-relay-ifb.conf"
 fi
 if [[ -d "${LOG_DIR}" ]]; then
 	rm -rf -- "${LOG_DIR}"
@@ -200,12 +200,12 @@ if [[ ${PURGE} -eq 1 ]]; then
 		rm -rf -- "${ETC_DIR}"
 		ok "removed ${ETC_DIR}"
 	fi
-	if id -u dohcord-relay >/dev/null 2>&1; then
-		userdel dohcord-relay >/dev/null 2>&1 || warn "could not remove the dohcord-relay user (it may still own files)"
-		ok "removed the dohcord-relay system user"
+	if id -u pishcord-relay >/dev/null 2>&1; then
+		userdel pishcord-relay >/dev/null 2>&1 || warn "could not remove the pishcord-relay user (it may still own files)"
+		ok "removed the pishcord-relay system user"
 	fi
-	if [[ -d /opt/dohcord-relay-certbot ]]; then
-		rm -rf -- /opt/dohcord-relay-certbot
+	if [[ -d /opt/pishcord-relay-certbot ]]; then
+		rm -rf -- /opt/pishcord-relay-certbot
 		ok "removed the private certbot installation"
 	fi
 else
@@ -236,12 +236,12 @@ fi
 # --- 6. summary -------------------------------------------------------------
 cat <<EOF
 
-  ${C_GREEN}${C_BOLD}Dohcord-relay has been removed from this server.${C_RESET}
+  ${C_GREEN}${C_BOLD}Pishcord-relay has been removed from this server.${C_RESET}
 
   Still present, remove them yourself if you want them gone:
 
     packages      apt-get remove --purge squid-openssl coturn
-    firewall      ufw status numbered      (delete the Dohcord-relay rules)
+    firewall      ufw status numbered      (delete the Pishcord-relay rules)
                   firewall-cmd --remove-port=443/tcp   ... for each opened port
 
   Re-install any time with the one-line command in the README.
