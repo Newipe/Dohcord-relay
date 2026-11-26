@@ -118,14 +118,19 @@ func New(cfg config.Config, logger *log.Logger) *Server {
 	return s
 }
 
+// schemaVersionJSON is the document's schemaVersion/version value, encoded once
+// instead of on every profile load.
+var schemaVersionJSON = strconv.Itoa(policy.SchemaVersion)
+
 // writeNetworkConfig writes the exact wire shape of /network-config: the static
 // fields are pre-encoded, the policy fragments come from the snapshot, and only
 // the credential fields are encoded per request. The field order and names are
 // what older clients already parse.
 //
 // The pieces are written straight into one buffer, so a profile load performs no
-// reflective encoding of the document and sends a single response body.
-func (s *Server) writeNetworkConfig(w http.ResponseWriter, snap *policySnapshot, ice []iceServer, expiresAt int64) {
+// reflective encoding of the document and sends a single response body. A HEAD
+// request gets the same headers and no body.
+func (s *Server) writeNetworkConfig(w http.ResponseWriter, r *http.Request, snap *policySnapshot, ice []iceServer, expiresAt int64) {
 	server := ice[0]
 	username, _ := json.Marshal(server.Username)
 	credential, _ := json.Marshal(server.Credential)
@@ -135,9 +140,9 @@ func (s *Server) writeNetworkConfig(w http.ResponseWriter, snap *policySnapshot,
 	buf.Grow(1024 + len(snap.allowedDestinations) + len(snap.routing))
 
 	buf.WriteString(`{"schemaVersion":`)
-	buf.WriteString(strconv.Itoa(policy.SchemaVersion))
+	buf.WriteString(schemaVersionJSON)
 	buf.WriteString(`,"version":`)
-	buf.WriteString(strconv.Itoa(policy.SchemaVersion))
+	buf.WriteString(schemaVersionJSON)
 	buf.WriteString(`,"proxy":`)
 	buf.Write(s.proxyJSON)
 	buf.WriteString(`,"httpsProxy":{"url":`)
@@ -159,7 +164,9 @@ func (s *Server) writeNetworkConfig(w http.ResponseWriter, snap *policySnapshot,
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(buf.Bytes())
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(buf.Bytes())
+	}
 	s.bufs.Put(buf)
 }
 
@@ -215,20 +222,23 @@ type networkConfig struct {
 
 // writeDocument encodes doc into a pooled buffer and writes it in one call. The
 // response is a few kilobytes, so this removes a per-request buffer allocation
-// and the chunked framing json.Encoder would produce.
-func (s *Server) writeDocument(w http.ResponseWriter, status int, doc any) {
+// and the chunked framing json.Encoder would produce. A HEAD request gets the
+// same headers and no body.
+func (s *Server) writeDocument(w http.ResponseWriter, r *http.Request, status int, doc any) {
 	buf := s.bufs.Get().(*bytes.Buffer)
 	buf.Reset()
 	err := json.NewEncoder(buf).Encode(doc)
 	if err != nil {
 		s.bufs.Put(buf)
-		writeJSON(w, http.StatusInternalServerError, errorBody("encode response"))
+		writeError(w, http.StatusInternalServerError, "encode response")
 		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
 	w.WriteHeader(status)
-	_, _ = w.Write(buf.Bytes())
+	if r.Method != http.MethodHead {
+		_, _ = w.Write(buf.Bytes())
+	}
 	s.bufs.Put(buf)
 }
 
@@ -236,6 +246,11 @@ type credentialsResponse struct {
 	ExpiresAt  int64       `json:"expiresAt"`
 	IceServers []iceServer `json:"iceServers"`
 }
+
+// maxHeaderBytes bounds a request head. Both endpoints take no headers beyond
+// the defaults, and the standard library default is 1 MiB, which a public
+// endpoint has no reason to accept.
+const maxHeaderBytes = 16 << 10
 
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
@@ -273,13 +288,13 @@ func (s *Server) allowRequest(w http.ResponseWriter, r *http.Request, now time.T
 		// One line per refusal: diagnostics count these, and a working relay
 		// should log none.
 		s.log.Printf("rate limited client=%s scope=global retry_after=%s", clientIP, retry)
-		writeJSON(w, http.StatusTooManyRequests, errorBody("global request limit reached"))
+		writeError(w, http.StatusTooManyRequests, "global request limit reached")
 		return clientIP, false
 	}
 	if ok, retry := s.perIP.Allow(clientIP, now); !ok {
 		retryAfter(w, retry)
 		s.log.Printf("rate limited client=%s scope=per-ip retry_after=%s", clientIP, retry)
-		writeJSON(w, http.StatusTooManyRequests, errorBody("too many requests from this address"))
+		writeError(w, http.StatusTooManyRequests, "too many requests from this address")
 		return clientIP, false
 	}
 	return clientIP, true
@@ -315,14 +330,14 @@ func (s *Server) handleNetworkConfig(w http.ResponseWriter, r *http.Request) {
 	pol, err := s.policy.Get()
 	if err != nil {
 		s.log.Printf("ERROR destination policy unavailable: %v", err)
-		writeJSON(w, http.StatusServiceUnavailable, errorBody("destination policy unavailable"))
+		writeError(w, http.StatusServiceUnavailable, "destination policy unavailable")
 		return
 	}
 	ice, expiresAt, err := s.issue(now)
 	if err != nil {
 		// Deliberately vague to the client; the details stay in the local log.
 		s.log.Printf("ERROR turn configuration unavailable: %v", err)
-		writeJSON(w, http.StatusServiceUnavailable, errorBody("turn configuration unavailable"))
+		writeError(w, http.StatusServiceUnavailable, "turn configuration unavailable")
 		return
 	}
 
@@ -332,18 +347,18 @@ func (s *Server) handleNetworkConfig(w http.ResponseWriter, r *http.Request) {
 	// config.Validate).
 	if _, ok = s.endpoint(); !ok {
 		s.log.Printf("ERROR proxy endpoint unusable: %q", s.cfg.ProxyURL)
-		writeJSON(w, http.StatusServiceUnavailable, errorBody("proxy configuration unavailable"))
+		writeError(w, http.StatusServiceUnavailable, "proxy configuration unavailable")
 		return
 	}
 
 	snap, err := s.snapshotFor(pol)
 	if err != nil {
 		s.log.Printf("ERROR encoding destination policy: %v", err)
-		writeJSON(w, http.StatusInternalServerError, errorBody("encode response"))
+		writeError(w, http.StatusInternalServerError, "encode response")
 		return
 	}
 
-	s.writeNetworkConfig(w, snap, ice, expiresAt)
+	s.writeNetworkConfig(w, r, snap, ice, expiresAt)
 
 	// Log issuance without the credential: it is a bearer secret for the
 	// lifetime of the allocation.
@@ -367,11 +382,11 @@ func (s *Server) handleCredentials(w http.ResponseWriter, r *http.Request) {
 	ice, expiresAt, err := s.issue(now)
 	if err != nil {
 		s.log.Printf("ERROR turn configuration unavailable: %v", err)
-		writeJSON(w, http.StatusServiceUnavailable, errorBody("turn configuration unavailable"))
+		writeError(w, http.StatusServiceUnavailable, "turn configuration unavailable")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, credentialsResponse{ExpiresAt: expiresAt, IceServers: ice})
+	s.writeDocument(w, r, http.StatusOK, credentialsResponse{ExpiresAt: expiresAt, IceServers: ice})
 	s.log.Printf("issued turn credential client=%s expires_at=%d", clientIP, expiresAt)
 }
 
@@ -410,6 +425,7 @@ func (s *Server) Run() error {
 			ReadTimeout:       10 * time.Second,
 			WriteTimeout:      15 * time.Second,
 			IdleTimeout:       60 * time.Second,
+			MaxHeaderBytes:    maxHeaderBytes,
 			ErrorLog:          s.log,
 		}
 		servers = append(servers, srv)
@@ -431,6 +447,7 @@ func (s *Server) Run() error {
 			ReadTimeout:       10 * time.Second,
 			WriteTimeout:      15 * time.Second,
 			IdleTimeout:       30 * time.Second,
+			MaxHeaderBytes:    maxHeaderBytes,
 			ErrorLog:          s.log,
 		}
 		servers = append(servers, srv)

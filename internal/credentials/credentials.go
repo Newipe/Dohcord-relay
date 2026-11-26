@@ -3,12 +3,15 @@
 package credentials
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
 	"fmt"
+	"hash"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -16,14 +19,41 @@ import (
 // authentication (turnserver.conf: rest-api-separator, default ':').
 const restSeparator = ":"
 
+// maxIdentityLen bounds the identity part of a username. It mirrors
+// ValidateIdentity, and sizes the stack buffer Issue writes into.
+const maxIdentityLen = 64
+
+// macState is a reusable HMAC-SHA1 state bound to one shared secret.
+// hmac.New allocates keyed state on every call and a credential is issued on
+// every profile load, so the state is pooled and reset instead of rebuilt.
+type macState struct {
+	mac    hash.Hash
+	secret []byte
+}
+
+var macPool = sync.Pool{New: func() any { return new(macState) }}
+
+// acquireMac returns a reset HMAC-SHA1 state keyed with secret. A pooled state
+// built for another secret is replaced, because hmac cannot change its key.
+func acquireMac(secret []byte) *macState {
+	st := macPool.Get().(*macState)
+	if st.mac == nil || !bytes.Equal(st.secret, secret) {
+		st.mac = hmac.New(sha1.New, secret)
+		st.secret = append(st.secret[:0], secret...)
+		return st
+	}
+	st.mac.Reset()
+	return st
+}
+
 // ValidateIdentity rejects identities that would break the "<timestamp>:<identity>"
 // username format or the TURN username grammar.
 func ValidateIdentity(identity string) error {
 	switch {
 	case identity == "":
 		return fmt.Errorf("turn identity must not be empty")
-	case len(identity) > 64:
-		return fmt.Errorf("turn identity must be at most 64 characters")
+	case len(identity) > maxIdentityLen:
+		return fmt.Errorf("turn identity must be at most %d characters", maxIdentityLen)
 	case strings.ContainsRune(identity, ':'):
 		return fmt.Errorf("turn identity must not contain %q", restSeparator)
 	case strings.ContainsAny(identity, " \t\r\n"):
@@ -39,14 +69,30 @@ func ValidateIdentity(identity string) error {
 //
 // The password is the standard base64 encoding of the raw HMAC-SHA1 digest, with
 // padding, which is what coturn itself computes for --use-auth-secret.
+//
+// The username and digest are built in stack buffers and the HMAC state is
+// reused, so issuing a credential allocates only the two returned strings.
 func Issue(secret []byte, identity string, ttl time.Duration, now time.Time) (username, password string, expiresAt int64) {
 	expiresAt = now.Add(ttl).Unix()
-	username = strconv.FormatInt(expiresAt, 10) + restSeparator + identity
 
-	mac := hmac.New(sha1.New, secret)
-	mac.Write([]byte(username))
-	password = base64.StdEncoding.EncodeToString(mac.Sum(nil))
-	return username, password, expiresAt
+	// 10 digits of timestamp, the separator and the identity; append grows the
+	// slice on the heap only if an identity longer than ValidateIdentity allows
+	// is passed in, and the result is then still correct.
+	var name [11 + maxIdentityLen]byte
+	b := strconv.AppendInt(name[:0], expiresAt, 10)
+	b = append(b, restSeparator...)
+	b = append(b, identity...)
+
+	st := acquireMac(secret)
+	_, _ = st.mac.Write(b)
+	var digest [sha1.Size]byte
+	sum := st.mac.Sum(digest[:0])
+	macPool.Put(st)
+
+	var encoded [28]byte // base64.StdEncoding.EncodedLen(sha1.Size)
+	base64.StdEncoding.Encode(encoded[:], sum)
+
+	return string(b), string(encoded[:]), expiresAt
 }
 
 // ParseUsername splits a REST username back into its expiration timestamp and

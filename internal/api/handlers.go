@@ -16,7 +16,7 @@ func allowedMethod(w http.ResponseWriter, r *http.Request) bool {
 		return true
 	}
 	w.Header().Set("Allow", "GET, HEAD")
-	writeJSON(w, http.StatusMethodNotAllowed, errorBody("method not allowed"))
+	writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	return false
 }
 
@@ -56,13 +56,50 @@ func (s *Server) clientIP(r *http.Request) string {
 	return host
 }
 
-func writeJSON(w http.ResponseWriter, status int, body any) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
+// errorMessages is every fixed error the API returns. Encoding each one once
+// keeps a refusal (a 429 under abuse, a 503 when a file is unreadable) free of
+// the map and encoder a per-request response would otherwise allocate.
+var errorMessages = []string{
+	"destination policy unavailable",
+	"encode response",
+	"global request limit reached",
+	"method not allowed",
+	"proxy configuration unavailable",
+	"too many requests from this address",
+	"turn configuration unavailable",
 }
 
-func errorBody(msg string) map[string]string { return map[string]string{"error": msg} }
+var errorBodies = func() map[string][]byte {
+	m := make(map[string][]byte, len(errorMessages))
+	for _, msg := range errorMessages {
+		body, err := json.Marshal(map[string]string{"error": msg})
+		if err != nil {
+			continue
+		}
+		m[msg] = append(body, '\n')
+	}
+	return m
+}()
+
+// errorBody returns the encoded {"error": msg} document. A message outside the
+// fixed set is encoded on the spot, so the response shape never depends on the
+// caller having registered it.
+func errorBody(msg string) []byte {
+	if body, ok := errorBodies[msg]; ok {
+		return body
+	}
+	body, _ := json.Marshal(map[string]string{"error": msg})
+	return append(body, '\n')
+}
+
+// writeError writes an error document in one call, with an exact length.
+func writeError(w http.ResponseWriter, status int, msg string) {
+	body := errorBody(msg)
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
 
 func retryAfter(w http.ResponseWriter, d time.Duration) {
 	secs := int(d.Seconds())

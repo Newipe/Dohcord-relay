@@ -53,7 +53,13 @@ parsed, not sourced.
 | `TRUST_PROXY_HEADER` | Set `true` **only** behind a reverse proxy that overwrites `X-Forwarded-For`. |
 
 The API reloads this file on `SIGHUP` (the unit's `ExecReload`) and picks up
-rotated secrets and tuning without a restart. `systemctl reload pishcord-relay-api`.
+rotated secrets and tuning without a restart: `systemctl reload pishcord-relay-api`.
+
+The TURN secret is read from `SECRET_FILE` on demand and cached, and the file is
+re-checked at most once a second, so a secret rotated in place is noticed within a
+second even without a reload; `SIGHUP` skips the wait. The policy snapshot in
+`POLICY_STATE_FILE` is checked on every request, so a policy apply is visible at
+once.
 
 > Changing `HTTPS_PROXY_URL` changes what clients are told. It must stay the
 > address clients actually reach the proxy on; the installer sets it from your

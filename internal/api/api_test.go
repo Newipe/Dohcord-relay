@@ -338,6 +338,36 @@ func TestGlobalRateLimit(t *testing.T) {
 	}
 }
 
+// TestHeadRequestsCarryHeadersWithoutABody pins the HEAD behaviour of both
+// endpoints: the same status and Content-Length as GET, and no body.
+func TestHeadRequestsCarryHeadersWithoutABody(t *testing.T) {
+	srv, _ := testServer(t, "0123456789abcdef0123456789abcdef", time.Hour)
+
+	for _, path := range []string{"/network-config", "/turn-credentials"} {
+		get := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.RemoteAddr = "203.0.113.8:5555"
+		srv.Routes().ServeHTTP(get, req)
+		if get.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d, want 200", path, get.Code)
+		}
+
+		head := httptest.NewRecorder()
+		headReq := httptest.NewRequest(http.MethodHead, path, nil)
+		headReq.RemoteAddr = "203.0.113.8:5555"
+		srv.Routes().ServeHTTP(head, headReq)
+		if head.Code != http.StatusOK {
+			t.Fatalf("HEAD %s = %d, want 200", path, head.Code)
+		}
+		if head.Body.Len() != 0 {
+			t.Errorf("HEAD %s sent %d body bytes", path, head.Body.Len())
+		}
+		if got, want := head.Header().Get("Content-Length"), get.Header().Get("Content-Length"); got != want {
+			t.Errorf("HEAD %s Content-Length = %q, GET = %q", path, got, want)
+		}
+	}
+}
+
 func TestACMEChallengeServing(t *testing.T) {
 	srv, _ := testServer(t, "", time.Hour)
 	webroot := t.TempDir()

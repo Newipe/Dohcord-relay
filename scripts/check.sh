@@ -11,8 +11,9 @@ if ! command -v go >/dev/null 2>&1; then
 	printf 'go is not installed; skipping Go checks\n' >&2
 	fail=1
 else
-	if [[ -n "$(gofmt -l cmd internal)" ]]; then
-		printf 'gofmt would change:\n%s\n' "$(gofmt -l cmd internal)" >&2
+	unformatted="$(gofmt -l cmd internal)"
+	if [[ -n "${unformatted}" ]]; then
+		printf 'gofmt would change:\n%s\n' "${unformatted}" >&2
 		fail=1
 	fi
 	go vet ./... || fail=1
