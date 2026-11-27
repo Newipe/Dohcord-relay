@@ -244,6 +244,25 @@ else
 	bad "shaping class rates: ${out}"
 fi
 
+# Regression: an HTB class with no child qdisc is a pfifo limited by the device
+# txqueuelen (about 1000 packets on a WAN device, 32 on an IFB). A saturated
+# class then buffered around a second of audio and dropped it in one clump.
+if grep -q 'parent 1:1 handle 1001: fq_codel limit 1000 target 5ms interval 100ms ecn' <<<"${out}" &&
+	grep -q 'parent 2:1 handle 1001: fq_codel' <<<"${out}" &&
+	grep -q 'classid 1:1 htb rate 8mbit ceil 8mbit burst 50000 cburst 50000 quantum 1500' <<<"${out}" &&
+	! grep -q 'tc qdisc .* pfifo' <<<"${out}"; then
+	ok "every class carries an fq_codel leaf and an explicit quantum"
+else
+	bad "leaf queues and quantum: ${out}"
+fi
+
+if grep -q 'ip link set pishcord-ifb txqueuelen 1000' <<<"${out}" &&
+	grep -q 'txqueuelen 1000' <<<"${out}"; then
+	ok "the IFB device's 32-packet queue is raised before shaping upload"
+else
+	bad "ifb txqueuelen: ${out}"
+fi
+
 # Regression: a limit used to start only after the next refresh, so a download
 # that began and ended inside one refresh interval was not limited at all. Each
 # service now has a fallback class at the configured rate and port filters that
@@ -380,53 +399,93 @@ else
 	bad "stop restore: ${out}"
 fi
 
-# --- 8c. traffic shaping: the refresh stays cheap ----------------------------
-# The refresh used to fork a subshell for every socket line and rebuild the whole
-# filter chain whenever the address table changed, which cost seconds on a relay
-# with a few thousand sockets. It now reads one socket table per service, parses
-# it in awk, and touches only the rules of addresses that appeared.
-mkdir -p "${TMP}/fakess"
+# --- 8c. traffic shaping: client discovery -----------------------------------
+# Regression: TURN clients were read from `ss -uan`, which cannot name a UDP TURN
+# client at all. coturn answers it from the shared listener socket bound to 3478
+# (whose peer is always 0.0.0.0), and its per-allocation relay sockets only ever
+# talk to the peers. Every TURN client therefore stayed in the single per-service
+# fallback class, sharing one per-IP allowance with everybody else. Client flows
+# are now read from the conntrack table, which holds one entry per flow to
+# 3478/5349 in both directions.
+mkdir -p "${TMP}/fakess" "${TMP}/fakect"
 cat >"${TMP}/fakess/ss" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FAKE_SS_LOG}"
 case "$*" in
-*-Htn*)
+*sport*:443*)
 	printf 'ESTAB 0 0 10.0.0.1:443 198.51.100.7:51234\n'
 	printf 'ESTAB 0 0 10.0.0.1:443 198.51.100.7:51235\n'
 	printf 'ESTAB 0 0 10.0.0.1:443 198.51.100.9:40000\n'
 	;;
+*sport*:3478*)
+	# Only a TLS client can be named by the socket table.
+	printf 'ESTAB 0 0 10.0.0.1:5349 198.51.100.31:41000\n'
+	;;
 *-Huan*)
+	# What coturn actually looks like: the listener has no peer, and the relay
+	# socket talks to a peer, not to the client. Neither may become a class.
 	printf 'UNCONN 0 0 0.0.0.0:3478 0.0.0.0:*\n'
 	printf 'ESTAB 0 0 10.0.0.1:49160 198.51.100.8:5555\n'
-	printf 'UNCONN 0 0 10.0.0.1:42111 203.0.113.77:9999\n'
 	;;
 esac
 EOF
 chmod +x "${TMP}/fakess/ss"
+cat >"${TMP}/fakect/conntrack" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FAKE_CT_LOG}"
+case "$*" in
+*"udp --dport 3478"*)
+	# The first src= of an entry is the client; the tuple in brackets is the
+	# reply and must not become a class of its own.
+	printf 'udp      17 120 src=198.51.100.20 dst=203.0.113.10 sport=50123 dport=3478 src=203.0.113.10 dst=198.51.100.20 sport=3478 dport=50123 [ASSURED] mark=0 use=1\n'
+	;;
+*"tcp --dport 5349"*)
+	printf 'tcp      6 431999 ESTABLISHED src=198.51.100.21 dst=203.0.113.10 sport=52000 dport=5349 src=203.0.113.10 dst=198.51.100.21 sport=5349 dport=52000 [ASSURED] mark=0 use=1\n'
+	;;
+esac
+EOF
+chmod +x "${TMP}/fakect/conntrack"
 : >"${TMP}/ss.log"
-out="$(PATH="${TMP}/fakess:${PATH}" FAKE_SS_LOG="${TMP}/ss.log" \
+: >"${TMP}/ct.log"
+out="$(PATH="${TMP}/fakect:${TMP}/fakess:${PATH}" FAKE_SS_LOG="${TMP}/ss.log" FAKE_CT_LOG="${TMP}/ct.log" \
 	PISHCORD_RELAY_TC_STATE="${TMP}/tcstate-scan" \
 	bash "${TC}" refresh --dry-run --interface eth0 --config "${TMP}/tc.env" 2>&1)"
 scans="$(wc -l <"${TMP}/ss.log")"
-if [[ "${scans}" == "2" ]]; then
-	ok "one socket scan per service per refresh (both directions share it)"
+if [[ "${scans}" == "1" ]]; then
+	ok "one socket scan per refresh: the client address list is shared by both directions"
 else
 	bad "socket scans per refresh: ${scans}"
 fi
 
-if grep -q 'match ip dst 198.51.100.7/32 match ip sport 443 0xffff flowid 1:' <<<"${out}" &&
-	grep -q 'match ip src 198.51.100.7/32 match ip dport 443 0xffff flowid 2:' <<<"${out}" &&
-	grep -q 'match ip dst 198.51.100.8/32 match ip sport 0xc000 0xc000 flowid 1:' <<<"${out}" &&
-	[[ "$(grep -c 'match ip dst 198.51.100.7/32' <<<"${out}")" == "1" ]]; then
-	ok "the socket scan is parsed into per-client classes, with duplicates removed"
+if grep -q 'match ip dst 198.51.100.20/32 match ip sport 3478 0xffff flowid 1:' <<<"${out}" &&
+	grep -q 'match ip src 198.51.100.20/32 match ip dport 3478 0xffff flowid 2:' <<<"${out}" &&
+	grep -q 'match ip dst 198.51.100.21/32 match ip sport 5349 0xffff flowid 1:' <<<"${out}" &&
+	! grep -q 'match ip dst 203.0.113.10' <<<"${out}"; then
+	ok "UDP and TLS TURN clients are discovered from the conntrack table"
 else
-	bad "scan parsing: ${out}"
+	bad "conntrack discovery: ${out}"
 fi
 
-if ! grep -q '203.0.113.77' <<<"${out}" && ! grep -q 'match ip dst 0.0.0.0' <<<"${out}"; then
-	ok "sockets outside the relay ports and wildcard peers are ignored"
+if grep -q 'match ip dst 198.51.100.7/32 match ip sport 443 0xffff flowid 1:' <<<"${out}" &&
+	grep -q 'match ip src 198.51.100.7/32 match ip dport 443 0xffff flowid 2:' <<<"${out}" &&
+	[[ "$(grep -c 'match ip dst 198.51.100.7/32' <<<"${out}")" == "1" ]]; then
+	ok "the proxy's socket table is parsed into per-client classes, with duplicates removed"
 else
-	bad "scan filtering: ${out}"
+	bad "proxy scan parsing: ${out}"
+fi
+
+# Without conntrack only accepted TCP connections can name a TURN client, and a
+# peer sending to a relay port must never become a client class.
+out="$(PATH="${TMP}/fakess:${PATH}" FAKE_SS_LOG="${TMP}/ss.log" \
+	TC_DISCOVERY=ss PISHCORD_RELAY_TC_STATE="${TMP}/tcstate-noscan" \
+	bash "${TC}" refresh --dry-run --interface eth0 --config "${TMP}/tc.env" 2>&1)"
+if grep -q 'match ip dst 198.51.100.31/32 match ip sport 5349 0xffff flowid 1:' <<<"${out}" &&
+	! grep -q '198.51.100.8' <<<"${out}" &&
+	! grep -q 'match ip dst 0.0.0.0' <<<"${out}" &&
+	! grep -q '\-Huan' "${TMP}/ss.log"; then
+	ok "without conntrack, TLS TURN clients are still discovered and relay peers are ignored"
+else
+	bad "socket-table fallback: ${out}"
 fi
 
 # --- 9. traffic shaping: validation -----------------------------------------
@@ -449,6 +508,15 @@ if grep -q 'tc class del dev eth0 classid 1:5' <<<"${out}"; then
 	ok "an address with no traffic is removed from the shaper"
 else
 	bad "stale pruning: ${out}"
+fi
+
+# A removal used to flush the whole chain, which sent every packet to the
+# unlimited default class until the filters were rebuilt. Only the departed
+# address's own classifiers are removed now.
+if grep -q 'tc filter del dev eth0 parent 1: protocol ip prio 1 u32 match ip dst 198.51.100.9/32' <<<"${out}"; then
+	ok "an expired address's classifiers are removed on their own"
+else
+	bad "incremental filter removal: ${out}"
 fi
 
 # A capped table refuses to track more addresses than TC_MAX_CLIENTS.

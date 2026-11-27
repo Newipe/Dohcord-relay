@@ -38,9 +38,28 @@
 #     unique addresses cannot grow kernel state without limit;
 #   * an address with no connection for TC_IDLE_SECONDS is forgotten.
 #
+# Two properties matter more than the cap itself for real-time voice:
+#
+#   * every class carries an active queue: `fq_codel` (per-flow fair queueing
+#     with CoDel's 5 ms sojourn target) instead of HTB's default pfifo, whose
+#     limit is the device txqueuelen. Without it a saturated class buffers a
+#     second of audio and then drops a whole burst, which is exactly what cuts a
+#     call out; with it the queue stays at a few milliseconds and loss, when the
+#     cap is really exceeded, is spread over the offending flow instead of
+#     arriving as a clump;
+#   * client addresses are read from the conntrack table, not from the socket
+#     table. coturn answers a UDP client from a socket bound to the relay port
+#     that is shared by every client, and its per-allocation relay sockets talk
+#     to the *peers*; `ss -uan` therefore cannot name a UDP TURN client at all.
+#     The conntrack table can: one entry per client flow to 3478/5349. Without
+#     conntrack every TURN client stays in the per-service fallback class, where
+#     they all share one per-IP allowance — the reported "voice cuts out when
+#     several people are on a call".
+#
 # Every tc command is checked: a rule that the kernel refuses aborts the apply
 # instead of leaving a half-installed tree that looks active. `status` re-reads
-# the kernel and requires the class *and* its classification filter to exist.
+# the kernel and requires the class *and* its classification filter to exist;
+# `diagnose` prints the per-class queue state.
 #
 # Nothing here is per connection or per session, and no protocol is modified.
 set -Eeuo pipefail
@@ -62,14 +81,26 @@ TC_INTERFACE=""
 TC_MAX_CLIENTS=512
 TC_IDLE_SECONDS=60
 TC_REFRESH_SECONDS=5
+# Leaf queueing. Every class gets one; see the note in add_leaf_qdisc.
+TC_AQM="auto"
+TC_AQM_LIMIT=1000
+TC_QUANTUM=1500
+# Where client addresses come from: auto|conntrack|proc|ss.
+TC_DISCOVERY="auto"
+TC_TURN_SCAN_SECONDS=""
 
 IFACE=""
 IFB="pishcord-ifb"
-# How often the TURN socket table is read. A UDP socket dump has to walk every
-# relay socket coturn holds (thousands on a busy relay), so it is the one part of
-# a refresh whose cost grows with load; in between scans the previous list is
-# reused and the fallback class keeps the limit in force.
-readonly TURN_SCAN_SECONDS=30
+# How often the TURN client table is re-read. The conntrack table is dumped with
+# a kernel-side filter, so it is as cheap as the proxy's socket scan; the /proc
+# table (used when the conntrack tool is absent) has to be read whole, so that
+# backend reuses the previous list for a while and the fallback class keeps the
+# limit in force in between.
+TURN_SCAN_SECONDS=30
+TURN_SCAN_SET=0
+AQM_KIND=""
+DISCOVERY_BACKEND=""
+FILTER_CMD=add
 readonly EGRESS_HANDLE=1
 readonly INGRESS_HANDLE=2
 readonly DEFAULT_CLASS=999
@@ -117,6 +148,7 @@ Usage: ${PROGRAM} <command> [options]
   refresh       Re-read the active client addresses and update the rules once
   watch         Keep refreshing (this is what the systemd service runs)
   status        Report the configured limits and whether they are active
+  diagnose      Report per-class queue state, drops and the discovery source
   stop          Remove only the rules this program installed
   validate      Check the limit settings in ${CONFIG}
 
@@ -137,6 +169,11 @@ Configuration (${DEFAULT_CONFIG}):
   TC_MAX_CLIENTS=512            addresses tracked per service and direction
   TC_IDLE_SECONDS=60            forget an address after this long without a flow
   TC_REFRESH_SECONDS=5          how often the class table is refreshed
+  TC_AQM=auto                   leaf queue: auto, fq_codel or pfifo
+  TC_AQM_LIMIT=1000             leaf queue limit, packets
+  TC_QUANTUM=1500               HTB quantum, bytes per round
+  TC_DISCOVERY=auto             client addresses from auto, conntrack, proc or ss
+  TC_TURN_SCAN_SECONDS=         how often the TURN table is re-read (0: automatic)
 
 Limits are aggregate per client IP: extra connections from the same address
 share the same allowance. The API's control traffic is not shaped.
@@ -179,6 +216,19 @@ load_config() {
 	[[ -z "${v}" ]] || TC_IDLE_SECONDS="${v}"
 	v="$(config_get TC_REFRESH_SECONDS)"
 	[[ -z "${v}" ]] || TC_REFRESH_SECONDS="${v}"
+	v="$(config_get TC_AQM)"
+	[[ -z "${v}" ]] || TC_AQM="${v}"
+	v="$(config_get TC_AQM_LIMIT)"
+	[[ -z "${v}" ]] || TC_AQM_LIMIT="${v}"
+	v="$(config_get TC_QUANTUM)"
+	[[ -z "${v}" ]] || TC_QUANTUM="${v}"
+	v="$(config_get TC_DISCOVERY)"
+	[[ -z "${v}" ]] || TC_DISCOVERY="${v}"
+	v="$(config_get TC_TURN_SCAN_SECONDS)"
+	if [[ -n "${v}" ]]; then
+		TC_TURN_SCAN_SECONDS="${v}"
+		TURN_SCAN_SET=1
+	fi
 
 	# The proxy port is the port in HTTPS_PROXY_URL, so a non-default proxy port
 	# is shaped correctly without another setting.
@@ -247,6 +297,32 @@ validate_config() {
 		fail "TC_INTERFACE is not a valid interface name: ${TC_INTERFACE}"
 		problems=$((problems + 1))
 	fi
+	case "${TC_AQM}" in
+	auto | fq_codel | pfifo) ;;
+	*)
+		fail "TC_AQM must be auto, fq_codel or pfifo, got ${TC_AQM}"
+		problems=$((problems + 1))
+		;;
+	esac
+	if [[ ! "${TC_AQM_LIMIT}" =~ ^[0-9]{1,6}$ ]] || ((10#${TC_AQM_LIMIT} < 1 || 10#${TC_AQM_LIMIT} > 200000)); then
+		fail "TC_AQM_LIMIT must be a packet count between 1 and 200000, got ${TC_AQM_LIMIT}"
+		problems=$((problems + 1))
+	fi
+	if [[ ! "${TC_QUANTUM}" =~ ^[0-9]{1,6}$ ]] || ((10#${TC_QUANTUM} < 1500 || 10#${TC_QUANTUM} > 60000)); then
+		fail "TC_QUANTUM must be between 1500 and 60000 bytes, got ${TC_QUANTUM}"
+		problems=$((problems + 1))
+	fi
+	case "${TC_DISCOVERY}" in
+	auto | conntrack | proc | ss) ;;
+	*)
+		fail "TC_DISCOVERY must be auto, conntrack, proc or ss, got ${TC_DISCOVERY}"
+		problems=$((problems + 1))
+		;;
+	esac
+	if [[ -n "${TC_TURN_SCAN_SECONDS}" ]] && { [[ ! "${TC_TURN_SCAN_SECONDS}" =~ ^[0-9]{1,5}$ ]] || ((10#${TC_TURN_SCAN_SECONDS} < 1)); }; then
+		fail "TC_TURN_SCAN_SECONDS must be a whole number of at least 1, got ${TC_TURN_SCAN_SECONDS}"
+		problems=$((problems + 1))
+	fi
 	((problems == 0))
 }
 
@@ -285,6 +361,46 @@ burst_bytes() {
 	((bytes < 16384)) && bytes=16384
 	((bytes > 524288)) && bytes=524288
 	printf '%s' "${bytes}"
+}
+
+# --- Leaf queueing ----------------------------------------------------------
+# HTB gives a class with no child qdisc a plain pfifo, and that pfifo's limit is
+# the interface's txqueuelen: about 1000 packets on a normal WAN device (up to
+# ~1.5 s of standing queue at 8 Mbit/s, then a burst of tail drops) and only 32
+# on an IFB device (a drop inside every ~24 ms of a 16 Mbit/s upload burst).
+# A saturated class then delivers audio late and in clumps, which is what a
+# voice call cannot survive. Every class therefore gets an active queue:
+# fq_codel, which keeps the sojourn time near 5 ms and spreads unavoidable loss
+# over the flow that causes it, or a bounded pfifo where fq_codel is missing.
+aqm_configure() {
+	case "${TC_AQM}" in
+	pfifo) AQM_KIND=pfifo ;;
+	*) AQM_KIND=fq_codel ;;
+	esac
+}
+
+# leaf_handle gives a leaf qdisc a handle that cannot collide with the root
+# handles (1:, 2:, ffff:). Handles are parsed as hexadecimal.
+leaf_handle() { local n=$(($1 + 4096)); printf '%x:' "${n}"; }
+
+# add_leaf_qdisc installs the queueing discipline below one HTB class. A kernel
+# without sch_fq_codel is not an error: the warning says what was used instead
+# and the cap itself is unaffected.
+add_leaf_qdisc() { # dev classid minor
+	local dev="$1" classid="$2" minor="$3" handle ok=1
+	handle="$(leaf_handle "${minor}")"
+	if [[ "${AQM_KIND}" == fq_codel ]]; then
+		tc_try qdisc replace dev "${dev}" parent "${classid}" handle "${handle}" \
+			fq_codel limit "${TC_AQM_LIMIT}" target 5ms interval 100ms ecn || ok=0
+		if ((ok == 0)); then
+			warn "fq_codel is unavailable on this kernel (sch_fq_codel); using a bounded pfifo queue instead. Voice jitter under load will be worse until it is available."
+			AQM_KIND=pfifo
+		fi
+	fi
+	if [[ "${AQM_KIND}" == pfifo ]]; then
+		tc_try qdisc replace dev "${dev}" parent "${classid}" handle "${handle}" \
+			pfifo limit "${TC_AQM_LIMIT}" || warn "could not install a leaf queue on ${dev} ${classid}"
+	fi
 }
 
 # --- State ------------------------------------------------------------------
@@ -358,15 +474,22 @@ run_tc() {
 	fi
 }
 
-# run_tc_try is for commands whose failure is harmless (removing a class or
-# filter that a previous apply already removed).
-run_tc_try() {
+# tc_try runs a tc command whose failure is reported to the caller instead of
+# aborting the apply. It is used where a capability is optional (an AQM leaf, an
+# incremental filter removal) and a fallback exists.
+tc_try() {
 	if ((DRY_RUN)); then
 		printf 'tc %s\n' "$*"
 		return 0
 	fi
 	log "tc $*"
-	tc "$@" 2>/dev/null || true
+	tc "$@" 2>/dev/null
+}
+
+# run_tc_try is for commands whose failure is harmless (removing a class or
+# filter that a previous apply already removed).
+run_tc_try() {
+	tc_try "$@" || true
 }
 
 have_ifb() { ip link show "${IFB}" >/dev/null 2>&1; }
@@ -496,6 +619,16 @@ ensure_device() {
 				ip link set "${IFB}" up
 			fi
 		fi
+		# An IFB device comes up with txqueuelen 32. That number is the limit of
+		# every pfifo HTB creates for a class, and it is also the queue that
+		# re-injects shaped packets into the stack, so leave it large enough that
+		# the interface stops accepting instead of dropping. The leaf qdiscs are
+		# what actually bound the queue now.
+		if ((DRY_RUN == 0)); then
+			ip link set "${IFB}" txqueuelen 1000 2>/dev/null || warn "could not raise the txqueuelen of ${IFB}"
+		else
+			printf 'ip link set %s txqueuelen 1000\n' "${IFB}"
+		fi
 		run_tc qdisc replace dev "${IFB}" root handle "${INGRESS_HANDLE}:" htb default "${DEFAULT_CLASS}"
 		run_tc class replace dev "${IFB}" parent "${INGRESS_HANDLE}:" classid "${INGRESS_HANDLE}:${DEFAULT_CLASS}" \
 			htb rate "${link}mbit" ceil "${link}mbit"
@@ -543,11 +676,16 @@ add_ingress_mirror() {
 	for p in "${ports[@]}"; do
 		run_tc filter add dev "${IFACE}" parent ffff: protocol ip prio 1 u32 \
 			match ip dport "${p}" 0xffff action mirred egress redirect dev "${IFB}"
+		run_tc filter add dev "${IFACE}" parent ffff: protocol ipv6 prio 1 u32 \
+			match ip6 dport "${p}" 0xffff action mirred egress redirect dev "${IFB}"
 	done
-	if ((RELAY_RANGE)) && [[ "${service}" == "turn" ]]; then
-		run_tc filter add dev "${IFACE}" parent ffff: protocol ip prio 2 u32 \
-			match ip dport 0xc000 0xc000 action mirred egress redirect dev "${IFB}"
-	fi
+	# The coturn relay range is deliberately NOT mirrored. On the WAN interface a
+	# packet arriving for a port in 49152-65535 is what a *peer* sends to the
+	# relay, or a reply to one of the host's own outbound connections; it is never
+	# what a client uploads (a TURN client sends to 3478/5349). Mirroring it put
+	# every one of those packets through an IFB round trip for nothing, and where
+	# the source happened to be a shaped address it was billed as that client's
+	# upload. Per-address download filters still cover the relay range.
 }
 
 add_class() {
@@ -561,8 +699,38 @@ add_class() {
 	fi
 	classid="${parent}${minor}"
 	burst="$(burst_bytes "${rate}")"
+	# quantum is set explicitly: HTB otherwise uses rate/r2q, which at 8-16 Mbit
+	# is 100-200 kB per round — about 60-130 voice packets served from one class
+	# before the scheduler looks at the next one, i.e. exactly the clumping this
+	# script must avoid. 1500 bytes keeps rounds to a packet.
 	run_tc class replace dev "${dev}" parent "${parent}" classid "${classid}" \
-		htb rate "${rate}mbit" ceil "${rate}mbit" burst "${burst}" cburst "${burst}"
+		htb rate "${rate}mbit" ceil "${rate}mbit" burst "${burst}" cburst "${burst}" \
+		quantum "${TC_QUANTUM}"
+	# The class is only a token bucket until something queues below it; without
+	# this it is a 1000-packet (WAN) or 32-packet (IFB) pfifo.
+	add_leaf_qdisc "${dev}" "${classid}" "${minor}"
+}
+
+# put_filter installs or removes one classifier. FILTER_CMD selects which, so the
+# add and delete paths use the same match specification and cannot drift apart.
+put_filter() { # dev ... (rest of a tc filter spec)
+	if [[ "${FILTER_CMD}" == "del" ]]; then
+		tc_try filter del "$@" || true
+		return 0
+	fi
+	run_tc filter add "$@"
+}
+
+# filters_for DEV PARENT CLASSID prints how many classifiers still point at a
+# class. tc deletes matches silently, so removals are checked instead of trusted.
+filters_for() { # dev parent classid
+	if ((DRY_RUN)); then
+		printf '0'
+		return 0
+	fi
+	local count
+	count="$(tc filter show dev "$1" parent "$2" 2>/dev/null | grep -c "flowid $3" || true)"
+	printf '%s' "${count:-0}"
 }
 
 # add_filters DIR SERVICE MINOR IP steers that address's relay traffic into its
@@ -602,26 +770,36 @@ add_filters() {
 
 	for p in "${ports[@]}"; do
 		if ((is6)); then
-			run_tc filter add dev "${dev}" parent "${parent}" protocol ipv6 prio "${handle}" u32 \
+			put_filter dev "${dev}" parent "${parent}" protocol ipv6 prio "${handle}" u32 \
 				match "${prefix}" "${key}" "${ip}/128" match "${prefix}" "${port_field}" "${p}" 0xffff \
 				flowid "${parent}${minor}"
 		else
-			run_tc filter add dev "${dev}" parent "${parent}" protocol ip prio "${handle}" u32 \
+			put_filter dev "${dev}" parent "${parent}" protocol ip prio "${handle}" u32 \
 				match "${prefix}" "${key}" "${ip}/32" match "${prefix}" "${port_field}" "${p}" 0xffff \
 				flowid "${parent}${minor}"
 		fi
 	done
 	if ((RELAY_RANGE)) && [[ "${service}" == "turn" ]]; then
 		if ((is6)); then
-			run_tc filter add dev "${dev}" parent "${parent}" protocol ipv6 prio 3 u32 \
+			put_filter dev "${dev}" parent "${parent}" protocol ipv6 prio 3 u32 \
 				match ip6 "${key}" "${ip}/128" match ip6 "${port_field}" 0xc000 0xc000 \
 				flowid "${parent}${minor}"
 		else
-			run_tc filter add dev "${dev}" parent "${parent}" protocol ip prio 1 u32 \
+			put_filter dev "${dev}" parent "${parent}" protocol ip prio 1 u32 \
 				match ip "${key}" "${ip}/32" match ip "${port_field}" 0xc000 0xc000 \
 				flowid "${parent}${minor}"
 		fi
 	fi
+}
+
+# del_filters DIR SERVICE MINOR IP removes exactly that address's classifiers,
+# leaving everybody else's in place. `reset_filters` is only the fallback: while
+# the chain is empty every packet takes the unlimited default class, so it is not
+# used for an ordinary address expiring any more.
+del_filters() { # dir service minor ip
+	FILTER_CMD=del
+	add_filters "$@"
+	FILTER_CMD=add
 }
 
 # add_hold_filters DIR SERVICE sends the service's relay traffic that matches no
@@ -644,9 +822,9 @@ add_hold_filters() {
 	fi
 	classid="${parent}$(hold_minor "${service}")"
 	for p in "${ports[@]}"; do
-		run_tc filter add dev "${dev}" parent "${parent}" protocol ip prio 2 u32 \
+		put_filter dev "${dev}" parent "${parent}" protocol ip prio 2 u32 \
 			match ip "${port_field}" "${p}" 0xffff flowid "${classid}"
-		run_tc filter add dev "${dev}" parent "${parent}" protocol ipv6 prio 4 u32 \
+		put_filter dev "${dev}" parent "${parent}" protocol ipv6 prio 4 u32 \
 			match ip6 "${port_field}" "${p}" 0xffff flowid "${classid}"
 	done
 	# The coturn relay range is deliberately not part of the fallback: on the
@@ -658,13 +836,119 @@ add_hold_filters() {
 }
 
 # --- Client discovery -------------------------------------------------------
-# The socket table is parsed by awk and only the client addresses reach the
-# shell. Walking every line in bash instead forked a subshell per socket, which
-# is what made a refresh on a busy relay expensive.
+# A client address is the source address of a flow to the relay's own listening
+# ports. Two sources can name those flows:
+#
+#   conntrack  one entry per client flow, in both directions. Kernel-filtered by
+#              protocol and destination port (ctnetlink), so the cost depends on
+#              the relay's own traffic, not on the size of the whole table. This
+#              is the only source that can name a UDP TURN client: coturn answers
+#              it from the shared listener socket bound to 3478, and its
+#              per-allocation relay sockets only ever talk to the *peers*.
+#   ss         the socket table. Exact for accepted TCP connections (the proxy,
+#              TURN over TLS); it cannot see a UDP TURN client at all, because
+#              such a flow lives on a 0.0.0.0:3478 listener whose peer address is
+#              never recorded. With this source TURN classes only appear for TLS
+#              clients, and `status` says so.
+#
+# The table is parsed by awk and only the client addresses reach the shell, so a
+# refresh costs the same whether five or five hundred addresses are shaped.
 #
 # discover_clients SERVICE prints the distinct client addresses using it. No
-# packet contents are read; only socket endpoints. It runs once per service per
+# packet contents are read; only flow endpoints. It runs once per service per
 # refresh (both directions use the same list).
+ss_peers() {
+	awk '
+		{
+			ip = $5
+			sub(/:[^:]*$/, "", ip)
+			gsub(/^\[|\]$/, "", ip)
+			sub(/%.*$/, "", ip)
+			if (ip == "" || ip == "*" || ip in seen) next
+			seen[ip] = 1
+			print ip
+		}'
+}
+
+# conntrack_peers keeps the client address of every entry whose destination port
+# is one of PORTS. The first src= of a conntrack line is the original direction,
+# i.e. the client; the reply tuple that follows is ignored.
+conntrack_peers() { # PORTS
+	awk -v ports="$1" '
+		BEGIN {
+			n = split(ports, a, " ")
+			for (i = 1; i <= n; i++) if (a[i] != "") want[a[i]] = 1
+		}
+		{
+			matched = 0
+			for (i = 1; i <= NF; i++)
+				if ($i ~ /^dport=/ && (substr($i, 7) in want)) { matched = 1; break }
+			if (!matched) next
+			ip = ""
+			for (i = 1; i <= NF; i++) if ($i ~ /^src=/) { ip = substr($i, 5); break }
+			if (ip == "" || ip in seen) next
+			seen[ip] = 1
+			print ip
+		}'
+}
+
+conntrack_file() {
+	if [[ -r /proc/net/nf_conntrack ]]; then
+		printf '%s' /proc/net/nf_conntrack
+	elif [[ -r /proc/net/ip_conntrack ]]; then
+		printf '%s' /proc/net/ip_conntrack
+	fi
+}
+
+# detect_discovery picks the source once per process. `auto` prefers the
+# conntrack tool (cheap kernel-filtered dumps), then the /proc table, and only
+# then the socket table, which cannot see UDP TURN clients.
+detect_discovery() {
+	case "${TC_DISCOVERY:-auto}" in
+	conntrack | proc | ss) DISCOVERY_BACKEND="${TC_DISCOVERY}" ;;
+	*)
+		if command -v conntrack >/dev/null 2>&1; then
+			DISCOVERY_BACKEND=conntrack
+		elif [[ -n "$(conntrack_file)" ]]; then
+			DISCOVERY_BACKEND=proc
+		else
+			DISCOVERY_BACKEND=ss
+		fi
+		;;
+	esac
+	# The /proc table has to be read whole, so it is scanned less often; a
+	# kernel-filtered conntrack dump is cheap enough to do on every refresh.
+	if ((TURN_SCAN_SET == 0)); then
+		if [[ "${DISCOVERY_BACKEND}" == proc ]]; then
+			TURN_SCAN_SECONDS=30
+		else
+			TURN_SCAN_SECONDS="${TC_REFRESH_SECONDS}"
+		fi
+	fi
+}
+
+# discover_turn_clients prints the client addresses of TURN flows. Both listener
+# protocols are covered: UDP is the primary transport and TCP the TLS fallback.
+discover_turn_clients() {
+	local proto port file
+	if [[ "${DISCOVERY_BACKEND}" == conntrack ]]; then
+		for port in "${TURN_PORTS[@]}"; do
+			for proto in udp tcp; do
+				conntrack -L -p "${proto}" --dport "${port}" 2>/dev/null || true
+			done
+		done | conntrack_peers "${TURN_PORTS[*]}"
+		return 0
+	fi
+	if [[ "${DISCOVERY_BACKEND}" == proc ]]; then
+		file="$(conntrack_file)"
+		[[ -n "${file}" ]] || return 0
+		conntrack_peers "${TURN_PORTS[*]}" <"${file}" 2>/dev/null || true
+		return 0
+	fi
+	# No conntrack: only accepted TCP connections can name a TURN client.
+	ss -Htn state established "( sport = :${TURN_PORTS[0]} or sport = :${TURN_PORTS[1]} )" 2>/dev/null | ss_peers
+}
+
 discover_clients() {
 	local service="$1"
 	if [[ -n "${PISHCORD_RELAY_TC_FAKE_CLIENTS:-}" ]]; then
@@ -674,37 +958,14 @@ discover_clients() {
 	fi
 
 	if [[ "${service}" == "proxy" ]]; then
-		ss -Htn state established "( sport = :${PROXY_PORT} )" 2>/dev/null |
-			awk '
-			{
-				ip = $5
-				sub(/:[^:]*$/, "", ip)
-				gsub(/^\[|\]$/, "", ip)
-				sub(/%.*$/, "", ip)
-				if (ip == "" || ip in seen) next
-				seen[ip] = 1
-				print ip
-			}'
+		# A connection accepted by Squid is in the socket table with the client
+		# as its peer. (conntrack is not used here: it would also name this
+		# host's own outbound HTTPS flows, whose destination port is 443 too.)
+		ss -Htn state established "( sport = :${PROXY_PORT} )" 2>/dev/null | ss_peers
 		return 0
 	fi
 
-	ss -Huan 2>/dev/null |
-		awk -v p1="${TURN_PORTS[0]}" -v p2="${TURN_PORTS[1]}" \
-			-v relay="${RELAY_RANGE}" -v lo="${RELAY_MIN}" -v hi="${RELAY_MAX}" '
-		{
-			lport = $4
-			sub(/^.*:/, "", lport)
-			if (lport !~ /^[0-9]+$/) next
-			if (!(lport == p1 || lport == p2 || (relay && lport + 0 >= lo && lport + 0 <= hi))) next
-			ip = $5
-			sub(/:[^:]*$/, "", ip)
-			gsub(/^\[|\]$/, "", ip)
-			sub(/%.*$/, "", ip)
-			if (ip == "" || ip in seen) next
-			if (ip == "0.0.0.0" || ip == "*" || ip == "::") next
-			seen[ip] = 1
-			print ip
-		}'
+	discover_turn_clients
 }
 
 # clients_for SERVICE NOW sets CLIENTS_OUT to that service's client addresses.
@@ -735,8 +996,8 @@ apply_rules() {
 refresh_rules() {
 	local now="${EPOCHSECONDS:-0}"
 	((now > 0)) || now="$(date +%s)"
-	local key dir service ip minor rate clients wanted seen_any
-	local changed=0 rebuild=0
+	local key dir service ip minor rate clients wanted seen_any left
+	local filters_dev filters_parent changed=0 rebuild=0 deleted=0 snapshot edir
 	local -A current=()
 
 	for service in proxy turn; do
@@ -790,8 +1051,10 @@ refresh_rules() {
 	done
 
 	# Forget addresses that have been gone longer than TC_IDLE_SECONDS. Their
-	# filters cannot be removed one by one reliably, so a removal rebuilds the
-	# chain once; that is rare compared with addresses appearing.
+	# classifiers are removed on their own; only a removal the kernel does not
+	# confirm (or a handle left over from an older version) falls back to
+	# rebuilding the whole chain, because that leaves every packet unrouted to a
+	# shaped class for the moment it takes.
 	for key in "${!ALLOC_MINOR[@]}"; do
 		[[ -n "${current["${key}"]:-}" ]] && continue
 		IFS='|' read -r dir service ip <<<"${key}"
@@ -800,14 +1063,50 @@ refresh_rules() {
 		((now - seen_any < TC_IDLE_SECONDS)) && continue
 		if [[ "${dir}" == "download" ]]; then
 			run_tc_try class del dev "${IFACE}" classid "${EGRESS_HANDLE}:${minor}"
+			filters_dev="${IFACE}"
+			filters_parent="${EGRESS_HANDLE}:"
 		else
 			run_tc_try class del dev "${IFB}" classid "${INGRESS_HANDLE}:${minor}"
+			filters_dev="${IFB}"
+			filters_parent="${INGRESS_HANDLE}:"
+		fi
+		del_filters "${dir}" "${service}" "${minor}" "${ip}"
+		left="$(filters_for "${filters_dev}" "${filters_parent}" "${filters_parent}${minor}")"
+		if [[ "${left}" != "0" ]]; then
+			log "classifiers for ${ip} could not be removed one by one; rebuilding the chain"
+			rebuild=1
 		fi
 		unset "ALLOC_MINOR[${key}]" "ALLOC_SEEN[${key}]" "USED_MINOR[\"${dir}|${minor}\"]"
 		TRACKED["${dir}"]=$((${TRACKED["${dir}"]:-1} - 1))
 		changed=1
-		rebuild=1
+		deleted=1
 	done
+
+	# Removing one address's classifiers must not remove anybody else's. One
+	# snapshot per device proves it; anything unexpected rebuilds the chain.
+	if ((deleted && DRY_RUN == 0)); then
+		for dir in upload download; do
+			if [[ "${dir}" == "upload" ]]; then
+				any_upload || continue
+				filters_dev="${IFB}"
+				filters_parent="${INGRESS_HANDLE}:"
+			else
+				any_download || continue
+				filters_dev="${IFACE}"
+				filters_parent="${EGRESS_HANDLE}:"
+			fi
+			snapshot="$(tc filter show dev "${filters_dev}" parent "${filters_parent}" 2>/dev/null || true)"
+			for key in "${!ALLOC_MINOR[@]}"; do
+				IFS='|' read -r edir _ _ <<<"${key}"
+				[[ "${edir}" == "${dir}" ]] || continue
+				if ! filter_has "${snapshot}" "${filters_parent}${ALLOC_MINOR[${key}]}"; then
+					log "classifiers of another address disappeared with ${ip}; rebuilding the chain"
+					rebuild=1
+					break 2
+				fi
+			done
+		done
+	fi
 
 	# Filters are fully derived from the class table: rebuild them after a
 	# removal or the first time this process runs (which also clears duplicates
@@ -869,8 +1168,14 @@ status() {
 	printf 'turn_upload_mbit=%s\n' "${TURN_UPLOAD_LIMIT_MBIT}"
 	printf 'turn_download_mbit=%s\n' "${TURN_DOWNLOAD_LIMIT_MBIT}"
 	printf 'max_clients=%s\n' "${TC_MAX_CLIENTS}"
+	printf 'discovery=%s\n' "${DISCOVERY_BACKEND:-ss}"
+	printf 'aqm=%s\n' "${AQM_KIND:-fq_codel}"
 	any_limits && needed=1
 	printf 'limits_configured=%s\n' "${needed}"
+	if ((needed)) && [[ "${DISCOVERY_BACKEND:-ss}" == "ss" ]] &&
+		{ ((TURN_UPLOAD_LIMIT_MBIT > 0)) || ((TURN_DOWNLOAD_LIMIT_MBIT > 0)); }; then
+		warn "no conntrack table is readable, so coturn's UDP clients cannot be discovered and share the per-service fallback class. Install the conntrack tool (or load the nf_conntrack module) for the TURN limits to apply per client IP."
+	fi
 
 	if ! command -v tc >/dev/null 2>&1; then
 		printf 'shaping=unavailable\n'
@@ -1026,6 +1331,55 @@ status() {
 	return 1
 }
 
+# --- Diagnose ---------------------------------------------------------------
+# A class that drops packets is invisible in the ordinary logs: the call just
+# sounds bad. diagnose prints the queue state of every class so the loss can be
+# attributed, and counts the allocations coturn refused for bandwidth reasons.
+diagnose_device() { # dev title
+	local dev="$1" title="$2"
+	printf '\n%s (%s)\n' "${title}" "${dev}"
+	if ! tc qdisc show dev "${dev}" >/dev/null 2>&1; then
+		printf '  no traffic-control information\n'
+		return 0
+	fi
+	printf '  queues:\n'
+	tc qdisc show dev "${dev}" 2>/dev/null | sed -e 's/^qdisc /    /' -e 's/qdisc /  qdisc /g' | head -20
+	printf '  classes (sent / dropped / overlimits / backlog):\n'
+	tc -s class show dev "${dev}" 2>/dev/null | awk '
+		/^class htb/ { cls = $3; sent = ""; next }
+		$1 == "Sent" { sent = $2 " " $3 " " $4 " pkt (dropped " $7 " overlimits " $10 ")"; next }
+		$1 == "backlog" { printf "    %-10s %s backlog %s\n", cls, sent, $2; next }
+	' | head -40
+}
+
+diagnose() {
+	local dev turn_log
+	status || true
+	printf '\nturn_scan_seconds=%s\n' "${TURN_SCAN_SECONDS}"
+	case "${DISCOVERY_BACKEND:-ss}" in
+	conntrack) ok "coturn clients are discovered from the conntrack table, UDP and TLS" ;;
+	proc) ok "coturn clients are discovered from the kernel conntrack table (no conntrack tool)" ;;
+	*) warn "only the socket table is available: UDP TURN clients cannot be discovered and share the fallback class" ;;
+	esac
+
+	if [[ -n "${IFACE}" ]]; then
+		diagnose_device "${IFACE}" "download (shaped on the WAN interface)"
+	fi
+	if have_ifb; then
+		diagnose_device "${IFB}" "upload (shaped on the IFB device)"
+	fi
+
+	turn_log="$(sed -n 's/^log-file=//p' "${TURN_CONF}" 2>/dev/null | tail -1)"
+	printf '\ncoturn:\n'
+	if [[ -n "${turn_log}" && -r "${turn_log}" ]]; then
+		printf '  error 486 (allocation bandwidth quota reached, whole log): %s\n' \
+			"$(grep -c 'error 486' "${turn_log}" 2>/dev/null || true)"
+	else
+		printf '  %s is not readable; check coturn\047s log directly\n' "${turn_log:-turnserver.log}"
+	fi
+	printf '  max-bps and bps-capacity are in %s\n' "${TURN_CONF}"
+}
+
 # --- Stop -------------------------------------------------------------------
 stop_shaping() {
 	detect_interface || true
@@ -1078,7 +1432,7 @@ watch() {
 parse_args() {
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-		apply | refresh | status | stop | validate | watch)
+		apply | refresh | status | diagnose | stop | validate | watch)
 			COMMAND="$1"
 			shift
 			;;
@@ -1126,6 +1480,8 @@ main() {
 		ok "bandwidth limits are valid: proxy ${PROXY_DOWNLOAD_LIMIT_MBIT}/${PROXY_UPLOAD_LIMIT_MBIT} Mbit/s down/up per client IP, TURN ${TURN_DOWNLOAD_LIMIT_MBIT}/${TURN_UPLOAD_LIMIT_MBIT} Mbit/s down/up per client IP"
 		return 0
 	fi
+	aqm_configure
+	detect_discovery
 
 	case "${COMMAND}" in
 	apply | refresh | watch | stop)
@@ -1173,6 +1529,9 @@ main() {
 		;;
 	status)
 		status
+		;;
+	diagnose)
+		diagnose
 		;;
 	stop)
 		stop_shaping

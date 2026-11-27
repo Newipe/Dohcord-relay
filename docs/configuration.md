@@ -158,35 +158,73 @@ rules and does nothing.
   what the host's own outbound connections look like, and the server's own
   traffic must never be limited as TURN. Traffic that matches no relay filter at
   all (the API, SSH, anything else) uses the default class, which is unlimited.
-- **upload** (client to server) on an IFB device: only packets addressed to
-  those relay ports are mirrored there (unrelated traffic never leaves the normal
-  path), and the same per-address classification happens on the IFB.
+- **upload** (client to server) on an IFB device: only packets addressed to the
+  service's own listener ports (IPv4 and IPv6) are redirected there, and the same
+  per-address classification happens on the IFB. coturn's relay port range is not
+  mirrored: packets arriving for those ports come from *peers*, not from the
+  client, so they are not a client's upload.
+
+Every class — per-client, fallback and the unlimited default — carries an
+**`fq_codel` leaf queue** (`limit` 1000 packets, `target 5ms`, `interval 100ms`,
+ECN). Without it a class is a plain `pfifo` whose limit is the device
+`txqueuelen`: about 1000 packets on a WAN device, which buffers more than a
+second of audio at 8 Mbit/s before it starts dropping a whole burst, and only 32
+on an IFB device, which drops inside every 24 ms of a 16 Mbit/s burst. That is
+what made calls stutter and cut out. With the leaf queue the standing queue stays
+at a few milliseconds, losses are spread over the flow that causes them instead
+of arriving as one clump, and the configured average rate is unchanged. A kernel
+without `sch_fq_codel` is detected at apply time and gets a bounded `pfifo`
+(`TC_AQM=pfifo` forces that path).
+
+HTB classes are also given an explicit `quantum` (`TC_QUANTUM`, 1500 bytes = one
+packet) and a 50 ms `burst`/`cburst`. HTB's default quantum is `rate/r2q`, which
+at 8-16 Mbit/s is 100-200 kB per round — 60 to 130 voice packets served from one
+class before the scheduler looks at another, and the kernel warns that the
+quantum is big.
 
 Limit values are Mbit/s everywhere: installer, console, `config.env`, this page.
-HTB is given a 50 ms burst so UDP voice does not suffer from packet loss on
-micro-bursts.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `TC_AQM` | `auto` | Leaf queue: `auto` (fq_codel, falling back to pfifo), `fq_codel` or `pfifo` |
+| `TC_AQM_LIMIT` | `1000` | Leaf queue length, packets |
+| `TC_QUANTUM` | `1500` | HTB quantum, bytes served per class per round |
+| `TC_DISCOVERY` | `auto` | Client addresses from `auto`, `conntrack`, `proc` or `ss` |
+| `TC_TURN_SCAN_SECONDS` | *(empty)* | How often the TURN client table is re-read; empty = every refresh with conntrack, 30 s with `/proc` |
+
+### How clients are discovered
+
+Linux `tc` has no per-IP hash table for HTB, so the per-address class table is
+built from the flows that actually exist. Client addresses come from the
+**conntrack table**: one entry per client flow to `3478`/`5349`, over UDP or TCP,
+filtered in the kernel by protocol and destination port. The parsing happens in
+`awk`, and an address that appears only adds its own class and filters, so a
+refresh costs the same whether five or five hundred addresses are shaped.
+
+This matters more than it may sound. Before conntrack discovery, TURN clients
+were read from `ss -uan`, which **cannot name a UDP TURN client at all**: coturn
+answers it from the shared listener socket bound to `0.0.0.0:3478`, whose peer
+address is never recorded, and its per-allocation relay sockets only ever talk to
+the peers. The result was that every TURN user stayed in the single per-service
+fallback class and shared one per-IP allowance — a call with several participants
+saw its voice cut out. `ss` remains the source for the proxy (a connection
+accepted by Squid has the client as its peer) and as a fallback for TURN over
+TLS; `status` reports which source is in use and warns when only `ss` is
+available.
+
+`TC_DISCOVERY=auto` prefers the `conntrack` tool (cheap kernel-filtered dumps),
+then `/proc/net/nf_conntrack`, then `ss`. The installer installs `conntrack` and
+loads `nf_conntrack`, so a default installation gets the primary source.
 
 ### Limitations, stated plainly
 
-Linux `tc` has no per-IP hash table for HTB, so the per-address class table is
-refreshed from the connections that actually exist. That refresh is cheap: one
-filtered `ss` scan per service (both directions share it, and the parsing happens
-in `awk`, not in a shell loop over every socket), and an address that appears
-only adds its own class and filters — so a refresh costs the same whether five
-or five hundred addresses are shaped. The chain is rebuilt once when an address
-leaves or the service starts, which keeps departed addresses from leaving stale
-filters behind. The proxy's table is re-read every `TC_REFRESH_SECONDS`;
-coturn's is re-read at most every 30 s, because a UDP socket dump has to walk
-every relay socket coturn holds.
-
 - a new client address is limited immediately, by its service's fallback class,
-  which carries exactly the configured per-IP rate. Within one refresh interval
-  (5 s by default, up to 30 s for TURN) the address moves to a class of its own.
-  While several new addresses are in the fallback class they share that one
+  which carries exactly the configured per-IP rate. Within one refresh
+  (`TC_REFRESH_SECONDS`, 5 s by default) it moves to a class of its own. While
+  several new addresses are in the fallback class they share that one
   allowance, so a burst of new clients can be slower than configured for a few
-  seconds, but never faster. Coturn relay-range traffic is the exception: it gets
-  its per-address class on the next TURN refresh, so up to 30 s of a brand-new
-  allocation's media can go unshaped;
+  seconds, but never faster. If only `ss` is available, UDP TURN clients never
+  leave the fallback class and `status` says so;
 - at most `TC_MAX_CLIENTS` addresses are tracked per service and direction
   (`512` by default, 1-2047). Beyond that, extra addresses are logged as not
   limited and reported by diagnostics; raise the value or lower the number of
@@ -202,12 +240,15 @@ every relay socket coturn holds.
 - upload shaping needs the `ifb` kernel module. The service runs with
   `ProtectKernelModules=yes`, so the installer loads the module and records it in
   `/etc/modules-load.d/pishcord-relay-ifb.conf` for the next boot;
-- IPv6 clients are shaped with their own filters. Every `tc` command is
-  checked: a rule the kernel refuses aborts `apply` instead of leaving a
-  half-installed tree, and `status` requires each class *and* the filter that
-  steers traffic into it (`missing_class`, `missing_filter`,
+- IPv6 clients are shaped with their own filters (upload and download). Every
+  `tc` command is checked: a rule the kernel refuses aborts `apply` instead of
+  leaving a half-installed tree, and `status` requires each class *and* the
+  filter that steers traffic into it (`missing_class`, `missing_filter`,
   `missing_fallback_class`, `missing_fallback_filter`), so a tree that shapes
-  nothing is never reported as active.
+  nothing is never reported as active;
+- an expired address's classifiers are removed on their own. Only a removal the
+  kernel does not confirm falls back to rebuilding the chain, because a rebuild
+  briefly sends every packet through the unlimited default class.
 
 ### Changing and checking limits
 
@@ -217,9 +258,11 @@ every relay socket coturn holds.
   staged, validated, backed up to `/var/backups/pishcord-relay/limits-<time>/`,
   applied, verified, and rolled back if the services do not come back healthy.
 - Diagnosis: `sudo pishcord-relay-tc status` prints the configured limits, the
-  interface, the qdiscs and whether the classes carry the configured rates;
-  `pishcord-relay diagnostics` and `verify.sh` report a configured-but-inactive
-  limit as a failure, never as success.
+  interface, the discovery source, the qdiscs and whether the classes carry the
+  configured rates; `sudo pishcord-relay-tc diagnose` adds the per-class queue
+  state (`Sent`, `dropped`, `overlimits`, `backlog`) and coturn's error-486
+  count; `pishcord-relay diagnostics` and `verify.sh` report a
+  configured-but-inactive limit as a failure, never as success.
 
 ## coturn configuration
 

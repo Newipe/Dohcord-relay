@@ -44,6 +44,11 @@ jobs:
       - name: Unit tests
         run: go test ./...
 
+      # The limiter and the API share state between requests; run the same tests
+      # with the race detector so a data race fails the build.
+      - name: Unit tests with the race detector
+        run: go test -race ./...
+
       - name: Build both executables for every supported target
         run: |
           set -Eeuo pipefail
@@ -72,6 +77,11 @@ jobs:
 
       - name: API port integration tests
         run: bash scripts/test-api-port.sh
+
+      - name: Limit and traffic-shaping tests
+        run: |
+          bash scripts/test-max-connections.sh
+          bash scripts/test-limits.sh
 
       - name: Release pipeline tests
         run: bash scripts/test-release.sh

@@ -1101,8 +1101,11 @@ check_root_and_os() {
 install_base_packages() {
 	export DEBIAN_FRONTEND=noninteractive
 	apt-get update -qq
+	# conntrack is how the shaper names TURN clients (see pishcord-relay-tc): a
+	# UDP TURN client only exists as an entry in the conntrack table, never as a
+	# socket with a peer address.
 	apt-get install -y -qq --no-install-recommends \
-		ca-certificates curl openssl iproute2 procps python3 jq >/dev/null
+		ca-certificates curl openssl iproute2 procps python3 jq conntrack >/dev/null
 	info "base packages present"
 }
 
@@ -2293,11 +2296,22 @@ install_shaping() {
 	if ! modprobe ifb >/dev/null 2>&1 && [[ ! -d /sys/module/ifb ]]; then
 		warn "the ifb kernel module is unavailable; per-client-IP upload limits cannot be enforced"
 	fi
-	if [[ -d /etc/modules-load.d && ! -e /etc/modules-load.d/pishcord-relay-ifb.conf ]]; then
-		printf '# Pishcord-relay: upload shaping mirrors relay traffic onto an ifb device.\nifb\n' \
-			>/etc/modules-load.d/pishcord-relay-ifb.conf 2>/dev/null ||
-			warn "could not persist the ifb module for the next boot"
+	if [[ -d /etc/modules-load.d ]]; then
+		local modules_file=/etc/modules-load.d/pishcord-relay-ifb.conf
+		if [[ ! -e "${modules_file}" ]]; then
+			printf '# Pishcord-relay: upload shaping mirrors relay traffic onto an ifb device,\n# and TURN clients are discovered in the conntrack table.\nifb\nnf_conntrack\n' \
+				>"${modules_file}" 2>/dev/null ||
+				warn "could not persist the ifb and nf_conntrack modules for the next boot"
+		elif ! grep -qx 'nf_conntrack' "${modules_file}" 2>/dev/null; then
+			# An installation from before conntrack discovery only lists ifb.
+			printf 'nf_conntrack\n' >>"${modules_file}" 2>/dev/null ||
+				warn "could not add nf_conntrack to ${modules_file}"
+		fi
 	fi
+	# Loading the table now is what makes TURN clients discoverable on a host
+	# that does not otherwise use netfilter. A builtin kernel is fine too.
+	modprobe nf_conntrack >/dev/null 2>&1 || [[ -d /sys/module/nf_conntrack ]] ||
+		warn "nf_conntrack is unavailable; TURN clients cannot be discovered and will share one fallback class"
 
 	systemctl enable "${TC_UNIT}" >/dev/null
 	systemctl restart "${TC_UNIT}" || true
