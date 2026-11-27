@@ -125,6 +125,57 @@ Voice connects but nobody hears anyone, or voice does not connect at all:
 coturn reads differ. They are the same file; re-run the installer to re-render
 `turnserver.conf`.
 
+### Voice cuts out or stutters when several people are on a call
+
+Voice connects (people are heard) but audio breaks up, goes robotic or drops for
+whole seconds, while text and profiles are fine. That is the bandwidth limiter,
+not coturn being unreachable. Work through these in order:
+
+1. **Is the limiter active, and where does it get client addresses?**
+
+   ```bash
+   sudo pishcord-relay-tc status
+   sudo pishcord-relay-tc diagnose
+   ```
+
+   `discovery=` must be `conntrack` or `proc`. With `discovery=ss` the UDP TURN
+   clients cannot be named at all (coturn's listener socket has no peer address),
+   so every TURN user shares one fallback class and one per-IP allowance — the
+   usual cause of "voice dies as soon as two people talk". Fix it by making the
+   conntrack table readable:
+
+   ```bash
+   sudo apt-get install -y conntrack    # or: sudo dnf install -y conntrack-tools
+   sudo modprobe nf_conntrack
+   sudo systemctl restart pishcord-relay-tc
+   sudo pishcord-relay-tc status | grep -E 'discovery|aqm|shaping'
+   ```
+
+2. **Is there a leaf queue?** `aqm=` must be `fq_codel`. A `pfifo` leaf buffers
+   about a second of audio at 8 Mbit/s and then drops a whole burst. If the
+   kernel has no `sch_fq_codel`, load it (`sudo modprobe sch_fq_codel`) or accept
+   that jitter under load will be worse.
+
+3. **Look at the classes.** In `diagnose`, `backlog` should stay in the low
+   kilobytes and `dropped` should be small and spread over classes, not one class
+   losing everything. A single class at its `rate` with a growing backlog is a
+   client that is actually over its cap; raise `--turn-upload-limit` /
+   `--turn-download-limit` (or **Limits & performance**) if that is legitimate.
+
+4. **`error 486` in coturn's log** means coturn refused an allocation for
+   bandwidth accounting, which happens before any packet flows. It is not a
+   shaper problem: check that `bps-capacity=0` (no reservation ceiling; the
+   default since this release) or at least `total-quota x max-bps`, and that
+   `max-bps` is above the per-IP TURN limit. Both are reported by
+   `sudo pishcord-relay diagnostics`.
+
+5. **Confirm the interface.** `TC_INTERFACE` must be the interface that actually
+   carries the relay's traffic; on a host behind NAT that is usually the private
+   one, and `status` prints what was detected from the default route.
+
+If you changed a limit, `sudo pishcord-relay limits` stages, validates, applies
+and verifies it, and rolls back if the services do not come back healthy.
+
 ## Network Configuration API
 
 | Symptom | Cause |

@@ -335,7 +335,13 @@ if [[ -n "${max_bps}" && -n "${bps_capacity}" ]] && [[ "${max_bps}" -gt 0 ]] && 
 	if [[ $((bps_capacity / max_bps)) -ge 2 ]]; then
 		pass "bandwidth limits set (max-bps=${max_bps}, bps-capacity=${bps_capacity}, ~$((bps_capacity / max_bps)) concurrent sessions)"
 	else
-		fail "bps-capacity (${bps_capacity}) is below two max-bps reservations (${max_bps}); coturn will reject allocations with error 486"
+		fail "bps-capacity (${bps_capacity}) is below two max-bps reservations (${max_bps}); coturn will reject allocations with error 486. Set bps-capacity=0 for no ceiling, or raise it above total-quota x max-bps."
+	fi
+elif [[ "${bps_capacity}" == "0" ]]; then
+	if [[ -z "${max_bps}" ]]; then
+		fail "bps-capacity=0 (no ceiling) but max-bps is missing; coturn has no bandwidth backstop"
+	else
+		pass "no relay capacity reservation (bps-capacity=0); per-client-IP TURN limits are enforced by the shaper and max-bps=${max_bps} is the per-session backstop"
 	fi
 else
 	note "max-bps/bps-capacity are unlimited; quotas alone bound usage"

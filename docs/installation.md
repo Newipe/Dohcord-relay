@@ -95,8 +95,8 @@ downloading anything, so local changes are what gets installed.
 | `--coturn-version V` | Upstream coturn release to build (default `4.18.0`, SHA-256 checked). |
 | `--user-quota N` | Allocations per credential (default 12). |
 | `--total-quota N` | Allocations for the relay (default 1200). |
-| `--max-bps N` | Per-session bandwidth ceiling, bytes/s (default 2000000). |
-| `--bps-capacity N` | Total relay bandwidth reservation (default 250000000). |
+| `--max-bps N` | Per-session bandwidth ceiling, bytes/s (default 8000000, above the per-IP TURN limit so coturn is only a backstop; `0` disables it). |
+| `--bps-capacity N` | Total relay bandwidth reservation, bytes/s (default `0`, no reservation ceiling; coturn reserves `max-bps` per allocation, so a small value rejects allocations with error 486). |
 | `--max-connections N` | Concurrent proxy connections per client IP (default 100). Interactive installs always show it and let you change it (Enter keeps the configured value on a re-run). Use this with `--yes` for automation. |
 | `--api-port N` | Network Configuration API port (default 8443). Interactive installs always show the port and let you change it (Enter keeps the configured one on a re-run). Use this with `--yes` for automation. |
 | `--proxy-upload-limit MBIT`, `--proxy-download-limit MBIT` | Proxy bandwidth per client IP (default 8 each, `0` disables). Interactive installs ask for both. |

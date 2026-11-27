@@ -1221,7 +1221,7 @@ limits_show() {
 	printf '    %-38s %s\n' "TURN allocations per credential" "$(limits_turn_value user-quota)"
 	printf '    %-38s %s\n' "TURN allocations in total" "$(limits_turn_value total-quota)"
 	printf '    %-38s %s\n' "TURN per-session ceiling (bytes/s)" "$(limits_turn_value max-bps)"
-	printf '    %-38s %s\n' "TURN relay capacity (bytes/s)" "$(limits_turn_value bps-capacity)"
+	printf '    %-38s %s\n' "TURN relay capacity (bytes/s, 0=no ceiling)" "$(limits_turn_value bps-capacity)"
 	say ""
 	say "  Traffic shaping"
 	printf '    %-38s %s\n' "$(limits_label TC_MAX_CLIENTS)" "$(limits_read TC_MAX_CLIENTS)"
@@ -1307,13 +1307,20 @@ limits_edit_turn() {
 	fi
 	for key in max-bps bps-capacity; do
 		current="$(limits_turn_value "${key}")"
-		current="${current:-2000000}"
+		if [[ "${key}" == "max-bps" ]]; then
+			current="${current:-8000000}"
+		else
+			current="${current:-0}"
+		fi
+		local minimum=1000
+		# bps-capacity=0 means "no reservation ceiling" in coturn.
+		[[ "${key}" == "bps-capacity" ]] && minimum=0
 		while true; do
 			printf '  %s (bytes/s) [%s]: ' "${key}" "${current}"
 			read -r answer || return 0
 			answer="${answer:-${current}}"
 			answer="${answer//[[:space:]]/}"
-			if reason="$(limits_number_problem "${key}" "${answer}" 1000 10000000000)"; then
+			if reason="$(limits_number_problem "${key}" "${answer}" "${minimum}" 10000000000)"; then
 				warn "${reason}"
 				continue
 			fi
@@ -1355,7 +1362,7 @@ limits_validate() {
 	total="$(limits_turn_value total-quota)"
 	bps="$(limits_turn_value max-bps)"
 	cap="$(limits_turn_value bps-capacity)"
-	for pair in "user-quota:${user}:1:100000" "total-quota:${total}:1:100000" "max-bps:${bps}:1000:10000000000" "bps-capacity:${cap}:1000:10000000000"; do
+	for pair in "user-quota:${user}:1:100000" "total-quota:${total}:1:100000" "max-bps:${bps}:1000:10000000000" "bps-capacity:${cap}:0:10000000000"; do
 		IFS=':' read -r key value min max <<<"${pair}"
 		if reason="$(limits_number_problem "${key}" "${value}" "${min}" "${max}")"; then
 			bad "${reason}"
@@ -1366,8 +1373,10 @@ limits_validate() {
 		bad "total-quota (${total}) must be at least user-quota (${user})"
 		problems=$((problems + 1))
 	fi
-	if [[ "${bps}" =~ ^[0-9]+$ && "${cap}" =~ ^[0-9]+$ ]] && ((cap < bps)); then
-		bad "bps-capacity (${cap}) must be at least max-bps (${bps}); coturn would refuse allocations"
+	# coturn reserves max-bps for every allocation, so a capacity below that
+	# rejects allocations with error 486. 0 means no reservation ceiling at all.
+	if [[ "${bps}" =~ ^[0-9]+$ && "${cap}" =~ ^[0-9]+$ ]] && ((cap > 0 && cap < bps)); then
+		bad "bps-capacity (${cap}) must be at least max-bps (${bps}) or 0 for no ceiling; coturn would refuse allocations"
 		problems=$((problems + 1))
 	fi
 	((problems == 0))

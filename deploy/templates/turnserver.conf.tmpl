@@ -76,16 +76,21 @@ user-quota=@USER_QUOTA@
 # Global ceiling on concurrent allocations for the whole relay.
 total-quota=@TOTAL_QUOTA@
 # Per-session bandwidth ceiling, bytes per second, each direction.
-# 2 MB/s (~16 Mbit/s) is comfortably above Discord voice, video and screen
-# share bitrates.
+# This is only a backstop: bandwidth is enforced per client IP by the shaper,
+# which queues every class with fq_codel. coturn's policer drops from a plain
+# per-session queue, so it must sit *above* the shaper's per-IP limit (16 Mbit/s
+# = 2 MB/s by default) or it becomes the first thing that drops voice packets
+# when one client is busy. 8 MB/s achieves that.
 max-bps=@MAX_BPS@
-# Total relay bandwidth the server may allocate, bytes per second.
-# IMPORTANT: coturn reserves max-bps for every open allocation, so this value
-# divided by max-bps is the number of concurrent relayed sessions the relay
-# accepts. Keep bps-capacity at roughly the VPS uplink (250 MB/s ~= 2 Gbit/s
-# reserves room for ~125 simultaneous 2 MB/s sessions). Setting it below a
-# couple of max-bps reservations makes coturn reject most allocations with
-# error 486 (Allocation Bandwidth Quota Reached).
+# Total relay bandwidth the server may allocate, bytes per second. 0 means no
+# ceiling.
+# IMPORTANT: coturn reserves max-bps for every open allocation, so a non-zero
+# value divided by max-bps is the number of concurrent relayed sessions the
+# relay accepts. 250 MB/s with the old 2 MB/s reservation admitted only 125
+# sessions while total-quota allows 1200, and every allocation past that point
+# was refused with error 486 (Allocation Bandwidth Quota Reached). With 0 the
+# ceiling is total-quota, the uplink and the per-client-IP shaper - which are
+# the limits that actually protect the relay.
 bps-capacity=@BPS_CAPACITY@
 
 # --- Peer destination filtering -------------------------------------------

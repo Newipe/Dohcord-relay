@@ -275,7 +275,7 @@ loads `nf_conntrack`, so a default installation gets the primary source.
 | `realm` | Your domain, or `pishcord.relay` for address installs |
 | `fingerprint`, `stale-nonce=600`, `no-tcp-relay`, `no-multicast-peers` | Enabled |
 | `user-quota` / `total-quota` | `12` / `1200` (installer flags) |
-| `max-bps` / `bps-capacity` | `2000000` / `250000000` |
+| `max-bps` / `bps-capacity` | `8000000` / `0` (no reservation ceiling) |
 | `cert` / `pkey` | The relay's certificate and key |
 
 Credentials use coturn's REST mechanism:

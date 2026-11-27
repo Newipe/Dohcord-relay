@@ -38,10 +38,18 @@ COTURN_VERSION="4.18.0"
 COTURN_SHA256="28d55294ac596fbd129b293a85e7bb1c5dc4bd15b7fb55c500f355149e5f4e28"
 USER_QUOTA=12
 TOTAL_QUOTA=1200
-# Per-session ceiling (~16 Mbit/s) and total relay capacity (~2 Gbit/s of
-# reservations, i.e. room for roughly 125 simultaneous sessions).
-MAX_BPS=2000000
-BPS_CAPACITY=250000000
+# Per-session ceiling and total relay capacity, bytes per second. coturn's own
+# policer must never be the first place a client's traffic is dropped, because
+# it drops from a plain per-session queue: the configured per-client-IP TURN
+# limit (16 Mbit/s = 2 MB/s by default) is enforced by the shaper, which queues
+# every class with fq_codel. max-bps is therefore set well above that cap (8
+# MB/s), so coturn is only a backstop, and bps-capacity is 0 (no reservation
+# ceiling): coturn reserves max-bps for every allocation, so the old 250 MB/s
+# reservation admitted only 125 sessions at the old 2 MB/s max-bps while
+# total-quota allows 1200, and every allocation past that point was refused
+# with error 486.
+MAX_BPS=8000000
+BPS_CAPACITY=0
 PROXY_PORT=443
 # Port of the Network Configuration API. 8443 is the default; an interactive
 # installation shows it and may choose another one (--api-port for automation).
@@ -287,9 +295,12 @@ Service sizes:
   --coturn-version VERSION Upstream coturn release to build (default: 4.18.0).
   --user-quota N           Concurrent allocations per credential (default: 12).
   --total-quota N          Concurrent allocations for the relay (default: 1200).
-  --max-bps N              Per-session bandwidth ceiling, bytes/s (default: 2000000).
+  --max-bps N              Per-session bandwidth ceiling, bytes/s (default: 8000000,
+                           above the per-client-IP TURN limit so coturn is only a
+                           backstop; 0 disables it).
   --bps-capacity N         Total relay bandwidth reservation, bytes/s
-                           (default: 250000000).
+                           (default: 0, no reservation ceiling; the shaper and the
+                           uplink enforce bandwidth).
   --max-connections N      Concurrent proxy connections per client IP (default: 100).
                            Interactive installs always show it and let you change
                            it (Enter keeps the configured value). Use this option
