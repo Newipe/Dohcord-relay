@@ -335,6 +335,28 @@ else
 	bad "ipv6 filtering: ${out}"
 fi
 
+# --- 8f. traffic shaping: one priority per protocol and chain -----------------
+# Regression: the upload mirrors gave the IPv4 and the IPv6 filter the same
+# priority. The kernel keys a classifier chain by (priority, protocol) and
+# refuses the second one with EINVAL, which tc reports as "Filter with specified
+# priority/protocol not found"; `apply` then aborted and the relay ran unshaped.
+declare -A seen_prio=()
+conflict=""
+while read -r parent proto prio; do
+	[[ -n "${parent}" ]] || continue
+	key="${parent} ${prio}"
+	if [[ -n "${seen_prio[${key}]:-}" && "${seen_prio[${key}]}" != "${proto}" ]]; then
+		conflict="${key}: ${seen_prio[${key}]} and ${proto}"
+	fi
+	seen_prio["${key}"]="${proto}"
+done < <(grep -o 'parent [^ ]* protocol [a-z0-9]* prio [0-9]*' <<<"${out}" |
+	awk '{ print $2, $4, $6 }' | sort -u)
+if [[ -z "${conflict}" ]] && grep -q 'parent ffff: protocol ipv6 prio' <<<"${out}"; then
+	ok "no two protocols share a priority in one classifier chain"
+else
+	bad "priority reused across protocols: ${conflict:-no ipv6 mirror}"
+fi
+
 sed -e 's/^PROXY_UPLOAD_LIMIT_MBIT=.*/PROXY_UPLOAD_LIMIT_MBIT=0/' \
 	-e 's/^PROXY_DOWNLOAD_LIMIT_MBIT=.*/PROXY_DOWNLOAD_LIMIT_MBIT=0/' "${TMP}/tc.env" >"${TMP}/tc-noproxy.env"
 out="$(tc_render 203.0.113.5 "${TMP}/tc-noproxy.env")"
@@ -680,6 +702,30 @@ if ((rc == 0)) && grep -q '^shaping=active' <<<"${out}" &&
 	ok "status reports shaping as active only when the classes and their filters are both installed"
 else
 	bad "active tree: rc=${rc} ${out}"
+fi
+
+# --- 11e. traffic shaping: stop clears its own state, nothing else ------------
+# Regression: stop ran `rm -rf` on the run directory. Under the unit that path is
+# systemd's RuntimeDirectory and a read-write bind mount (ProtectSystem=strict),
+# so removal failed with "Device or resource busy" and the failed ExecStopPost
+# marked every restart of the shaper as failed.
+mkdir -p "${TMP}/tcstate-stop"
+printf 'download proxy 7 203.0.113.5 %s\n' "$(date +%s)" >"${TMP}/tcstate-stop/classes"
+printf 'mq\n' >"${TMP}/tcstate-stop/previous-root"
+if command -v unshare >/dev/null 2>&1 && unshare -Ur true 2>/dev/null; then
+	rc=0
+	out="$(unshare -Ur env PATH="${TMP}/faketc:${TMP}/fakeip:${PATH}" \
+		PISHCORD_RELAY_TC_STATE="${TMP}/tcstate-stop" \
+		bash "${TC}" stop --interface eth0 --config "${TMP}/tc.env" 2>&1)" || rc=$?
+	if ((rc == 0)) && [[ -d "${TMP}/tcstate-stop" ]] &&
+		[[ ! -e "${TMP}/tcstate-stop/classes" && ! -e "${TMP}/tcstate-stop/previous-root" ]] &&
+		grep -q 'traffic shaping removed' <<<"${out}"; then
+		ok "stop removes its state files and leaves the systemd run directory in place"
+	else
+		bad "stop state cleanup: rc=${rc} ${out}"
+	fi
+else
+	skip "stop removes its state files and leaves the run directory in place (needs unshare -Ur)"
 fi
 
 # --- 12. manager console: limits validation ----------------------------------

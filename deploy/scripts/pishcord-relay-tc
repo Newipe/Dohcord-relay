@@ -363,6 +363,18 @@ burst_bytes() {
 	printf '%s' "${bytes}"
 }
 
+# default_quantum gives the unlimited default class a quantum the kernel does not
+# warn about. HTB derives it from rate/r2q, which at a 10 Gbit link rate is
+# 125000 bytes, so every apply logged "sch_htb: quantum of class 10999 is big".
+# 5 ms of the link rate, clamped to the range HTB is happy with, keeps the log
+# quiet; that class only carries traffic that matches no limit.
+default_quantum() { # link mbit
+	local q=$(($1 * 1000 / 8 / 200))
+	((q < 1500)) && q=1500
+	((q > 60000)) && q=60000
+	printf '%s' "${q}"
+}
+
 # --- Leaf queueing ----------------------------------------------------------
 # HTB gives a class with no child qdisc a plain pfifo, and that pfifo's limit is
 # the interface's txqueuelen: about 1000 packets on a normal WAN device (up to
@@ -559,8 +571,9 @@ hold_minor() {
 
 # --- Device setup -----------------------------------------------------------
 ensure_device() {
-	local link previous
+	local link previous quantum
 	link="$(link_rate_mbit)"
+	quantum="$(default_quantum "${link}")"
 
 	if ! own_qdisc; then
 		previous="$(current_root_qdisc)"
@@ -587,7 +600,7 @@ ensure_device() {
 		run_tc qdisc replace dev "${IFACE}" root handle "${EGRESS_HANDLE}:" htb default "${DEFAULT_CLASS}"
 	fi
 	run_tc class replace dev "${IFACE}" parent "${EGRESS_HANDLE}:" classid "${EGRESS_HANDLE}:${DEFAULT_CLASS}" \
-		htb rate "${link}mbit" ceil "${link}mbit"
+		htb rate "${link}mbit" ceil "${link}mbit" quantum "${quantum}"
 
 	any_limits || return 0
 
@@ -631,7 +644,7 @@ ensure_device() {
 		fi
 		run_tc qdisc replace dev "${IFB}" root handle "${INGRESS_HANDLE}:" htb default "${DEFAULT_CLASS}"
 		run_tc class replace dev "${IFB}" parent "${INGRESS_HANDLE}:" classid "${INGRESS_HANDLE}:${DEFAULT_CLASS}" \
-			htb rate "${link}mbit" ceil "${link}mbit"
+			htb rate "${link}mbit" ceil "${link}mbit" quantum "${quantum}"
 
 		for service in proxy turn; do
 			rate_of "${service}" upload
@@ -673,10 +686,15 @@ add_ingress_mirror() {
 	local -a ports
 	service_ports "${service}"
 	ports=("${SERVICE_PORTS[@]}")
+	# A classifier chain is keyed by (priority, protocol), not by priority alone:
+	# the kernel refuses an IPv6 filter that would reuse the IPv4 one's priority
+	# with EINVAL, which `tc` reports as "Filter with specified priority/protocol
+	# not found". IPv4 therefore runs at priority 1 and IPv6 at priority 3, the
+	# same split the per-address matches use.
 	for p in "${ports[@]}"; do
 		run_tc filter add dev "${IFACE}" parent ffff: protocol ip prio 1 u32 \
 			match ip dport "${p}" 0xffff action mirred egress redirect dev "${IFB}"
-		run_tc filter add dev "${IFACE}" parent ffff: protocol ipv6 prio 1 u32 \
+		run_tc filter add dev "${IFACE}" parent ffff: protocol ipv6 prio 3 u32 \
 			match ip6 dport "${p}" 0xffff action mirred egress redirect dev "${IFB}"
 	done
 	# The coturn relay range is deliberately NOT mirrored. On the WAN interface a
@@ -1408,7 +1426,14 @@ stop_shaping() {
 			ip link del "${IFB}" 2>/dev/null || true
 		fi
 	fi
-	((DRY_RUN)) || rm -rf "${STATE_DIR}"
+	if ((DRY_RUN == 0)); then
+		# Only the two files written here are removed. The run directory belongs
+		# to systemd (RuntimeDirectory=), which serves it as a read-write bind
+		# mount behind ProtectSystem=strict, so removing the directory itself
+		# fails with "Device or resource busy" and, under `set -e`, turned every
+		# restart into a failed unit. Cleanup failure must never fail a stop.
+		rm -f -- "$(state_file)" "$(previous_root_file)" 2>/dev/null || true
+	fi
 	return 0
 }
 
